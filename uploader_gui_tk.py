@@ -8,6 +8,7 @@ import configparser
 import pandas as pd
 import numpy as np
 import httpx
+import subprocess
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -20,8 +21,87 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 
 KST = timezone(timedelta(hours=9))
-LOG_FILE = 'processed_files.log'
-RESUME_FILE = 'upload_resume.json'
+
+# Data directory (AppData) for persistent state
+def _get_data_dir() -> str:
+    appdata = os.getenv('APPDATA') or os.path.expanduser('~')
+    d = os.path.join(appdata, 'ExtrusionUploader')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+DATA_DIR = _get_data_dir()
+LOG_PATH = os.path.join(DATA_DIR, 'processed_files.log')
+RESUME_PATH = os.path.join(DATA_DIR, 'upload_resume.json')
+
+
+def _migrate_legacy_state_gui():
+    """GUI-side migration of legacy state files into AppData.
+    Safe union/merge like CLI.
+    """
+    legacy_dir = os.path.dirname(os.path.abspath(__file__))
+    leg_log = os.path.join(legacy_dir, 'processed_files.log')
+    leg_res = os.path.join(legacy_dir, 'upload_resume.json')
+    # Merge logs
+    try:
+        legacy_set = set()
+        if os.path.exists(leg_log):
+            try:
+                with open(leg_log, 'r', encoding='utf-8') as f:
+                    legacy_set = {line.strip() for line in f if line.strip()}
+            except UnicodeDecodeError:
+                with open(leg_log, 'r', encoding='cp949', errors='ignore') as f:
+                    legacy_set = {line.strip() for line in f if line.strip()}
+        app_set = set()
+        if os.path.exists(LOG_PATH):
+            try:
+                with open(LOG_PATH, 'r', encoding='utf-8') as f:
+                    app_set = {line.strip() for line in f if line.strip()}
+            except UnicodeDecodeError:
+                with open(LOG_PATH, 'r', encoding='cp949', errors='ignore') as f:
+                    app_set = {line.strip() for line in f if line.strip()}
+        merged = app_set | legacy_set
+        if merged and merged != app_set:
+            with open(LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(sorted(merged)) + '\n')
+    except Exception:
+        pass
+    # Merge resume
+    try:
+        import json
+        leg = {}
+        if os.path.exists(leg_res):
+            try:
+                with open(leg_res, 'r', encoding='utf-8') as f:
+                    leg = json.load(f) or {}
+            except Exception:
+                leg = {}
+        app = {}
+        if os.path.exists(RESUME_PATH):
+            try:
+                with open(RESUME_PATH, 'r', encoding='utf-8') as f:
+                    app = json.load(f) or {}
+            except Exception:
+                app = {}
+        merged = dict(app)
+        for k, v in leg.items():
+            try:
+                lv = int(v)
+            except Exception:
+                lv = 0
+            try:
+                av = int(merged.get(k, 0))
+            except Exception:
+                av = 0
+            if lv > av:
+                merged[k] = lv
+        if merged != app:
+            tmp = RESUME_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                import json as _json
+                _json.dump(merged, f, ensure_ascii=False)
+            os.replace(tmp, RESUME_PATH)
+    except Exception:
+        pass
 
 # Config path resolution (script-dir or %APPDATA%/ExtrusionUploader)
 _CONFIG_PATH = None
@@ -44,20 +124,20 @@ def kst_now() -> datetime:
 
 
 def load_processed() -> set:
-    if not os.path.exists(LOG_FILE):
+    if not os.path.exists(LOG_PATH):
         return set()
     # Be tolerant of legacy encodings (cp949, ansi)
     try:
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+        with open(LOG_PATH, 'r', encoding='utf-8') as f:
             return set(line.strip() for line in f if line.strip())
     except UnicodeDecodeError:
-        with open(LOG_FILE, 'r', encoding='cp949', errors='ignore') as f:
+        with open(LOG_PATH, 'r', encoding='cp949', errors='ignore') as f:
             return set(line.strip() for line in f if line.strip())
 
 
 def log_processed(folder: str, filename: str):
     key = f"{folder}/{filename}"
-    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+    with open(LOG_PATH, 'a', encoding='utf-8') as f:
         f.write(key + '\n')
 
 
@@ -65,8 +145,8 @@ def log_processed(folder: str, filename: str):
 def load_resume() -> dict:
     try:
         import json
-        if os.path.exists(RESUME_FILE):
-            with open(RESUME_FILE, 'r', encoding='utf-8') as f:
+        if os.path.exists(RESUME_PATH):
+            with open(RESUME_PATH, 'r', encoding='utf-8') as f:
                 return json.load(f) or {}
     except Exception:
         pass
@@ -76,10 +156,10 @@ def load_resume() -> dict:
 def save_resume(data: dict):
     try:
         import json
-        tmp = RESUME_FILE + '.tmp'
+        tmp = RESUME_PATH + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, RESUME_FILE)
+        os.replace(tmp, RESUME_PATH)
     except Exception:
         pass
 
@@ -174,8 +254,14 @@ def load_config(path: str | None = None) -> dict:
         'CHECK_LOCK': 'true',
     }
     script_cfg, app_cfg = _resolve_config_paths()
-    # Decide which config to use
-    chosen = path or (script_cfg if os.path.exists(script_cfg) else (app_cfg if os.path.exists(app_cfg) else app_cfg))
+    # Always use AppData config; if missing and script config exists, migrate it once
+    chosen = path or app_cfg
+    if not os.path.exists(chosen) and os.path.exists(script_cfg):
+        try:
+            import shutil
+            shutil.copyfile(script_cfg, chosen)
+        except Exception:
+            pass
     if os.path.exists(chosen):
         # Tolerate BOM (utf-8-sig) and legacy encodings
         try:
@@ -198,12 +284,9 @@ def save_config(values: dict, path: str | None = None):
     cfg.optionxform = str
     cfg['app'] = {k: str(v) for k, v in values.items()}
     # Determine save path (use previously chosen path or AppData fallback)
-    if not path:
-        if _CONFIG_PATH and len(_CONFIG_PATH) > 0:
-            path = _CONFIG_PATH
-        else:
-            _, app_cfg = _resolve_config_paths()
-            path = app_cfg
+    _, app_cfg = _resolve_config_paths()
+    path = path or app_cfg
+    _CONFIG_PATH = path
     # Use utf-8-sig for BOM tolerance across editors
     with open(path, 'w', encoding='utf-8-sig') as f:
         cfg.write(f)
@@ -567,6 +650,44 @@ class App(tk.Tk):
         self.settings_frame.grid_remove()
         self.btn_settings.config(text='설정 열기')
 
+        # Migrate legacy state once UI builds
+        _migrate_legacy_state_gui()
+
+        # Scheduler (Task Scheduler) controls
+        sfrm = ttk.LabelFrame(frm, text='자동 실행 (작업 스케줄러)')
+        sfrm.grid(row=5, column=0, columnspan=4, sticky='we', **pad)
+
+        # Defaults
+        self.var_sched_mode = tk.StringVar(value='Daily')  # Daily | OnLogon
+        self.var_sched_time = tk.StringVar(value='01:00')
+        self.var_sched_delay = tk.StringVar(value='1')
+        self.var_task_name = tk.StringVar(value='Extrusion Uploader Daily')
+        self.var_cli_path = tk.StringVar(value=self._find_cli_default())
+
+        ttk.Label(sfrm, text='모드').grid(row=0, column=0, sticky='w', padx=4, pady=4)
+        self.cmb_mode = ttk.Combobox(sfrm, values=['Daily','OnLogon'], textvariable=self.var_sched_mode, width=10, state='readonly')
+        self.cmb_mode.grid(row=0, column=1, sticky='w', padx=4, pady=4)
+        ttk.Label(sfrm, text='시작 시간(일일)').grid(row=0, column=2, sticky='e', padx=4, pady=4)
+        ttk.Entry(sfrm, textvariable=self.var_sched_time, width=8).grid(row=0, column=3, sticky='w', padx=4, pady=4)
+        ttk.Label(sfrm, text='지연(분, 로그온)').grid(row=0, column=4, sticky='e', padx=4, pady=4)
+        ttk.Entry(sfrm, textvariable=self.var_sched_delay, width=6).grid(row=0, column=5, sticky='w', padx=4, pady=4)
+
+        ttk.Label(sfrm, text='작업 이름').grid(row=1, column=0, sticky='w', padx=4, pady=4)
+        ttk.Entry(sfrm, textvariable=self.var_task_name, width=30).grid(row=1, column=1, columnspan=2, sticky='we', padx=4, pady=4)
+
+        ttk.Label(sfrm, text='CLI 경로').grid(row=1, column=3, sticky='e', padx=4, pady=4)
+        ttk.Entry(sfrm, textvariable=self.var_cli_path, width=40).grid(row=1, column=4, sticky='we', padx=4, pady=4)
+        ttk.Button(sfrm, text='찾기', command=self._pick_cli).grid(row=1, column=5, padx=4, pady=4)
+
+        sbtn = ttk.Frame(sfrm)
+        sbtn.grid(row=2, column=0, columnspan=6, sticky='w', padx=4, pady=6)
+        ttk.Button(sbtn, text='등록/업데이트', command=self.on_sched_register).pack(side='left', padx=6)
+        ttk.Button(sbtn, text='해지', command=self.on_sched_unregister).pack(side='left', padx=6)
+        ttk.Button(sbtn, text='상태 확인', command=self.on_sched_status).pack(side='left', padx=6)
+
+        sfrm.columnconfigure(1, weight=1)
+        sfrm.columnconfigure(4, weight=1)
+
     def toggle_settings(self):
         if self.settings_frame.winfo_viewable():
             self.settings_frame.grid_remove()
@@ -577,6 +698,74 @@ class App(tk.Tk):
 
     def _toggle_anon_visibility(self):
         self.entry_anon.configure(show='' if self.var_show_anon.get() else '*')
+
+    # --- Scheduler helpers ---
+    def _find_cli_default(self) -> str:
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+            cand = [
+                os.path.join(base, 'ExtrusionUploaderCli.exe'),
+                os.path.join(base, 'dist', 'ExtrusionUploaderCli.exe')
+            ]
+            for p in cand:
+                if os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+        return ''
+
+    def _pick_cli(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(title='CLI 실행 파일 선택', filetypes=[('Executable','*.exe'),('All','*.*')])
+        if path:
+            self.var_cli_path.set(path)
+
+    def _run_schtasks(self, args: list[str]) -> tuple[int,str,str]:
+        try:
+            proc = subprocess.run(['schtasks'] + args, capture_output=True, text=True)
+            return proc.returncode, proc.stdout, proc.stderr
+        except Exception as e:
+            return 1, '', str(e)
+
+    def on_sched_register(self):
+        exe = self.var_cli_path.get().strip('"')
+        if not exe or not os.path.exists(exe):
+            self.log('CLI 경로가 유효하지 않습니다.')
+            return
+        name = self.var_task_name.get().strip() or 'Extrusion Uploader'
+        mode = self.var_sched_mode.get()
+        if mode == 'Daily':
+            st = self.var_sched_time.get().strip() or '01:00'
+            code, out, err = self._run_schtasks(['/Create','/TN',name,'/TR',exe,'/SC','DAILY','/ST',st,'/F'])
+        else:
+            try:
+                delay_min = int(self.var_sched_delay.get().strip() or '1')
+            except Exception:
+                delay_min = 1
+            delay = f"{delay_min:04d}:00"  # mm:ss with zero pad
+            code, out, err = self._run_schtasks(['/Create','/TN',name,'/TR',exe,'/SC','ONLOGON','/DELAY',delay,'/F'])
+        if code == 0:
+            self.log(f"스케줄 등록/업데이트 완료: {name}")
+        else:
+            self.log(f"스케줄 등록 실패: {name} | {err or out}")
+
+    def on_sched_unregister(self):
+        name = self.var_task_name.get().strip() or 'Extrusion Uploader'
+        code, out, err = self._run_schtasks(['/Delete','/TN',name,'/F'])
+        if code == 0:
+            self.log(f"스케줄 해지 완료: {name}")
+        else:
+            self.log(f"스케줄 해지 실패: {name} | {err or out}")
+
+    def on_sched_status(self):
+        name = self.var_task_name.get().strip() or 'Extrusion Uploader'
+        code, out, err = self._run_schtasks(['/Query','/TN',name])
+        if code == 0:
+            self.log(f"스케줄 상태 OK: {name}")
+            if out:
+                self.log(out.splitlines()[0])
+        else:
+            self.log(f"스케줄 존재하지 않음 또는 오류: {name} | {err or out}")
 
     def pick_plc(self):
         d = filedialog.askdirectory()

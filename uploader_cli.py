@@ -12,8 +12,83 @@ import httpx
 
 KST = timezone(timedelta(hours=9))
 
-LOG_FILE = 'processed_files.log'
-RESUME_FILE = 'upload_resume.json'
+# Data directory for logs/state (AppData)
+def get_data_dir() -> str:
+    appdata = os.getenv('APPDATA') or os.path.expanduser('~')
+    d = os.path.join(appdata, 'ExtrusionUploader')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+DATA_DIR = get_data_dir()
+LOG_PATH = os.path.join(DATA_DIR, 'processed_files.log')
+RESUME_PATH = os.path.join(DATA_DIR, 'upload_resume.json')
+
+
+def migrate_legacy_state():
+    """Merge legacy state files from script directory into AppData paths.
+    - processed_files.log: union of lines
+    - upload_resume.json: union of keys, taking max offset per key
+    """
+    legacy_dir = os.path.dirname(os.path.abspath(__file__))
+    leg_log = os.path.join(legacy_dir, 'processed_files.log')
+    leg_res = os.path.join(legacy_dir, 'upload_resume.json')
+    # Merge logs
+    try:
+        legacy_set = set()
+        if os.path.exists(leg_log):
+            try:
+                with open(leg_log, 'r', encoding='utf-8') as f:
+                    legacy_set = {line.strip() for line in f if line.strip()}
+            except UnicodeDecodeError:
+                with open(leg_log, 'r', encoding='cp949', errors='ignore') as f:
+                    legacy_set = {line.strip() for line in f if line.strip()}
+        app_set = set()
+        if os.path.exists(LOG_PATH):
+            try:
+                with open(LOG_PATH, 'r', encoding='utf-8') as f:
+                    app_set = {line.strip() for line in f if line.strip()}
+            except UnicodeDecodeError:
+                with open(LOG_PATH, 'r', encoding='cp949', errors='ignore') as f:
+                    app_set = {line.strip() for line in f if line.strip()}
+        merged = app_set | legacy_set
+        if merged and merged != app_set:
+            with open(LOG_PATH, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(sorted(merged)) + '\n')
+    except Exception:
+        pass
+    # Merge resume
+    try:
+        import json
+        leg = {}
+        if os.path.exists(leg_res):
+            try:
+                with open(leg_res, 'r', encoding='utf-8') as f:
+                    leg = json.load(f) or {}
+            except Exception:
+                leg = {}
+        app = {}
+        if os.path.exists(RESUME_PATH):
+            try:
+                with open(RESUME_PATH, 'r', encoding='utf-8') as f:
+                    app = json.load(f) or {}
+            except Exception:
+                app = {}
+        merged = dict(app)
+        for k, v in leg.items():
+            try:
+                lv = int(v)
+            except Exception:
+                lv = 0
+            try:
+                av = int(merged.get(k, 0))
+            except Exception:
+                av = 0
+            if lv > av:
+                merged[k] = lv
+        if merged != app:
+            save_resume(merged)
+    except Exception:
+        pass
 
 
 def kst_now() -> datetime:
@@ -48,7 +123,14 @@ def load_config(path: str | None = None) -> tuple[dict, str]:
         'CHECK_LOCK': 'true',
     }
     script_cfg, app_cfg = resolve_config_paths()
-    chosen = path or (script_cfg if os.path.exists(script_cfg) else (app_cfg if os.path.exists(app_cfg) else app_cfg))
+    # Always prefer AppData config; migrate from script config if needed
+    chosen = path or app_cfg
+    if not os.path.exists(chosen) and os.path.exists(script_cfg):
+        try:
+            import shutil
+            shutil.copyfile(script_cfg, chosen)
+        except Exception:
+            pass
     if os.path.exists(chosen):
         try:
             cfg.read(chosen, encoding='utf-8-sig')
@@ -63,16 +145,16 @@ def load_config(path: str | None = None) -> tuple[dict, str]:
 
 
 def save_resume(data: dict):
-    tmp = RESUME_FILE + '.tmp'
+    tmp = RESUME_PATH + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, RESUME_FILE)
+    os.replace(tmp, RESUME_PATH)
 
 
 def load_resume() -> dict:
-    if os.path.exists(RESUME_FILE):
+    if os.path.exists(RESUME_PATH):
         try:
-            with open(RESUME_FILE, 'r', encoding='utf-8') as f:
+            with open(RESUME_PATH, 'r', encoding='utf-8') as f:
                 return json.load(f) or {}
         except Exception:
             return {}
@@ -94,7 +176,7 @@ def get_resume_offset(key: str) -> int:
     return int(data.get(key, 0))
 
 
-def load_processed(log_file: str = LOG_FILE) -> set:
+def load_processed(log_file: str = LOG_PATH) -> set:
     if not os.path.exists(log_file):
         return set()
     try:
@@ -107,7 +189,7 @@ def load_processed(log_file: str = LOG_FILE) -> set:
 
 def log_processed(folder: str, filename: str):
     key = f"{folder}/{filename}"
-    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+    with open(LOG_PATH, 'a', encoding='utf-8') as f:
         f.write(key + '\n')
 
 
@@ -345,6 +427,8 @@ def list_candidates(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: int,
 
 
 def main():
+    # Migrate any legacy state from script directory to AppData
+    migrate_legacy_state()
     ap = argparse.ArgumentParser(description='Extrusion Uploader (CLI, Edge)')
     ap.add_argument('--range', dest='range_mode', choices=['today','yesterday','twodays','custom'], default=None)
     ap.add_argument('--custom-date', dest='custom_date', default=None)
@@ -405,4 +489,3 @@ def main():
 
 if __name__ == '__main__':
     raise SystemExit(main())
-
