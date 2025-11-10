@@ -1,0 +1,11 @@
+미리보기: 업로드 예정 파일 목록
+  - C:/Users/user/Documents/GitHub/Extrusion_data/Temperature_data/LandData 2025-01-16-03-07-41.csv
+  - C:/Users/user/Documents/GitHub/Extrusion_data/Temperature_data/LandData-2025-01-07_07-45-50__2025-01-08_07-45-41.csv
+업로드 예정: 2개
+제외 파일 요약:
+  - 데이터 없음: 1개
+예시(최대 10개):
+  - C:/Users/user/Documents/GitHub/Extrusion_data/Temperature_data/LandData 2025-01-02-07-49-23.csv (데이터 없음)
+
+C:\Users\user\Documents\GitHub\Extrusion_data\uploader_gui_tk.py:296: FutureWarning: Downcasting behavior in `replace` is deprecated and will be removed in a future version. To retain the old behavior, explicitly call `result.infer_objects(copy=False)`. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+  temp_series = df[temp_main].replace('-', np.nan)

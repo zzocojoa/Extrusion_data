@@ -1,15 +1,36 @@
 import os
 import pandas as pd
-from supabase import create_client, Client
 from dotenv import load_dotenv
 import numpy as np
+import httpx
 from datetime import datetime
+import sys
+
+# Ensure UTF-8 capable stdout/stderr to avoid emoji print errors on Windows consoles
+if USE_EDGE:
+    pass
+else:
+    try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
 
 # --- 설정 ---
 LOG_FILE = "processed_files.log"
+# Current source folder context for logging processed files (set before loops)
+CURRENT_FOLDER = None
 
 # .env 파일에서 환경 변수를 로드합니다.
 load_dotenv()
+
+# Prefer Edge Function configuration when available
+SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_ANON_KEY: str | None = os.environ.get("SUPABASE_ANON_KEY")
+EDGE_FUNCTION_URL: str = os.environ.get("EDGE_FUNCTION_URL", "").strip() or (
+    (SUPABASE_URL.rstrip("/") + "/functions/v1/upload-metrics") if SUPABASE_URL else ""
+)
+USE_EDGE = bool(SUPABASE_ANON_KEY and EDGE_FUNCTION_URL)
 
 # Supabase 클라이언트를 초기화합니다.
 try:
@@ -36,8 +57,24 @@ def log_processed_file(log_file: str, filename: str):
     """
     처리 완료된 파일 이름을 로그 파일에 추가합니다.
     """
+    # Prefer logging as "folder/filename" to avoid cross-folder collisions.
+    key = filename
+    try:
+        if '/' not in filename and '\\' not in filename:
+            folder = globals().get('CURRENT_FOLDER')
+            if folder:
+                key = f"{folder}/{filename}"
+    except Exception:
+        key = filename
     with open(log_file, 'a') as f:
-        f.write(filename + '\n')
+        f.write(key + '\n')
+
+def make_log_key(folder: str, filename: str) -> str:
+    return f"{folder}/{filename}"
+
+def is_processed(processed_files: set, folder: str, filename: str) -> bool:
+    key = make_log_key(folder, filename)
+    return (key in processed_files) or (filename in processed_files)
 
 def process_plc_data(file_path: str, filename: str) -> pd.DataFrame:
     """
@@ -132,11 +169,12 @@ if __name__ == "__main__":
     # --- PLC 데이터 처리 ---
     plc_folder = "PLC_data"
     print(f"\n🔄 '{plc_folder}' 폴더 처리를 시작합니다...")
+    CURRENT_FOLDER = plc_folder
     for filename in sorted(os.listdir(plc_folder)):
         if not filename.endswith('.csv'):
             continue
         
-        if filename in processed_files:
+        if is_processed(processed_files, plc_folder, filename):
             continue
 
         print(f"  - 새로운 파일 처리: {filename}")
@@ -154,11 +192,12 @@ if __name__ == "__main__":
     # --- 온도 데이터 처리 ---
     temp_folder = "Temperature_data"
     print(f"\n🔄 '{temp_folder}' 폴더 처리를 시작합니다...")
+    CURRENT_FOLDER = temp_folder
     for filename in sorted(os.listdir(temp_folder)):
         if not filename.endswith('.csv') or not filename.startswith('LandData'):
             continue
 
-        if filename in processed_files:
+        if is_processed(processed_files, temp_folder, filename):
             continue
             
         print(f"  - 새로운 파일 처리: {filename}")
