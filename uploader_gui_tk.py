@@ -397,11 +397,15 @@ def edge_upload(url: str, anon_key: str, df: pd.DataFrame, logfn, progress_cb=No
             progress_cb(processed, total)
         except Exception:
             pass
-    for i in range(processed, total, 500):
-        batch = records[i:i+500]
-        r = httpx.post(url, json=batch, headers=headers, timeout=30.0)
-        if r.status_code >= 300:
-            logfn(f'Edge error: {r.status_code} {r.text[:200]}')
+    for i in range(processed, total, 300):
+        batch = records[i:i+300]
+        try:
+            r = httpx.post(url, json=batch, headers=headers, timeout=30.0)
+            if r.status_code >= 300:
+                logfn(f'Edge error: {r.status_code} {r.text[:200]}')
+                return False
+        except Exception as e:
+            logfn(f'네트워크 오류 발생: {e}')
             return False
         processed = min(i + len(batch), total)
         if resume_key:

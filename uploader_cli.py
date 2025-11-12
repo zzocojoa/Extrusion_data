@@ -357,8 +357,8 @@ def edge_upload(edge_url: str, anon_key: str, df: pd.DataFrame, resume_key: str 
     start = max(0, min(start_index, total))
     if start > 0:
         log(f"    - 파일 재개 지점: {start}/{total}")
-    for i in range(start, total, 500):
-        batch = records[i:i+500]
+    for i in range(start, total, 300):
+        batch = records[i:i+300]
         try:
             r = httpx.post(edge_url, json=batch, headers=headers, timeout=30.0)
             if r.status_code >= 300:
