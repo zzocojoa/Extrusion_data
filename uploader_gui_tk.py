@@ -313,6 +313,36 @@ def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
                 if n in df.columns:
                     colmap[key] = n
                     break
+        # Fallback heuristics for commonly varying column names
+        cols = list(df.columns)
+        if 'container_temp_rear' not in colmap:
+            # 1) 이름 기반: "뒤쪽"/"후면" 포함 컬럼
+            for cname in cols:
+                # e.g. "콘테이너온도 뒤쪽", "콘테이너 온도 뒤쪽"
+                if '뒤쪽' in cname or '후면' in cname:
+                    colmap['container_temp_rear'] = cname
+                    break
+        if 'container_temp_rear' not in colmap and 'container_temp_front' in colmap:
+            # 2) 순서 기반: 앞쪽 바로 다음의 숫자형 컬럼을 뒤쪽으로 간주
+            try:
+                front_idx = cols.index(colmap['container_temp_front'])
+            except ValueError:
+                front_idx = -1
+            if front_idx >= 0:
+                used = set(colmap.values())
+                for cname in cols[front_idx + 1:]:
+                    if cname in used:
+                        continue
+                    s = df[cname]
+                    if getattr(s.dtype, 'kind', None) in ('i', 'u', 'f', 'c'):
+                        colmap['container_temp_rear'] = cname
+                        break
+        if 'production_counter' not in colmap:
+            for cname in cols:
+                # e.g. "생산카운트", "생산카운터"
+                if '생산' in cname and ('카운트' in cname or '카운터' in cname):
+                    colmap['production_counter'] = cname
+                    break
         if 'time' not in colmap:
             raise ValueError('필수 컬럼 누락(시간)')
         date_str = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}"
