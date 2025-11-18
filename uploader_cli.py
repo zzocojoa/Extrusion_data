@@ -10,85 +10,22 @@ import pandas as pd
 import numpy as np
 import httpx
 
+from core.config import get_data_dir, load_config
+from core.transform import build_records_plc as core_build_records_plc, build_records_temp as core_build_records_temp
+from core import state as core_state
+from core import files as core_files
+
 KST = timezone(timedelta(hours=9))
 
 # Data directory for logs/state (AppData)
-def get_data_dir() -> str:
-    appdata = os.getenv('APPDATA') or os.path.expanduser('~')
-    d = os.path.join(appdata, 'ExtrusionUploader')
-    os.makedirs(d, exist_ok=True)
-    return d
-
 DATA_DIR = get_data_dir()
 LOG_PATH = os.path.join(DATA_DIR, 'processed_files.log')
 RESUME_PATH = os.path.join(DATA_DIR, 'upload_resume.json')
 
 
 def migrate_legacy_state():
-    """Merge legacy state files from script directory into AppData paths.
-    - processed_files.log: union of lines
-    - upload_resume.json: union of keys, taking max offset per key
-    """
-    legacy_dir = os.path.dirname(os.path.abspath(__file__))
-    leg_log = os.path.join(legacy_dir, 'processed_files.log')
-    leg_res = os.path.join(legacy_dir, 'upload_resume.json')
-    # Merge logs
-    try:
-        legacy_set = set()
-        if os.path.exists(leg_log):
-            try:
-                with open(leg_log, 'r', encoding='utf-8') as f:
-                    legacy_set = {line.strip() for line in f if line.strip()}
-            except UnicodeDecodeError:
-                with open(leg_log, 'r', encoding='cp949', errors='ignore') as f:
-                    legacy_set = {line.strip() for line in f if line.strip()}
-        app_set = set()
-        if os.path.exists(LOG_PATH):
-            try:
-                with open(LOG_PATH, 'r', encoding='utf-8') as f:
-                    app_set = {line.strip() for line in f if line.strip()}
-            except UnicodeDecodeError:
-                with open(LOG_PATH, 'r', encoding='cp949', errors='ignore') as f:
-                    app_set = {line.strip() for line in f if line.strip()}
-        merged = app_set | legacy_set
-        if merged and merged != app_set:
-            with open(LOG_PATH, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(sorted(merged)) + '\n')
-    except Exception:
-        pass
-    # Merge resume
-    try:
-        import json
-        leg = {}
-        if os.path.exists(leg_res):
-            try:
-                with open(leg_res, 'r', encoding='utf-8') as f:
-                    leg = json.load(f) or {}
-            except Exception:
-                leg = {}
-        app = {}
-        if os.path.exists(RESUME_PATH):
-            try:
-                with open(RESUME_PATH, 'r', encoding='utf-8') as f:
-                    app = json.load(f) or {}
-            except Exception:
-                app = {}
-        merged = dict(app)
-        for k, v in leg.items():
-            try:
-                lv = int(v)
-            except Exception:
-                lv = 0
-            try:
-                av = int(merged.get(k, 0))
-            except Exception:
-                av = 0
-            if lv > av:
-                merged[k] = lv
-        if merged != app:
-            save_resume(merged)
-    except Exception:
-        pass
+    """Wrapper calling shared core.state.migrate_legacy_state."""
+    core_state.migrate_legacy_state(os.path.dirname(os.path.abspath(__file__)))
 
 
 def kst_now() -> datetime:
@@ -96,172 +33,68 @@ def kst_now() -> datetime:
 
 
 def resolve_config_paths():
+    # Kept for backward compatibility; core.config.load_config now handles paths.
     script_dir = os.path.dirname(os.path.abspath(__file__))
     script_cfg = os.path.join(script_dir, 'config.ini')
-    appdata = os.getenv('APPDATA') or os.path.expanduser('~')
-    app_dir = os.path.join(appdata, 'ExtrusionUploader')
-    try:
-        os.makedirs(app_dir, exist_ok=True)
-    except Exception:
-        pass
-    app_cfg = os.path.join(app_dir, 'config.ini')
+    app_cfg = os.path.join(get_data_dir(), 'config.ini')
     return script_cfg, app_cfg
 
 
 def load_config(path: str | None = None) -> tuple[dict, str]:
-    cfg = configparser.ConfigParser()
-    cfg.optionxform = str
-    defaults = {
-        'SUPABASE_URL': os.environ.get('SUPABASE_URL', ''),
-        'SUPABASE_ANON_KEY': os.environ.get('SUPABASE_ANON_KEY', ''),
-        'EDGE_FUNCTION_URL': os.environ.get('EDGE_FUNCTION_URL', ''),
-        'PLC_DIR': 'PLC_data',
-        'TEMP_DIR': 'Temperature_data',
-        'RANGE_MODE': 'yesterday',
-        'CUSTOM_DATE': '',
-        'MTIME_LAG_MIN': '15',
-        'CHECK_LOCK': 'true',
-    }
-    script_cfg, app_cfg = resolve_config_paths()
-    # Always prefer AppData config; migrate from script config if needed
-    chosen = path or app_cfg
-    if not os.path.exists(chosen) and os.path.exists(script_cfg):
-        try:
-            import shutil
-            shutil.copyfile(script_cfg, chosen)
-        except Exception:
-            pass
-    if os.path.exists(chosen):
-        try:
-            cfg.read(chosen, encoding='utf-8-sig')
-        except Exception:
-            with open(chosen, 'r', encoding='cp949', errors='ignore') as f:
-                content = f.read()
-            cfg.read_string(content if content.strip().startswith('[') else '[app]\n' + content)
-        if 'app' in cfg:
-            for k, v in cfg['app'].items():
-                defaults[k.upper()] = v
-    return defaults, chosen
+    # Delegate to shared core.config implementation
+    return load_config(path)
 
 
 def save_resume(data: dict):
-    tmp = RESUME_PATH + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, RESUME_PATH)
+    core_state.save_resume(data, RESUME_PATH)
 
 
 def load_resume() -> dict:
-    if os.path.exists(RESUME_PATH):
-        try:
-            with open(RESUME_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f) or {}
-        except Exception:
-            return {}
-    return {}
+    return core_state.load_resume(RESUME_PATH)
 
 
 def set_resume_offset(key: str, offset: int):
-    data = load_resume()
-    if offset <= 0:
-        if key in data:
-            del data[key]
-    else:
-        data[key] = int(offset)
-    save_resume(data)
+    core_state.set_resume_offset(key, offset, RESUME_PATH)
 
 
 def get_resume_offset(key: str) -> int:
-    data = load_resume()
-    return int(data.get(key, 0))
+    return core_state.get_resume_offset(key, RESUME_PATH)
 
 
 def load_processed(log_file: str = LOG_PATH) -> set:
-    if not os.path.exists(log_file):
-        return set()
-    try:
-        with open(log_file, 'r', encoding='utf-8') as f:
-            return set(line.strip() for line in f if line.strip())
-    except UnicodeDecodeError:
-        with open(log_file, 'r', encoding='cp949', errors='ignore') as f:
-            return set(line.strip() for line in f if line.strip())
+    return core_state.load_processed(log_file)
 
 
 def log_processed(folder: str, filename: str):
-    key = f"{folder}/{filename}"
-    with open(LOG_PATH, 'a', encoding='utf-8') as f:
-        f.write(key + '\n')
+    core_state.log_processed(folder, filename, LOG_PATH)
 
 
 def is_locked(path: str) -> bool:
-    try:
-        if os.name == 'nt':
-            import msvcrt
-            with open(path, 'rb') as fh:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                    return False
-                except OSError:
-                    return True
-        return False
-    except Exception:
-        return True
+    return core_files.is_locked(path)
 
 
 def file_mtime_kst(path: str) -> datetime:
-    ts = os.path.getmtime(path)
-    return datetime.fromtimestamp(ts, timezone.utc).astimezone(KST)
+    return core_files.file_mtime_kst(path)
 
 
 def parse_plc_date_from_filename(name: str) -> datetime | None:
-    m = re.match(r'^(\d{2})(\d{2})(\d{2})', name)
-    if not m:
-        return None
-    y, mo, d = m.groups()
-    try:
-        return datetime(int('20' + y), int(mo), int(d), tzinfo=KST)
-    except Exception:
-        return None
+    return core_files.parse_plc_date_from_filename(name)
 
 
 def parse_temp_end_date_from_filename(name: str) -> datetime | None:
-    m = re.search(r'__([0-9]{4}-[0-9]{2}-[0-9]{2})', name)
-    if m:
-        date_str = m.group(1)
-    else:
-        matches = list(re.finditer(r'([0-9]{4}-[0-9]{2}-[0-9]{2})', name))
-        if not matches:
-            return None
-        date_str = matches[-1].group(1)
-    try:
-        y, mo, d = map(int, date_str.split('-'))
-        return datetime(y, mo, d, tzinfo=KST)
-    except Exception:
-        return None
+    return core_files.parse_temp_end_date_from_filename(name)
 
 
 def within_cutoff(file_date: datetime, cutoff_date: datetime) -> bool:
-    return file_date.date() <= cutoff_date.date()
+    return core_files.within_cutoff(file_date, cutoff_date)
 
 
 def stable_enough(path: str, lag_minutes: int) -> bool:
-    last = file_mtime_kst(path)
-    return last <= (kst_now() - timedelta(minutes=lag_minutes))
+    return core_files.stable_enough(path, lag_minutes)
 
 
 def compute_cutoff(mode: str, custom_date: str) -> datetime:
-    today = kst_now().date()
-    if mode == 'today':
-        return datetime(today.year, today.month, today.day, tzinfo=KST)
-    if mode == 'twodays':
-        d = today - timedelta(days=2)
-        return datetime(d.year, d.month, d.day, tzinfo=KST)
-    if mode == 'custom' and custom_date:
-        y, m, d = map(int, custom_date.split('-'))
-        return datetime(y, m, d, tzinfo=KST)
-    d = today - timedelta(days=1)
-    return datetime(d.year, d.month, d.day, tzinfo=KST)
+    return core_files.compute_cutoff(mode, custom_date)
 
 
 def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
@@ -379,82 +212,28 @@ def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
 
 
 def edge_upload(edge_url: str, anon_key: str, df: pd.DataFrame, resume_key: str | None = None, start_index: int = 0, log=print) -> bool:
-    if df.empty:
-        log('    - 유효 데이터 없음(건너뜀)')
-        return True
-    records = df.replace({np.nan: None}).to_dict(orient='records')
-    headers = {"Authorization": f"Bearer {anon_key}", "Content-Type": "application/json"}
-    total = len(records)
-    start = max(0, min(start_index, total))
-    if start > 0:
-        log(f"    - 파일 재개 지점: {start}/{total}")
-    for i in range(start, total, 300):
-        batch = records[i:i+300]
-        try:
-            r = httpx.post(edge_url, json=batch, headers=headers, timeout=30.0)
-            if r.status_code >= 300:
-                log(f"    업로드 실패 ({r.status_code}): {r.text[:200]}")
-                return False
-        except Exception as e:
-            log(f"    업로드 예외: {e}")
-            return False
-        if resume_key:
-            set_resume_offset(resume_key, min(i + len(batch), total))
-    log(f"    {len(records)}건 업로드 완료(Edge)")
-    return True
+    return core_upload.upload_via_edge(
+        edge_url,
+        anon_key,
+        df,
+        log=log,
+        resume_key=resume_key,
+        start_index=start_index,
+        batch_size=300,
+    )
 
 
 def list_candidates(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: int, include_today: bool, check_lock: bool, quick: bool) -> list[tuple[str, str, str, str]]:
-    items = []
-    processed = load_processed()
-    # PLC
-    if os.path.isdir(plc_dir):
-        for fn in sorted(os.listdir(plc_dir)):
-            if not fn.lower().endswith('.csv'):
-                continue
-            fdate = parse_plc_date_from_filename(fn)
-            if not fdate or not within_cutoff(fdate, cutoff):
-                continue
-            path = os.path.join(plc_dir, fn)
-            if f"{plc_dir}/{fn}" in processed or fn in processed:
-                continue
-            if fdate.date() == kst_now().date() and include_today:
-                if not stable_enough(path, lag_min):
-                    continue
-                if check_lock and is_locked(path):
-                    continue
-            if quick:
-                items.append((plc_dir, fn, path, 'plc'))
-            else:
-                if not build_records_plc(path, fn).empty:
-                    items.append((plc_dir, fn, path, 'plc'))
-    # Temperature
-    if os.path.isdir(temp_dir):
-        for fn in sorted(os.listdir(temp_dir)):
-            if not fn.lower().endswith('.csv'):
-                continue
-            fdate = parse_temp_end_date_from_filename(fn)
-            if not fdate:
-                try:
-                    fdate = file_mtime_kst(os.path.join(temp_dir, fn))
-                except Exception:
-                    fdate = None
-            if not fdate or not within_cutoff(fdate, cutoff):
-                continue
-            path = os.path.join(temp_dir, fn)
-            if f"{temp_dir}/{fn}" in processed or fn in processed:
-                continue
-            if fdate.date() == kst_now().date() and include_today:
-                if not stable_enough(path, lag_min):
-                    continue
-                if check_lock and is_locked(path):
-                    continue
-            if quick:
-                items.append((temp_dir, fn, path, 'temp'))
-            else:
-                if not build_records_temp(path, fn).empty:
-                    items.append((temp_dir, fn, path, 'temp'))
-    return items
+    # For CLI we still honor "quick" by optionally filtering with content checks.
+    base_items = core_files.list_candidates(plc_dir, temp_dir, cutoff, lag_min, include_today, check_lock, quick=True)
+    if quick:
+        return base_items
+    filtered: list[tuple[str, str, str, str]] = []
+    for folder, fn, path, kind in base_items:
+        df = build_records_plc(path, fn) if kind == 'plc' else build_records_temp(path, fn)
+        if not df.empty:
+            filtered.append((folder, fn, path, kind))
+    return filtered
 
 
 def main():
@@ -516,6 +295,15 @@ def main():
             ok_all = False
     print(f'완료: {done}/{len(items)}')
     return 0 if ok_all else 1
+
+
+# Override local implementations with shared core.transform versions
+def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
+    return core_build_records_plc(file_path, filename)
+
+
+def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
+    return core_build_records_temp(file_path, filename)
 
 
 if __name__ == '__main__':
