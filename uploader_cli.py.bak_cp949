@@ -14,7 +14,6 @@ from core.config import get_data_dir, load_config
 from core.transform import build_records_plc as core_build_records_plc, build_records_temp as core_build_records_temp
 from core import state as core_state
 from core import files as core_files
-from core import upload as core_upload
 
 KST = timezone(timedelta(hours=9))
 
@@ -220,7 +219,7 @@ def edge_upload(edge_url: str, anon_key: str, df: pd.DataFrame, resume_key: str 
         log=log,
         resume_key=resume_key,
         start_index=start_index,
-        batch_size=500,
+        batch_size=300,
     )
 
 

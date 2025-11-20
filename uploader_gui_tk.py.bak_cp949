@@ -763,7 +763,7 @@ def edge_upload(url: str, anon_key: str, df: pd.DataFrame, logfn, progress_cb=No
         log=logfn,
         resume_key=resume_key,
         start_index=start_index,
-        batch_size=500,
+        batch_size=300,
         progress_cb=progress_cb,
     )
 

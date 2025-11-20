@@ -1,0 +1,120 @@
+    try:
+        try:
+            df = pd.read_csv(file_path)
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, encoding='cp949')
+        candidates = {
+            'time': ['?œê°„', '?œê°', 'Time'],
+            'main_pressure': ['ë©”ì¸?•ë ¥', 'ë©”ì¸ ?•ë ¥'],
+            'billet_length': ['ë¹Œë ›ê¸¸ì´', 'ë¹Œë › ê¸¸ì´'],
+            'container_temp_front': ['ì½˜í…Œ?´ë„ˆ?¨ë„ ?ìª½', 'ì½˜í…Œ?´ë„ˆ ?¨ë„ ?ìª½'],
+            'container_temp_rear': ['ì½˜í…Œ?´ë„ˆ?¨ë„ ?¤ìª½', 'ì½˜í…Œ?´ë„ˆ ?¨ë„ ?¤ìª½'],
+            'production_counter': ['?ì‚°ì¹´ìš´??, '?ì‚° ì¹´ìš´??],
+            'current_speed': ['?„ì¬?ë„', '?„ì¬ ?ë„'],
+        }
+        colmap = {}
+        for key, names in candidates.items():
+            for n in names:
+                if n in df.columns:
+                    colmap[key] = n
+                    break
+        # Fallback heuristics for columns that often differ by one word
+        cols = list(df.columns)
+        if 'container_temp_rear' not in colmap:
+            # 1) ?´ë¦„ ê¸°ë°˜: "?¤ìª½"/"?„ë©´" ?¬í•¨ ì»¬ëŸ¼
+            for cname in cols:
+                # e.g. "ì½˜í…Œ?´ë„ˆ?¨ë„ ?¤ìª½", "ì½˜í…Œ?´ë„ˆ ?¨ë„ ?¤ìª½"
+                if '?¤ìª½' in cname or '?„ë©´' in cname:
+                    colmap['container_temp_rear'] = cname
+                    break
+        if 'container_temp_rear' not in colmap and 'container_temp_front' in colmap:
+            # 2) ?œì„œ ê¸°ë°˜: ?ìª½ ë°”ë¡œ ?¤ìŒ???¤ëŠ” ?«ì??ì»¬ëŸ¼???¤ìª½?¼ë¡œ ê°„ì£¼
+            try:
+                front_idx = cols.index(colmap['container_temp_front'])
+            except ValueError:
+                front_idx = -1
+            if front_idx >= 0:
+                used = set(colmap.values())
+                for cname in cols[front_idx + 1:]:
+                    if cname in used:
+                        continue
+                    s = df[cname]
+                    # ?«ì???´ë§Œ ?„ë³´ë¡?                    if getattr(s.dtype, 'kind', None) in ('i', 'u', 'f', 'c'):
+                        colmap['container_temp_rear'] = cname
+                        break
+        if 'production_counter' not in colmap:
+            for cname in cols:
+                # e.g. "?ì‚°ì¹´ìš´??, "?ì‚°ì¹´ìš´??
+                if '?ì‚°' in cname and ('ì¹´ìš´?? in cname or 'ì¹´ìš´?? in cname):
+                    colmap['production_counter'] = cname
+                    break
+        if 'time' not in colmap:
+            raise ValueError('?„ìˆ˜ ì»¬ëŸ¼ ?„ë½(?œê°„)')
+        date_str = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}"
+        df['timestamp'] = df[colmap['time']].apply(lambda t: f"{date_str}T{t}+09:00")
+        out = pd.DataFrame()
+        out['timestamp'] = df['timestamp']
+        out['device_id'] = 'extruder_plc'
+        for key in ['main_pressure','billet_length','container_temp_front','container_temp_rear','production_counter','current_speed']:
+            if key in colmap:
+                out[key] = df[colmap[key]]
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+
+def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
+    try:
+        try:
+            df = pd.read_csv(file_path, header=0)
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, header=0, encoding='cp949')
+        df.columns = df.columns.str.strip().str.replace(r'\[|\]', '', regex=True)
+        lower_map = {c.lower(): c for c in df.columns}
+
+        def pick(*cands: str) -> str | None:
+            for c in cands:
+                key = c.lower()
+                if key in lower_map:
+                    return lower_map[key]
+            return None
+
+        dt_col = pick('datetime', 'date_time', '? ì§œ?œê°„', '?¼ì‹œ')
+        date_col = pick('date', '? ì§œ', '?¼ì')
+        time_col = pick('time', '?œê°„', '?œê°')
+        temp_main = pick('temperature', '?¨ë„', 'temp')
+        if temp_main is None:
+            raise ValueError('?¨ë„(Temperature) ì»¬ëŸ¼??ì°¾ì„ ???†ìŠµ?ˆë‹¤')
+
+        if dt_col is not None:
+            dt = pd.to_datetime(df[dt_col], errors='coerce')
+        elif date_col is not None and time_col is not None:
+            tstr = df[time_col].astype(str)
+            has_ms = tstr.str.count(':') >= 3
+            tconv = tstr
+            if has_ms.any():
+                parts = tstr.str.rsplit(':', n=1, expand=True)
+                tconv = parts[0] + '.' + parts[1]
+            dt = pd.to_datetime(df[date_col].astype(str) + ' ' + tconv, errors='coerce')
+        else:
+            raise ValueError('? ì§œ/?œê°„ ì»¬ëŸ¼??ì°¾ì„ ???†ìŠµ?ˆë‹¤')
+
+        out = pd.DataFrame()
+        out['timestamp'] = dt.dt.strftime('%Y-%m-%dT%H:%M:%S.%f').str.rstrip('0').str.rstrip('.') + '+09:00'
+        out['device_id'] = 'spot_temperature_sensor'
+        temp_series = df[temp_main].replace('-', np.nan)
+        out['temperature'] = pd.to_numeric(temp_series, errors='coerce')
+        out.dropna(subset=['timestamp', 'temperature'], inplace=True)
+        return out[['timestamp', 'device_id', 'temperature']]
+    except Exception:
+        return pd.DataFrame()
+
+
+def edge_upload(edge_url: str, anon_key: str, df: pd.DataFrame, resume_key: str | None = None, start_index: int = 0, log=print) -> bool:
+    return core_upload.upload_via_edge(
+        edge_url,
+        anon_key,
+        df,
+        log=log,
+        resume_key=resume_key,
+        start_index=start_index,

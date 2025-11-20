@@ -15,7 +15,7 @@ def upload_via_edge(
     log: Callable[[str], None],
     resume_key: Optional[str] = None,
     start_index: int = 0,
-    batch_size: int = 300,
+    batch_size: int = 500,
     progress_cb=None,
 ) -> bool:
     """
@@ -58,4 +58,3 @@ def upload_via_edge(
 
     log(f"    {len(records)}건 업로드 완료(Edge)")
     return True
-

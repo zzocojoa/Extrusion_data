@@ -9,6 +9,7 @@ source venv/bin/activate
 # 빌드하는 방식
 # uploader_gui_tk.py pyinstaller
 pyinstaller --onefile --noconsole --name ExtrusionUploader --icon assets\app.ico --collect-data certifi --collect-data pandas --collect-data numpy uploader_gui_tk.py
+pyinstaller ExtrusionUploader.spec
 
 # uploader_cli.py pyinstaller
 pyinstaller --onefile --noconsole --name ExtrusionUploaderCli --icon assets\app.ico --collect-data certifi --collect-data pandas --collect-data numpy uploader_cli.py
