@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -27,6 +26,7 @@ def parse_plc_date_from_filename(name: str) -> datetime | None:
 def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
     """
     Read a PLC CSV and normalize into the unified metrics schema for all_metrics.
+    Includes extrusion end position when present.
     """
     try:
         try:
@@ -53,13 +53,19 @@ def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
             ],
             # production counter (various spellings)
             "production_counter": [
-                "생산카운트",
-                "생산 카운트",
                 "생산카운터",
                 "생산 카운터",
+                "생산카운트",
+                "생산 카운트",
             ],
             # current speed
             "current_speed": ["현재속도", "현재 속도"],
+            # extrusion end position
+            "extrusion_end_position": [
+                "압출종료 위치",
+                "압출 종료 위치",
+                "압출종료위치",
+            ],
         }
 
         colmap: dict[str, str] = {}
@@ -72,9 +78,9 @@ def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
         # Fallback heuristics for commonly varying column names
         cols = list(df.columns)
         if "container_temp_rear" not in colmap:
-            # 1) name-based: contains "뒤쪽" or "후면"
+            # 1) name-based: contains "쪽" or "면"
             for cname in cols:
-                if ("뒤쪽" in cname) or ("후면" in cname):
+                if ("쪽" in cname) or ("면" in cname):
                     colmap["container_temp_rear"] = cname
                     break
         if "container_temp_rear" not in colmap and "container_temp_front" in colmap:
@@ -95,7 +101,7 @@ def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
 
         if "production_counter" not in colmap:
             for cname in cols:
-                if "생산" in cname and ("카운트" in cname or "카운터" in cname):
+                if ("생산" in cname) and (("카운터" in cname) or ("카운트" in cname)):
                     colmap["production_counter"] = cname
                     break
 
@@ -116,6 +122,7 @@ def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
             "container_temp_rear",
             "production_counter",
             "current_speed",
+            "extrusion_end_position",
         ]:
             if key in colmap:
                 out[key] = df[colmap[key]]
@@ -133,9 +140,9 @@ def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
 
     try:
         try:
-            df = pd.read_csv(file_path, header=0)
+            df = pd.read_csv(file_path, header=0, low_memory=False)
         except UnicodeDecodeError:
-            df = pd.read_csv(file_path, header=0, encoding="cp949")
+            df = pd.read_csv(file_path, header=0, encoding="cp949", low_memory=False)
 
         # normalize columns (strip spaces, remove bracket chars), build lower-case map
         df.columns = df.columns.str.strip().str.replace(r"\[|\]", "", regex=True)
@@ -178,4 +185,3 @@ def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
         return out
     except Exception:
         return pd.DataFrame()
-

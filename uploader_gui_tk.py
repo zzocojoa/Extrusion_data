@@ -1,17 +1,15 @@
-import os
+﻿import os
 import sys
 import re
 import threading
-from datetime import datetime, timedelta, timezone
-import configparser
 
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
-import httpx
 import subprocess
 
 from core.config import get_data_dir, load_config as core_load_config, save_config as core_save_config
-from core.transform import build_records_plc as core_build_records_plc, build_records_temp as core_build_records_temp
+from core.transform import build_records_plc, build_records_temp
 from core import files as core_files
 from core import upload as core_upload
 
@@ -23,7 +21,7 @@ except Exception:
 
 # Tkinter UI
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 
 KST = timezone(timedelta(hours=9))
 
@@ -31,6 +29,17 @@ KST = timezone(timedelta(hours=9))
 DATA_DIR = get_data_dir()
 LOG_PATH = os.path.join(DATA_DIR, 'processed_files.log')
 RESUME_PATH = os.path.join(DATA_DIR, 'upload_resume.json')
+# Icon path for window/taskbar (local asset)
+APP_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'app.ico')
+
+# Set explicit AppUserModelID on Windows so taskbar uses our icon
+if os.name == 'nt':
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ExtrusionUploader")
+    except Exception:
+        pass
 
 
 def _migrate_legacy_state_gui():
@@ -40,22 +49,6 @@ def _migrate_legacy_state_gui():
     import core.state as core_state
 
     core_state.migrate_legacy_state(os.path.dirname(os.path.abspath(__file__)))
-
-# Config path resolution (script-dir or %APPDATA%/ExtrusionUploader)
-_CONFIG_PATH = None
-
-def _resolve_config_paths():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    script_cfg = os.path.join(script_dir, 'config.ini')
-    appdata = os.getenv('APPDATA') or os.path.expanduser('~')
-    app_dir = os.path.join(appdata, 'ExtrusionUploader')
-    try:
-        os.makedirs(app_dir, exist_ok=True)
-    except Exception:
-        pass
-    app_cfg = os.path.join(app_dir, 'config.ini')
-    return script_cfg, app_cfg
-
 
 def kst_now() -> datetime:
     return datetime.now(KST)
@@ -99,230 +92,36 @@ def get_resume_offset(key: str) -> int:
 
 
 def is_locked(path: str) -> bool:
-    try:
-        if os.name == 'nt':
-            import msvcrt
-            with open(path, 'rb') as fh:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                    return False
-                except OSError:
-                    return True
-        return False
-    except Exception:
-        return True
+    return core_files.is_locked(path)
 
 
 def file_mtime_kst(path: str) -> datetime:
-    ts = os.path.getmtime(path)
-    return datetime.fromtimestamp(ts, timezone.utc).astimezone(KST)
+    return core_files.file_mtime_kst(path)
 
 
 def parse_plc_date_from_filename(name: str) -> datetime | None:
-    m = re.match(r'^(\d{2})(\d{2})(\d{2})', name)
-    if not m:
-        return None
-    y, mo, d = m.groups()
-    try:
-        return datetime(int('20' + y), int(mo), int(d), tzinfo=KST)
-    except Exception:
-        return None
+    return core_files.parse_plc_date_from_filename(name)
 
 
 def parse_temp_end_date_from_filename(name: str) -> datetime | None:
-    # Prefer explicit end-date marker (__YYYY-MM-DD), else last YYYY-MM-DD in name
-    m = re.search(r'__([0-9]{4}-[0-9]{2}-[0-9]{2})', name)
-    if m:
-        date_str = m.group(1)
-    else:
-        matches = list(re.finditer(r'([0-9]{4}-[0-9]{2}-[0-9]{2})', name))
-        if not matches:
-            return None
-        date_str = matches[-1].group(1)
-    try:
-        y, mo, d = map(int, date_str.split('-'))
-        return datetime(y, mo, d, tzinfo=KST)
-    except Exception:
-        return None
+    return core_files.parse_temp_end_date_from_filename(name)
 
 
 def within_cutoff(file_date: datetime, cutoff_date: datetime) -> bool:
-    return file_date.date() <= cutoff_date.date()
+    return core_files.within_cutoff(file_date, cutoff_date)
 
 
 def stable_enough(path: str, lag_minutes: int) -> bool:
-    last = file_mtime_kst(path)
-    return last <= (kst_now() - timedelta(minutes=lag_minutes))
+    return core_files.stable_enough(path, lag_minutes)
 
 
 def load_config(path: str | None = None) -> dict:
-    global _CONFIG_PATH
-    cfg, chosen = core_load_config(path)
-    _CONFIG_PATH = chosen
+    cfg, _ = core_load_config(path)
     return cfg
 
 
 def save_config(values: dict, path: str | None = None):
-    global _CONFIG_PATH
-    target = core_save_config(values, path)
-    _CONFIG_PATH = target
-
-
-def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
-    try:
-        try:
-            df = pd.read_csv(file_path)
-        except UnicodeDecodeError:
-            df = pd.read_csv(file_path, encoding='cp949')
-        candidates = {
-            'time': ['시간', '시각', 'Time'],
-            'main_pressure': ['메인압력', '메인 압력'],
-            'billet_length': ['빌렛길이', '빌렛 길이'],
-            'container_temp_front': ['콘테이너온도 앞쪽', '콘테이너 온도 앞쪽'],
-            'container_temp_rear': ['콘테이너온도 뒤쪽', '콘테이너 온도 뒤쪽'],
-            'production_counter': ['생산카운트', '생산 카운트'],
-            'current_speed': ['현재속도', '현재 속도'],
-        }
-        colmap = {}
-        for key, names in candidates.items():
-            for n in names:
-                if n in df.columns:
-                    colmap[key] = n
-                    break
-        # Fallback heuristics for commonly varying column names
-        cols = list(df.columns)
-        if 'container_temp_rear' not in colmap:
-            # 1) 이름 기반: "뒤쪽"/"후면" 포함 컬럼
-            for cname in cols:
-                # e.g. "콘테이너온도 뒤쪽", "콘테이너 온도 뒤쪽"
-                if '뒤쪽' in cname or '후면' in cname:
-                    colmap['container_temp_rear'] = cname
-                    break
-        if 'container_temp_rear' not in colmap and 'container_temp_front' in colmap:
-            # 2) 순서 기반: 앞쪽 바로 다음의 숫자형 컬럼을 뒤쪽으로 간주
-            try:
-                front_idx = cols.index(colmap['container_temp_front'])
-            except ValueError:
-                front_idx = -1
-            if front_idx >= 0:
-                used = set(colmap.values())
-                for cname in cols[front_idx + 1:]:
-                    if cname in used:
-                        continue
-                    s = df[cname]
-                    if getattr(s.dtype, 'kind', None) in ('i', 'u', 'f', 'c'):
-                        colmap['container_temp_rear'] = cname
-                        break
-        if 'production_counter' not in colmap:
-            for cname in cols:
-                # e.g. "생산카운트", "생산카운터"
-                if '생산' in cname and ('카운트' in cname or '카운터' in cname):
-                    colmap['production_counter'] = cname
-                    break
-        if 'time' not in colmap:
-            raise ValueError('필수 컬럼 누락(시간)')
-        date_str = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}"
-        df['timestamp'] = df[colmap['time']].apply(lambda t: f"{date_str}T{t}+09:00")
-        out = pd.DataFrame()
-        out['timestamp'] = df['timestamp']
-        out['device_id'] = 'extruder_plc'
-        for key in ['main_pressure','billet_length','container_temp_front','container_temp_rear','production_counter','current_speed']:
-            if key in colmap:
-                out[key] = df[colmap[key]]
-        return out
-    except Exception as e:
-        print(f"PLC 변환 오류: {filename} - {e}")
-        return pd.DataFrame()
-
-
-def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
-    try:
-        try:
-            df = pd.read_csv(file_path, header=0)
-        except UnicodeDecodeError:
-            df = pd.read_csv(file_path, header=0, encoding='cp949')
-        # normalize columns (strip spaces, remove bracket chars), build lower-case map
-        df.columns = df.columns.str.strip().str.replace(r'\[|\]', '', regex=True)
-        lower_map = {c.lower(): c for c in df.columns}
-
-        def pick(*cands: str) -> str | None:
-            for c in cands:
-                key = c.lower()
-                if key in lower_map:
-                    return lower_map[key]
-            return None
-
-        # Try to resolve columns flexibly (KR/EN)
-        dt_col = pick('datetime', 'date_time', '날짜시간', '일시')
-        date_col = pick('date', '날짜', '일자')
-        time_col = pick('time', '시간', '시각')
-        temp_main = pick('temperature', '온도', 'temp')
-
-        if temp_main is None:
-            raise ValueError('온도(Temperature) 컬럼을 찾을 수 없습니다')
-
-        # Build timestamp
-        if dt_col is not None:
-            dt = pd.to_datetime(df[dt_col], errors='coerce')
-        elif date_col is not None and time_col is not None:
-            # Handle time like HH:MM:SS:ms by converting last ':' to '.'
-            tstr = df[time_col].astype(str)
-            # if time has 3 colons, replace last ':' with '.'
-            has_ms = tstr.str.count(':') >= 3
-            tconv = tstr
-            if has_ms.any():
-                parts = tstr.str.rsplit(':', n=1, expand=True)
-                tconv = parts[0] + '.' + parts[1]
-            dt = pd.to_datetime(df[date_col].astype(str) + ' ' + tconv, errors='coerce')
-        else:
-            raise ValueError('날짜/시간 컬럼을 찾을 수 없습니다')
-
-        # Drop invalid rows
-        out = pd.DataFrame()
-        out['timestamp'] = dt.dt.strftime('%Y-%m-%dT%H:%M:%S.%f').str.rstrip('0').str.rstrip('.') + '+09:00'
-        out['device_id'] = 'spot_temperature_sensor'
-        # Build temperature strictly from Temperature column only
-        temp_series = df[temp_main].replace('-', np.nan)
-        out['temperature'] = pd.to_numeric(temp_series, errors='coerce')
-        out.dropna(subset=['timestamp', 'temperature'], inplace=True)
-        return out[['timestamp', 'device_id', 'temperature']]
-    except Exception as e:
-        print(f"온도 변환 오류: {filename} - {e}")
-        return pd.DataFrame()
-
-
-def edge_upload(url: str, anon_key: str, df: pd.DataFrame, logfn, progress_cb=None, start_index: int = 0, resume_key: str | None = None) -> bool:
-    if df.empty:
-        return True
-    records = df.replace({np.nan: None}).to_dict(orient='records')
-    headers = {"Authorization": f"Bearer {anon_key}", "Content-Type": "application/json"}
-    total = len(records)
-    processed = max(0, min(start_index, total))
-    if processed > 0 and progress_cb:
-        try:
-            progress_cb(processed, total)
-        except Exception:
-            pass
-    for i in range(processed, total, 300):
-        batch = records[i:i+300]
-        try:
-            r = httpx.post(url, json=batch, headers=headers, timeout=30.0)
-            if r.status_code >= 300:
-                logfn(f'Edge error: {r.status_code} {r.text[:200]}')
-                return False
-        except Exception as e:
-            logfn(f'네트워크 오류 발생: {e}')
-            return False
-        processed = min(i + len(batch), total)
-        if resume_key:
-            set_resume_offset(resume_key, processed)
-        if progress_cb:
-            try:
-                progress_cb(processed, total)
-            except Exception:
-                pass
-    return True
+    core_save_config(values, path)
 
 
 def compute_cutoff(mode: str, custom_date: str) -> datetime:
@@ -412,361 +211,342 @@ def preview_diagnostics(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: 
     return included, excluded
 
 
-class App(tk.Tk):
+import customtkinter as ctk
+
+# Set theme
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title('Extrusion Uploader (Edge / Tk)')
-        self.geometry('900x600')
+        self.title('Extrusion Uploader (Modern)')
+        self.geometry('1100x700')
         self.resizable(True, True)
+        try:
+            self.iconbitmap(APP_ICON)
+        except Exception:
+            pass
+        
         self.cfg = load_config()
-        self.create_widgets()
+        
+        # Shared state
+        self.active_progress = {}
+        self.progress_lock = threading.Lock()
+        self.total_files = 0
+        self.processed_count = 0
+        self.is_uploading = False
+        
+        # Grid layout (1x2)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        
+        self.create_sidebar()
+        self.create_main_area()
+        
+        # Handle window close
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Initial View
+        self.show_dashboard()
 
-    def create_widgets(self):
-        pad = {'padx': 6, 'pady': 4}
-        frm = ttk.Frame(self)
-        frm.pack(fill='both', expand=True)
+    def on_closing(self):
+        self.destroy()
+        os._exit(0)
 
-        # Settings variables
+    def create_sidebar(self):
+        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(4, weight=1)
+        
+        self.logo_label = ctk.CTkLabel(self.sidebar, text="Extrusion\nUploader", font=ctk.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+        
+        self.btn_dash = ctk.CTkButton(self.sidebar, text="대시보드", command=self.show_dashboard)
+        self.btn_dash.grid(row=1, column=0, padx=20, pady=10)
+        
+        self.btn_settings = ctk.CTkButton(self.sidebar, text="설정", command=self.show_settings)
+        self.btn_settings.grid(row=2, column=0, padx=20, pady=10)
+        
+        self.btn_logs = ctk.CTkButton(self.sidebar, text="로그", command=self.show_logs)
+        self.btn_logs.grid(row=3, column=0, padx=20, pady=10)
+        
+        # Status indicator at bottom
+        self.status_label = ctk.CTkLabel(self.sidebar, text="Ready", text_color="gray")
+        self.status_label.grid(row=5, column=0, padx=20, pady=20)
+
+    def create_main_area(self):
+        # Container for pages
+        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+
+    def clear_main(self):
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+
+    # --- Views ---
+    def show_dashboard(self):
+        self.clear_main()
+        
+        # Hero Section (Progress)
+        self.hero_frame = ctk.CTkFrame(self.main_frame)
+        self.hero_frame.grid(row=0, column=0, sticky="ew", pady=(0, 20))
+        
+        self.lbl_big_status = ctk.CTkLabel(self.hero_frame, text="대기 중", font=ctk.CTkFont(size=24, weight="bold"))
+        self.lbl_big_status.pack(pady=(20, 10))
+        
+        self.prog_bar = ctk.CTkProgressBar(self.hero_frame, width=400)
+        self.prog_bar.pack(pady=10)
+        self.prog_bar.set(0)
+        
+        self.lbl_prog_text = ctk.CTkLabel(self.hero_frame, text="0.0% (0/0)")
+        self.lbl_prog_text.pack(pady=(0, 20))
+        
+        # Active Tasks Section
+        self.tasks_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="작업 상태")
+        self.tasks_frame.grid(row=1, column=0, sticky="nsew")
+        self.main_frame.grid_rowconfigure(1, weight=1)
+        
+        self.task_labels = {} # {filename: label_widget}
+        
+        # Action Buttons
+        self.action_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.action_frame.grid(row=2, column=0, sticky="ew", pady=10)
+        
+        ctk.CTkButton(self.action_frame, text="업로드 시작", command=self.on_start, fg_color="#2CC985", hover_color="#26A670").pack(side="right", padx=10)
+        ctk.CTkButton(self.action_frame, text="미리보기", command=self.on_preview).pack(side="right", padx=10)
+
+        # Start update loop
+        self.update_dashboard_loop()
+
+    def show_settings(self):
+        self.clear_main()
+        
+        # Scrollable settings container
+        sf = ctk.CTkScrollableFrame(self.main_frame, label_text="환경 설정")
+        sf.grid(row=0, column=0, sticky="nsew")
+        
+        # Variables (sync with self.cfg)
         self.var_url = tk.StringVar(value=self.cfg['SUPABASE_URL'])
         self.var_anon = tk.StringVar(value=self.cfg['SUPABASE_ANON_KEY'])
         self.var_edge = tk.StringVar(value=self.cfg['EDGE_FUNCTION_URL'])
         self.var_plc = tk.StringVar(value=self.cfg['PLC_DIR'])
         self.var_temp = tk.StringVar(value=self.cfg['TEMP_DIR'])
-
-        # Collapsible Settings Frame
-        self.settings_frame = ttk.LabelFrame(frm, text='설정')
-        # Connection group
-        conn = ttk.LabelFrame(self.settings_frame, text='연결 설정')
-        conn.grid(row=0, column=0, columnspan=3, sticky='we', padx=6, pady=(6, 0))
-        ttk.Label(conn, text='Supabase URL').grid(row=0, column=0, sticky='w', padx=4, pady=4)
-        ttk.Entry(conn, textvariable=self.var_url, width=60).grid(row=0, column=1, columnspan=2, sticky='we', padx=4, pady=4)
-        ttk.Label(conn, text='Anon Key').grid(row=1, column=0, sticky='w', padx=4, pady=4)
-        self.entry_anon = ttk.Entry(conn, textvariable=self.var_anon, width=60, show='*')
-        self.entry_anon.grid(row=1, column=1, sticky='we', padx=4, pady=4)
-        self.var_show_anon = tk.BooleanVar(value=False)
-        ttk.Checkbutton(conn, text='키 보기', variable=self.var_show_anon, command=self._toggle_anon_visibility).grid(row=1, column=2, sticky='w', padx=4, pady=4)
-        ttk.Label(conn, text='Edge Function URL').grid(row=2, column=0, sticky='w', padx=4, pady=4)
-        ttk.Entry(conn, textvariable=self.var_edge, width=60).grid(row=2, column=1, columnspan=2, sticky='we', padx=4, pady=4)
-        conn.columnconfigure(1, weight=1)
-
-        # Folders group
-        fgrp = ttk.LabelFrame(self.settings_frame, text='데이터 폴더')
-        fgrp.grid(row=1, column=0, columnspan=3, sticky='we', padx=6, pady=(6, 6))
-        ttk.Label(fgrp, text='PLC 폴더').grid(row=0, column=0, sticky='w', padx=4, pady=4)
-        ttk.Entry(fgrp, textvariable=self.var_plc, width=50).grid(row=0, column=1, sticky='we', padx=4, pady=4)
-        ttk.Button(fgrp, text='찾기', command=self.pick_plc).grid(row=0, column=2, padx=4, pady=4)
-        ttk.Label(fgrp, text='온도 폴더').grid(row=1, column=0, sticky='w', padx=4, pady=4)
-        ttk.Entry(fgrp, textvariable=self.var_temp, width=50).grid(row=1, column=1, sticky='we', padx=4, pady=4)
-        ttk.Button(fgrp, text='찾기', command=self.pick_temp).grid(row=1, column=2, padx=4, pady=4)
-        fgrp.columnconfigure(1, weight=1)
-        self.settings_frame.grid(row=0, column=0, columnspan=4, sticky='we', **pad)
-
-        # Row 3: Range
-        ttk.Label(frm, text='업로드 범위').grid(row=5, column=0, sticky='w', **pad)
+        self.var_smart_sync = tk.BooleanVar(value=(str(self.cfg.get('SMART_SYNC', 'true')).lower() == 'true'))
         self.var_range = tk.StringVar(value=self.cfg['RANGE_MODE'])
-        rfrm = ttk.Frame(frm)
-        rfrm.grid(row=5, column=1, columnspan=3, sticky='w')
-        for text, val in [('오늘까지(안정 N분 필요)', 'today'), ('어제까지', 'yesterday'), ('이틀 전까지', 'twodays'), ('사용자 지정', 'custom')]:
-            ttk.Radiobutton(rfrm, text=text, value=val, variable=self.var_range).pack(side='left', padx=6)
+        
+        # UI Helpers
+        def add_entry(parent, label, var, row):
+            ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=5)
+            ctk.CTkEntry(parent, textvariable=var, width=400).grid(row=row, column=1, padx=10, pady=5)
+            
+        def add_path(parent, label, var, row, cmd):
+            ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=5)
+            ctk.CTkEntry(parent, textvariable=var, width=300).grid(row=row, column=1, padx=10, pady=5)
+            ctk.CTkButton(parent, text="찾기", width=80, command=cmd).grid(row=row, column=2, padx=10, pady=5)
 
-        ttk.Label(frm, text='사용자 지정(YYYY-MM-DD)').grid(row=6, column=0, sticky='w', **pad)
-        self.var_custom = tk.StringVar(value=self.cfg['CUSTOM_DATE'])
-        ttk.Entry(frm, textvariable=self.var_custom, width=16).grid(row=6, column=1, sticky='w', **pad)
+        # Connection
+        grp_conn = ctk.CTkFrame(sf)
+        grp_conn.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(grp_conn, text="연결 설정", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        add_entry(grp_conn, "Supabase URL", self.var_url, 1)
+        add_entry(grp_conn, "Anon Key", self.var_anon, 2)
+        add_entry(grp_conn, "Edge URL", self.var_edge, 3)
+        
+        # Folders
+        grp_folder = ctk.CTkFrame(sf)
+        grp_folder.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(grp_folder, text="폴더 설정", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        add_path(grp_folder, "PLC 폴더", self.var_plc, 1, self.pick_plc)
+        add_path(grp_folder, "온도 폴더", self.var_temp, 2, self.pick_temp)
+        
+        # Options
+        grp_opt = ctk.CTkFrame(sf)
+        grp_opt.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(grp_opt, text="옵션", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        
+        ctk.CTkSwitch(grp_opt, text="Smart Sync (최신 데이터만 전송)", variable=self.var_smart_sync).grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=10)
+        
+        ctk.CTkLabel(grp_opt, text="업로드 범위").grid(row=2, column=0, sticky="w", padx=10, pady=5)
+        ctk.CTkOptionMenu(grp_opt, variable=self.var_range, values=['today', 'yesterday', 'twodays', 'custom']).grid(row=2, column=1, sticky="w", padx=10, pady=5)
 
-        ttk.Label(frm, text='안정성(마지막 수정 후 분)').grid(row=7, column=0, sticky='w', **pad)
-        self.var_lag = tk.StringVar(value=str(self.cfg['MTIME_LAG_MIN']))
-        ttk.Entry(frm, textvariable=self.var_lag, width=8).grid(row=7, column=1, sticky='w', **pad)
-        self.var_lock = tk.BooleanVar(value=(str(self.cfg['CHECK_LOCK']).lower()=='true'))
-        ttk.Checkbutton(frm, text='잠금 파일 제외(가능 시)', variable=self.var_lock).grid(row=7, column=2, sticky='w', **pad)
+        # Save Button
+        ctk.CTkButton(self.main_frame, text="설정 저장", command=self.on_save).grid(row=2, column=0, pady=20)
 
-        # Buttons
-        btnfrm = ttk.Frame(frm)
-        btnfrm.grid(row=1, column=0, columnspan=4, sticky='w', **pad)
-        self.btn_settings = ttk.Button(btnfrm, text='설정 닫기', command=self.toggle_settings)
-        self.btn_settings.pack(side='left', padx=6)
-        ttk.Button(btnfrm, text='설정 저장', command=self.on_save).pack(side='left', padx=6)
-        ttk.Button(btnfrm, text='미리보기', command=self.on_preview).pack(side='left', padx=6)
-        ttk.Button(btnfrm, text='업로드 시작', command=self.on_start).pack(side='left', padx=6)
-        ttk.Button(btnfrm, text='종료', command=self.destroy).pack(side='left', padx=6)
-        # Quick preview toggle (count-only)
-        self.var_quick_preview = tk.BooleanVar(value=True)
-        ttk.Checkbutton(btnfrm, text='빠른 미리보기(파일 수만)', variable=self.var_quick_preview).pack(side='left', padx=12)
+    def show_logs(self):
+        self.clear_main()
+        self.log_box = ctk.CTkTextbox(self.main_frame, width=600)
+        self.log_box.grid(row=0, column=0, sticky="nsew")
+        self.main_frame.grid_rowconfigure(0, weight=1)
 
-        # Progress + labels + Log
-        self.prog = ttk.Progressbar(frm, orient='horizontal', length=600, mode='determinate')
-        self.prog.grid(row=2, column=0, columnspan=4, sticky='we', **pad)
-        self.lbl_prog = ttk.Label(frm, text='진행률: 0.0% (0/0) | 현재 파일: 0.00%')
-        self.lbl_prog.grid(row=3, column=0, columnspan=4, sticky='w', **pad)
-        self.txt = tk.Text(frm, height=16)
-        self.txt.grid(row=4, column=0, columnspan=4, sticky='nsew', **pad)
-
-        frm.rowconfigure(4, weight=1)
-        frm.columnconfigure(3, weight=1)
-
-        # Start with settings collapsed by default for a cleaner workspace
-        self.settings_frame.grid_remove()
-        self.btn_settings.config(text='설정 열기')
-
-        # Migrate legacy state once UI builds
-        _migrate_legacy_state_gui()
-
-        # Scheduler (Task Scheduler) controls
-        sfrm = ttk.LabelFrame(frm, text='자동 실행 (작업 스케줄러)')
-        sfrm.grid(row=5, column=0, columnspan=4, sticky='we', **pad)
-
-        # Defaults
-        self.var_sched_mode = tk.StringVar(value='Daily')  # Daily | OnLogon
-        self.var_sched_time = tk.StringVar(value='01:00')
-        self.var_sched_delay = tk.StringVar(value='1')
-        self.var_task_name = tk.StringVar(value='Extrusion Uploader Daily')
-        self.var_cli_path = tk.StringVar(value=self._find_cli_default())
-
-        ttk.Label(sfrm, text='모드').grid(row=0, column=0, sticky='w', padx=4, pady=4)
-        self.cmb_mode = ttk.Combobox(sfrm, values=['Daily','OnLogon'], textvariable=self.var_sched_mode, width=10, state='readonly')
-        self.cmb_mode.grid(row=0, column=1, sticky='w', padx=4, pady=4)
-        ttk.Label(sfrm, text='시작 시간(일일)').grid(row=0, column=2, sticky='e', padx=4, pady=4)
-        ttk.Entry(sfrm, textvariable=self.var_sched_time, width=8).grid(row=0, column=3, sticky='w', padx=4, pady=4)
-        ttk.Label(sfrm, text='지연(분, 로그온)').grid(row=0, column=4, sticky='e', padx=4, pady=4)
-        ttk.Entry(sfrm, textvariable=self.var_sched_delay, width=6).grid(row=0, column=5, sticky='w', padx=4, pady=4)
-
-        ttk.Label(sfrm, text='작업 이름').grid(row=1, column=0, sticky='w', padx=4, pady=4)
-        ttk.Entry(sfrm, textvariable=self.var_task_name, width=30).grid(row=1, column=1, columnspan=2, sticky='we', padx=4, pady=4)
-
-        ttk.Label(sfrm, text='CLI 경로').grid(row=1, column=3, sticky='e', padx=4, pady=4)
-        ttk.Entry(sfrm, textvariable=self.var_cli_path, width=40).grid(row=1, column=4, sticky='we', padx=4, pady=4)
-        ttk.Button(sfrm, text='찾기', command=self._pick_cli).grid(row=1, column=5, padx=4, pady=4)
-
-        sbtn = ttk.Frame(sfrm)
-        sbtn.grid(row=2, column=0, columnspan=6, sticky='w', padx=4, pady=6)
-        ttk.Button(sbtn, text='등록/업데이트', command=self.on_sched_register).pack(side='left', padx=6)
-        ttk.Button(sbtn, text='해지', command=self.on_sched_unregister).pack(side='left', padx=6)
-        ttk.Button(sbtn, text='상태 확인', command=self.on_sched_status).pack(side='left', padx=6)
-
-        sfrm.columnconfigure(1, weight=1)
-        sfrm.columnconfigure(4, weight=1)
-
-    def toggle_settings(self):
-        if self.settings_frame.winfo_viewable():
-            self.settings_frame.grid_remove()
-            self.btn_settings.config(text='설정 열기')
-        else:
-            self.settings_frame.grid()
-            self.btn_settings.config(text='설정 닫기')
-
-    def _toggle_anon_visibility(self):
-        self.entry_anon.configure(show='' if self.var_show_anon.get() else '*')
-
-    # --- Scheduler helpers ---
-    def _find_cli_default(self) -> str:
-        try:
-            base = os.path.dirname(os.path.abspath(__file__))
-            cand = [
-                os.path.join(base, 'ExtrusionUploaderCli.exe'),
-                os.path.join(base, 'dist', 'ExtrusionUploaderCli.exe')
-            ]
-            for p in cand:
-                if os.path.exists(p):
-                    return p
-        except Exception:
-            pass
-        return ''
-
-    def _pick_cli(self):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(title='CLI 실행 파일 선택', filetypes=[('Executable','*.exe'),('All','*.*')])
-        if path:
-            self.var_cli_path.set(path)
-
-    def _run_schtasks(self, args: list[str]) -> tuple[int,str,str]:
-        try:
-            proc = subprocess.run(['schtasks'] + args, capture_output=True, text=True)
-            return proc.returncode, proc.stdout, proc.stderr
-        except Exception as e:
-            return 1, '', str(e)
-
-    def on_sched_register(self):
-        exe = self.var_cli_path.get().strip('"')
-        if not exe or not os.path.exists(exe):
-            self.log('CLI 경로가 유효하지 않습니다.')
-            return
-        name = self.var_task_name.get().strip() or 'Extrusion Uploader'
-        mode = self.var_sched_mode.get()
-        if mode == 'Daily':
-            st = self.var_sched_time.get().strip() or '01:00'
-            code, out, err = self._run_schtasks(['/Create','/TN',name,'/TR',exe,'/SC','DAILY','/ST',st,'/F'])
-        else:
-            try:
-                delay_min = int(self.var_sched_delay.get().strip() or '1')
-            except Exception:
-                delay_min = 1
-            delay = f"{delay_min:04d}:00"  # mm:ss with zero pad
-            code, out, err = self._run_schtasks(['/Create','/TN',name,'/TR',exe,'/SC','ONLOGON','/DELAY',delay,'/F'])
-        if code == 0:
-            self.log(f"스케줄 등록/업데이트 완료: {name}")
-        else:
-            self.log(f"스케줄 등록 실패: {name} | {err or out}")
-
-    def on_sched_unregister(self):
-        name = self.var_task_name.get().strip() or 'Extrusion Uploader'
-        code, out, err = self._run_schtasks(['/Delete','/TN',name,'/F'])
-        if code == 0:
-            self.log(f"스케줄 해지 완료: {name}")
-        else:
-            self.log(f"스케줄 해지 실패: {name} | {err or out}")
-
-    def on_sched_status(self):
-        name = self.var_task_name.get().strip() or 'Extrusion Uploader'
-        code, out, err = self._run_schtasks(['/Query','/TN',name])
-        if code == 0:
-            self.log(f"스케줄 상태 OK: {name}")
-            if out:
-                self.log(out.splitlines()[0])
-        else:
-            self.log(f"스케줄 존재하지 않음 또는 오류: {name} | {err or out}")
-
+    # --- Logic Adapters ---
     def pick_plc(self):
         d = filedialog.askdirectory()
-        if d:
-            self.var_plc.set(d)
-
+        if d: self.var_plc.set(d)
+        
     def pick_temp(self):
         d = filedialog.askdirectory()
-        if d:
-            self.var_temp.set(d)
+        if d: self.var_temp.set(d)
 
-    def log(self, msg: str, color=None):
-        self.txt.insert('end', msg + '\n')
-        self.txt.see('end')
-
-    def get_values(self) -> dict:
-        return {
+    def on_save(self):
+        vals = {
             'SUPABASE_URL': self.var_url.get(),
             'SUPABASE_ANON_KEY': self.var_anon.get(),
             'EDGE_FUNCTION_URL': self.var_edge.get(),
-            'PLC_DIR': self.var_plc.get() or 'PLC_data',
-            'TEMP_DIR': self.var_temp.get() or 'Temperature_data',
+            'PLC_DIR': self.var_plc.get(),
+            'TEMP_DIR': self.var_temp.get(),
+            'SMART_SYNC': str(self.var_smart_sync.get()).lower(),
             'RANGE_MODE': self.var_range.get(),
-            'CUSTOM_DATE': self.var_custom.get(),
-            'MTIME_LAG_MIN': self.var_lag.get() or '15',
-            'CHECK_LOCK': 'true' if self.var_lock.get() else 'false',
+            # Defaults for others
+            'CUSTOM_DATE': self.cfg.get('CUSTOM_DATE', ''),
+            'MTIME_LAG_MIN': self.cfg.get('MTIME_LAG_MIN', '15'),
+            'CHECK_LOCK': self.cfg.get('CHECK_LOCK', 'true')
         }
+        save_config(vals)
+        self.cfg = vals # Update memory
+        messagebox.showinfo("저장", "설정이 저장되었습니다.")
 
-    def on_save(self):
-        save_config(self.get_values())
-        self.log('설정 저장 완료')
+    def log(self, msg):
+        # If log view is active, append
+        if hasattr(self, 'log_box') and self.log_box.winfo_exists():
+            self.log_box.insert("end", msg + "\n")
+            self.log_box.see("end")
+        print(msg) # Always print to console
+
+    def update_dashboard_loop(self):
+        if not hasattr(self, 'hero_frame') or not self.hero_frame.winfo_exists():
+            return # Dashboard not active
+            
+        # Update Progress
+        total = self.total_files if self.total_files > 0 else 1
+        pct = self.processed_count / total
+        self.prog_bar.set(pct)
+        self.lbl_prog_text.configure(text=f"{pct*100:.1f}% ({self.processed_count}/{self.total_files})")
+        
+        if self.is_uploading:
+            self.lbl_big_status.configure(text="업로드 중...", text_color="#3B8ED0")
+            self.status_label.configure(text="Running", text_color="#2CC985")
+        else:
+            self.lbl_big_status.configure(text="대기 중", text_color="gray")
+            self.status_label.configure(text="Idle", text_color="gray")
+
+        # Update Active Tasks List
+        with self.progress_lock:
+            current_files = set(self.active_progress.keys())
+            
+            # Remove old
+            for fn in list(self.task_labels.keys()):
+                if fn not in current_files:
+                    self.task_labels[fn].destroy()
+                    del self.task_labels[fn]
+            
+            # Add/Update new
+            for fn, p in self.active_progress.items():
+                text = f"{fn}: {p:.0f}%"
+                if fn not in self.task_labels:
+                    lbl = ctk.CTkLabel(self.tasks_frame, text=text, anchor="w")
+                    lbl.pack(fill="x", padx=5, pady=2)
+                    self.task_labels[fn] = lbl
+                else:
+                    self.task_labels[fn].configure(text=text)
+
+        self.after(200, self.update_dashboard_loop)
 
     def on_preview(self):
-        vals = self.get_values()
-        cutoff = compute_cutoff(vals['RANGE_MODE'], vals['CUSTOM_DATE'])
-        include_today = (vals['RANGE_MODE'] == 'today')
-        try:
-            lag = int(vals['MTIME_LAG_MIN'])
-        except Exception:
-            lag = 15
-        if self.var_quick_preview.get():
-            items = list_candidates(vals['PLC_DIR'], vals['TEMP_DIR'], cutoff, lag, include_today, vals['CHECK_LOCK']=='true')
-            self.log('미리보기(빠른): 업로드 예정 파일 목록')
-            for folder, fn, _, _ in items[:200]:
-                self.log(f'  - {folder}/{fn}')
-            self.log(f'업로드 예정: {len(items)}개')
-        else:
-            inc, exc = preview_diagnostics(vals['PLC_DIR'], vals['TEMP_DIR'], cutoff, lag, include_today, vals['CHECK_LOCK']=='true')
-            self.log('미리보기: 업로드 예정 파일 목록')
-            for folder, fn, _, _ in inc[:200]:
-                self.log(f'  - {folder}/{fn}')
-            self.log(f'업로드 예정: {len(inc)}개')
-            if exc:
-                # summarize reasons
-                summary = {}
-                for folder, fn, reason in exc:
-                    summary[reason] = summary.get(reason, 0) + 1
-                self.log('제외 파일 요약:')
-                for reason, cnt in summary.items():
-                    self.log(f'  - {reason}: {cnt}개')
-                self.log('예시(최대 10개):')
-                for folder, fn, reason in exc[:10]:
-                    self.log(f'  - {folder}/{fn} ({reason})')
+        self.show_logs()
+        self.log("미리보기 시작...")
+        # Reuse existing preview logic, just redirect log
+        threading.Thread(target=self._run_preview_logic, daemon=True).start()
+
+    def _run_preview_logic(self):
+        # Quick adaptation of original preview logic
+        vals = self.cfg
+        cutoff = compute_cutoff(vals['RANGE_MODE'], vals.get('CUSTOM_DATE', ''))
+        items = list_candidates(vals['PLC_DIR'], vals['TEMP_DIR'], cutoff, 15, vals['RANGE_MODE']=='today', True)
+        self.log(f"업로드 대상: {len(items)}개 파일")
+        for _, fn, _, _ in items[:20]:
+            self.log(f" - {fn}")
+        if len(items) > 20: self.log("...")
 
     def on_start(self):
-        vals = self.get_values()
-        self.prog['value'] = 0
-        self.txt.delete('1.0', 'end')
-        threading.Thread(target=self._run_upload, args=(vals,), daemon=True).start()
+        self.show_dashboard()
+        self.is_uploading = True
+        self.processed_count = 0
+        self.total_files = 0
+        with self.progress_lock:
+            self.active_progress.clear()
+            
+        threading.Thread(target=self._run_upload, args=(self.cfg,), daemon=True).start()
 
     def _run_upload(self, vals: dict):
+        import concurrent.futures
+
         url = vals['SUPABASE_URL'].strip()
         anon = vals['SUPABASE_ANON_KEY'].strip()
         edge = vals['EDGE_FUNCTION_URL'].strip() or (url.rstrip('/') + '/functions/v1/upload-metrics')
-        cutoff = compute_cutoff(vals['RANGE_MODE'], vals['CUSTOM_DATE'])
+        cutoff = compute_cutoff(vals['RANGE_MODE'], vals.get('CUSTOM_DATE', ''))
         include_today = (vals['RANGE_MODE'] == 'today')
         try:
-            lag = int(vals['MTIME_LAG_MIN'])
+            lag = int(vals.get('MTIME_LAG_MIN', '15'))
         except Exception:
             lag = 15
-        check_lock = (vals['CHECK_LOCK'] == 'true')
+        check_lock = (vals.get('CHECK_LOCK', 'true') == 'true')
+        enable_smart_sync = (vals.get('SMART_SYNC', 'true') == 'true')
 
         items = list_candidates(vals['PLC_DIR'], vals['TEMP_DIR'], cutoff, lag, include_today, check_lock)
-        self.log(f'대상 파일: {len(items)}개')
+        self.total_files = len(items)
+        
         if not items:
+            self.is_uploading = False
+            self.log("업로드 대상 없음")
             return
 
-        total_files = len(items)
-        self.prog['maximum'] = total_files
-        count = 0
-        for folder, fn, path, kind in items:
+        count_lock = threading.Lock()
+        max_workers = 4
+
+        def upload_single_file(item):
+            folder, fn, path, kind = item
             key = f'{folder}/{fn}'
-            start_idx = get_resume_offset(key)
-            if start_idx > 0:
-                self.log(f'업로드 재개: {folder}/{fn} (재개 지점 {start_idx}행)')
-            else:
-                self.log(f'업로드 시작: {folder}/{fn}')
-            df = build_records_plc(path, fn) if kind == 'plc' else build_records_temp(path, fn)
+            
             def per_file_cb(done, total):
-                pct = (done/total*100.0) if total else 100.0
-                overall_pct = ((count + (done/total if total else 0))/total_files*100.0) if total_files else 100.0
-                self.lbl_prog.config(text=f'진행률: {overall_pct:0.1f}% ({count}/{total_files}) | 현재 파일: {pct:0.2f}%')
-                self.update_idletasks()
-            ok = edge_upload(edge, anon, df, self.log, progress_cb=per_file_cb, start_index=start_idx, resume_key=key)
-            if ok:
-                log_processed(folder, fn)
-                # 성공 시 재개 지점 제거
-                set_resume_offset(key, 0)
-                count += 1
-                self.prog['value'] = count
-                overall_pct = (count/total_files*100.0) if total_files else 100.0
-                self.lbl_prog.config(text=f'진행률: {overall_pct:0.1f}% ({count}/{total_files}) | 현재 파일: 100.00%')
-                self.update_idletasks()
-            else:
-                self.log(f'업로드 실패: {folder}/{fn}')
-        self.log(f'완료: {count}개 파일 업로드')
+                if total > 0:
+                    p = (done / total) * 100.0
+                    with self.progress_lock:
+                        self.active_progress[fn] = p
 
+            ok = core_upload.upload_item(
+                edge, anon, folder, fn, path, kind,
+                build_plc=build_records_plc,
+                build_temp=build_records_temp,
+                get_resume_offset=get_resume_offset,
+                set_resume_offset_fn=set_resume_offset,
+                log_processed_fn=log_processed,
+                log=self.log, # Redirect to GUI log
+                batch_size=500,
+                progress_cb=per_file_cb,
+                enable_smart_sync=enable_smart_sync,
+            )
+            
+            with self.progress_lock:
+                if fn in self.active_progress:
+                    del self.active_progress[fn]
+            return ok, key
 
-# Override local PLC / temperature record builders with shared core.transform versions
-def build_records_plc(file_path: str, filename: str) -> pd.DataFrame:
-    return core_build_records_plc(file_path, filename)
-
-
-def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
-    return core_build_records_temp(file_path, filename)
-
-
-def list_candidates(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: int, include_today: bool, check_lock: bool):
-    # GUI uses quick candidate selection (no content check)
-    return core_files.list_candidates(plc_dir, temp_dir, cutoff, lag_min, include_today, check_lock, quick=True)
-
-
-def edge_upload(url: str, anon_key: str, df: pd.DataFrame, logfn, progress_cb=None, start_index: int = 0, resume_key: str | None = None) -> bool:
-    return core_upload.upload_via_edge(
-        url,
-        anon_key,
-        df,
-        log=logfn,
-        resume_key=resume_key,
-        start_index=start_index,
-        batch_size=500,
-        progress_cb=progress_cb,
-    )
-
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {executor.submit(upload_single_file, item): item for item in items}
+            for future in concurrent.futures.as_completed(future_to_file):
+                try:
+                    ok, key = future.result()
+                    with count_lock:
+                        self.processed_count += 1
+                except Exception as e:
+                    self.log(f"Error: {e}")
+        
+        self.is_uploading = False
+        self.log("모든 업로드 완료")
 
 if __name__ == '__main__':
     App().mainloop()
+

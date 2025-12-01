@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import re
 import argparse
@@ -212,18 +212,6 @@ def build_records_temp(file_path: str, filename: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def edge_upload(edge_url: str, anon_key: str, df: pd.DataFrame, resume_key: str | None = None, start_index: int = 0, log=print) -> bool:
-    return core_upload.upload_via_edge(
-        edge_url,
-        anon_key,
-        df,
-        log=log,
-        resume_key=resume_key,
-        start_index=start_index,
-        batch_size=500,
-    )
-
-
 def list_candidates(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: int, include_today: bool, check_lock: bool, quick: bool) -> list[tuple[str, str, str, str]]:
     # For CLI we still honor "quick" by optionally filtering with content checks.
     base_items = core_files.list_candidates(plc_dir, temp_dir, cutoff, lag_min, include_today, check_lock, quick=True)
@@ -276,26 +264,38 @@ def main():
     print('범위:', mode, custom or '')
     print('폴더:', plc_dir, '|', temp_dir)
 
-    items = list_candidates(plc_dir, temp_dir, cutoff, lag, include_today, check_lock, quick=args.quick)
-    print(f'대상 파일: {len(items)}개')
-    if not items:
-        return 0
-
-    ok_all = True
-    done = 0
-    for folder, fn, path, kind in items:
-        key = f'{folder}/{fn}'
-        start_idx = get_resume_offset(key)
-        print(f'- 업로드: {key} (재개 {start_idx})')
-        df = build_records_plc(path, fn) if kind == 'plc' else build_records_temp(path, fn)
-        if edge_upload(edge_url, anon_key, df, resume_key=key, start_index=start_idx, log=print):
-            log_processed(folder, fn)
-            set_resume_offset(key, 0)
-            done += 1
-        else:
-            ok_all = False
-    print(f'완료: {done}/{len(items)}')
-    return 0 if ok_all else 1
+    items = list_candidates(plc_dir, temp_dir, cutoff, lag, include_today, check_lock, quick=args.quick)                                                                                      
+    print(f'대상 파일: {len(items)}개')                                                                                                                                                       
+    if not items:                                                                                                                                                                             
+        return 0                                                                                                                                                                              
+                                                                                                                                                                                            
+    ok_all = True                                                                                                                                                                             
+    done = 0                                                                                                                                                                                  
+    for folder, fn, path, kind in items:                                                                                                                                                      
+        print(f'- 업로드 {folder}/{fn}')                                                                                                                                                      
+        ok = core_upload.upload_item(                                                                                                                                                         
+            edge_url,                                                                                                                                                                         
+            anon_key,                                                                                                                                                                         
+            folder,                                                                                                                                                                           
+            fn,                                                                                                                                                                               
+            path,                                                                                                                                                                             
+            kind,                                                                                                                                                                             
+            build_plc=build_records_plc,                                                                                                                                                      
+            build_temp=build_records_temp,                                                                                                                                                    
+            get_resume_offset=get_resume_offset,                                                                                                                                              
+            set_resume_offset_fn=set_resume_offset,                                                                                                                                           
+            log_processed_fn=log_processed,                                                                                                                                                   
+            log=print,                                                                                                                                                                        
+            batch_size=500,                                                                                                                                                                   
+            progress_cb=None,                                                                                                                                                                 
+        )                                                                                                                                                                                     
+        if ok:                                                                                                                                                                                
+            done += 1                                                                                                                                                                         
+        else:                                                                                                                                                                                 
+            ok_all = False                                                                                                                                                                    
+                                                                                                                                                                                            
+    print(f'완료: {done}/{len(items)}개')                                                                                                                                                     
+    return 0 if ok_all else 1      
 
 
 # Override local implementations with shared core.transform versions
