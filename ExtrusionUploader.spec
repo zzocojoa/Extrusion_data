@@ -5,6 +5,9 @@ datas = []
 datas += collect_data_files('certifi')
 datas += collect_data_files('pandas')
 datas += collect_data_files('numpy')
+datas += collect_data_files('numpy')
+datas += collect_data_files('customtkinter')
+datas += [('assets', 'assets')]
 
 
 block_cipher = None
@@ -15,7 +18,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=['customtkinter', 'PIL', 'PIL.Image', 'packaging', 'jaraco.text', 'jaraco.classes', 'jaraco.context'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -41,8 +44,7 @@ a = Analysis(
         'sklearn',
         # Visualization / imaging
         'matplotlib',
-        'PIL',
-        'Pillow',
+        'matplotlib',
         'imageio',
         # Testing frameworks
         'pytest',

@@ -2,6 +2,7 @@
 import sys
 import re
 import threading
+import queue
 
 from datetime import datetime, timedelta, timezone
 import pandas as pd
@@ -22,15 +23,28 @@ except Exception:
 # Tkinter UI
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from PIL import Image
 
 KST = timezone(timedelta(hours=9))
 
 # Data directory (AppData) for persistent state
+# Data directory (AppData) for persistent state
 DATA_DIR = get_data_dir()
 LOG_PATH = os.path.join(DATA_DIR, 'processed_files.log')
 RESUME_PATH = os.path.join(DATA_DIR, 'upload_resume.json')
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    return os.path.join(base_path, relative_path)
+
 # Icon path for window/taskbar (local asset)
-APP_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'app.ico')
+APP_ICON = resource_path(os.path.join('assets', 'app.ico'))
 
 # Set explicit AppUserModelID on Windows so taskbar uses our icon
 if os.name == 'nt':
@@ -220,7 +234,7 @@ ctk.set_default_color_theme("blue")
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title('Extrusion Uploader (Modern)')
+        self.title('Extrusion Uploader')
         self.geometry('1100x700')
         self.resizable(True, True)
         try:
@@ -236,6 +250,12 @@ class App(ctk.CTk):
         self.total_files = 0
         self.processed_count = 0
         self.is_uploading = False
+        self.pause_event = threading.Event()
+        self.pause_event.set() # Start as running (not paused)
+        
+        # Thread-safe logging
+        self.log_queue = queue.Queue()
+        self.check_log_queue()
         
         # Grid layout (1x2)
         self.grid_columnconfigure(1, weight=1)
@@ -259,16 +279,24 @@ class App(ctk.CTk):
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_rowconfigure(4, weight=1)
         
-        self.logo_label = ctk.CTkLabel(self.sidebar, text="Extrusion\nUploader", font=ctk.CTkFont(size=20, weight="bold"))
+        # Load Logo
+        logo_path = resource_path(os.path.join('assets', 'logo.png'))
+        try:
+            logo_img = ctk.CTkImage(light_image=Image.open(logo_path), dark_image=Image.open(logo_path), size=(80, 80))
+            self.logo_label = ctk.CTkLabel(self.sidebar, text="Extrusion\nUploader", image=logo_img, compound="top", font=ctk.CTkFont(size=20, weight="bold"))
+        except Exception as e:
+            print(f"Logo load failed: {e}")
+            self.logo_label = ctk.CTkLabel(self.sidebar, text="Extrusion\nUploader", font=ctk.CTkFont(size=20, weight="bold"))
+            
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
         
-        self.btn_dash = ctk.CTkButton(self.sidebar, text="대시보드", command=self.show_dashboard)
+        self.btn_dash = ctk.CTkButton(self.sidebar, text="Dashboard", command=self.show_dashboard)
         self.btn_dash.grid(row=1, column=0, padx=20, pady=10)
         
-        self.btn_settings = ctk.CTkButton(self.sidebar, text="설정", command=self.show_settings)
+        self.btn_settings = ctk.CTkButton(self.sidebar, text="Settings", command=self.show_settings)
         self.btn_settings.grid(row=2, column=0, padx=20, pady=10)
         
-        self.btn_logs = ctk.CTkButton(self.sidebar, text="로그", command=self.show_logs)
+        self.btn_logs = ctk.CTkButton(self.sidebar, text="Logs", command=self.show_logs)
         self.btn_logs.grid(row=3, column=0, padx=20, pady=10)
         
         # Status indicator at bottom
@@ -294,7 +322,7 @@ class App(ctk.CTk):
         self.hero_frame = ctk.CTkFrame(self.main_frame)
         self.hero_frame.grid(row=0, column=0, sticky="ew", pady=(0, 20))
         
-        self.lbl_big_status = ctk.CTkLabel(self.hero_frame, text="대기 중", font=ctk.CTkFont(size=24, weight="bold"))
+        self.lbl_big_status = ctk.CTkLabel(self.hero_frame, text="Waiting...", font=ctk.CTkFont(size=24, weight="bold"))
         self.lbl_big_status.pack(pady=(20, 10))
         
         self.prog_bar = ctk.CTkProgressBar(self.hero_frame, width=400)
@@ -305,7 +333,7 @@ class App(ctk.CTk):
         self.lbl_prog_text.pack(pady=(0, 20))
         
         # Active Tasks Section
-        self.tasks_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="작업 상태")
+        self.tasks_frame = ctk.CTkScrollableFrame(self.main_frame, label_text="Task Status")
         self.tasks_frame.grid(row=1, column=0, sticky="nsew")
         self.main_frame.grid_rowconfigure(1, weight=1)
         
@@ -315,8 +343,18 @@ class App(ctk.CTk):
         self.action_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.action_frame.grid(row=2, column=0, sticky="ew", pady=10)
         
-        ctk.CTkButton(self.action_frame, text="업로드 시작", command=self.on_start, fg_color="#2CC985", hover_color="#26A670").pack(side="right", padx=10)
-        ctk.CTkButton(self.action_frame, text="미리보기", command=self.on_preview).pack(side="right", padx=10)
+        start_state = "disabled" if self.is_uploading else "normal"
+        self.btn_start = ctk.CTkButton(self.action_frame, text="Start Upload", command=self.on_start, state=start_state, fg_color="#2CC985", hover_color="#26A670")
+        self.btn_start.pack(side="right", padx=10)
+        
+        # Determine initial state based on current upload status
+        pause_state = "normal" if self.is_uploading else "disabled"
+        pause_text = "Resume" if self.is_uploading and not self.pause_event.is_set() else "Pause"
+        
+        self.btn_pause = ctk.CTkButton(self.action_frame, text=pause_text, command=self.on_pause, state=pause_state, fg_color="#E5C07B", hover_color="#D1A03D")
+        self.btn_pause.pack(side="right", padx=10)
+        
+        ctk.CTkButton(self.action_frame, text="Preview", command=self.on_preview).pack(side="right", padx=10)
 
         # Start update loop
         self.update_dashboard_loop()
@@ -380,6 +418,11 @@ class App(ctk.CTk):
         self.log_box = ctk.CTkTextbox(self.main_frame, width=600)
         self.log_box.grid(row=0, column=0, sticky="nsew")
         self.main_frame.grid_rowconfigure(0, weight=1)
+        
+        # Restore history
+        if hasattr(self, 'log_history'):
+            self.log_box.insert("1.0", "\n".join(self.log_history) + "\n")
+            self.log_box.see("end")
 
     # --- Logic Adapters ---
     def pick_plc(self):
@@ -408,11 +451,37 @@ class App(ctk.CTk):
         self.cfg = vals # Update memory
         messagebox.showinfo("저장", "설정이 저장되었습니다.")
 
+    def check_log_queue(self):
+        """Check queue for new log messages and update GUI in main thread"""
+        if not hasattr(self, 'log_history'):
+            self.log_history = []
+
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                
+                # Add to history
+                self.log_history.append(msg)
+                if len(self.log_history) > 2000:
+                    self.log_history = self.log_history[-1500:] # Keep last 1500
+                
+                # Update UI if visible
+                if hasattr(self, 'log_box') and self.log_box.winfo_exists():
+                    self.log_box.insert("end", msg + "\n")
+                    self.log_box.see("end")
+                    
+                    # Prevent infinite growth in widget (Sync with history size roughly)
+                    if float(self.log_box.index("end")) > 2500:
+                        self.log_box.delete("1.0", "1000.0")
+        except queue.Empty:
+            pass
+        finally:
+            # Schedule next check
+            self.after(100, self.check_log_queue)
+
     def log(self, msg):
-        # If log view is active, append
-        if hasattr(self, 'log_box') and self.log_box.winfo_exists():
-            self.log_box.insert("end", msg + "\n")
-            self.log_box.see("end")
+        # Put message in queue (Thread-safe)
+        self.log_queue.put(msg)
         print(msg) # Always print to console
 
     def update_dashboard_loop(self):
@@ -426,10 +495,14 @@ class App(ctk.CTk):
         self.lbl_prog_text.configure(text=f"{pct*100:.1f}% ({self.processed_count}/{self.total_files})")
         
         if self.is_uploading:
-            self.lbl_big_status.configure(text="업로드 중...", text_color="#3B8ED0")
-            self.status_label.configure(text="Running", text_color="#2CC985")
+            if not self.pause_event.is_set():
+                self.lbl_big_status.configure(text="Paused", text_color="#E5C07B")
+                self.status_label.configure(text="Paused", text_color="#E5C07B")
+            else:
+                self.lbl_big_status.configure(text="Uploading...", text_color="#3B8ED0")
+                self.status_label.configure(text="Running", text_color="#2CC985")
         else:
-            self.lbl_big_status.configure(text="대기 중", text_color="gray")
+            self.lbl_big_status.configure(text="Waiting...", text_color="gray")
             self.status_label.configure(text="Idle", text_color="gray")
 
         # Update Active Tasks List
@@ -470,6 +543,21 @@ class App(ctk.CTk):
             self.log(f" - {fn}")
         if len(items) > 20: self.log("...")
 
+    def on_pause(self):
+        if not self.is_uploading:
+            return
+            
+        if self.pause_event.is_set():
+            # Pause it
+            self.pause_event.clear()
+            self.btn_pause.configure(text="Resume")
+            self.log("일시정지 요청됨...")
+        else:
+            # Resume it
+            self.pause_event.set()
+            self.btn_pause.configure(text="Pause")
+            self.log("작업 재개됨")
+
     def on_start(self):
         self.show_dashboard()
         self.is_uploading = True
@@ -477,6 +565,10 @@ class App(ctk.CTk):
         self.total_files = 0
         with self.progress_lock:
             self.active_progress.clear()
+            
+        self.pause_event.set()
+        self.btn_pause.configure(state="normal", text="일시정지")
+        self.btn_start.configure(state="disabled")
             
         threading.Thread(target=self._run_upload, args=(self.cfg,), daemon=True).start()
 
@@ -527,6 +619,7 @@ class App(ctk.CTk):
                 batch_size=500,
                 progress_cb=per_file_cb,
                 enable_smart_sync=enable_smart_sync,
+                pause_event=self.pause_event
             )
             
             with self.progress_lock:
@@ -546,7 +639,21 @@ class App(ctk.CTk):
         
         self.is_uploading = False
         self.log("모든 업로드 완료")
+        self.btn_pause.configure(state="disabled")
+        self.btn_start.configure(state="normal")
+
+
+def list_candidates(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: int, include_today: bool, check_lock: bool):
+    # GUI uses quick candidate selection (no content check)
+    return core_files.list_candidates(plc_dir, temp_dir, cutoff, lag_min, include_today, check_lock, quick=True)
 
 if __name__ == '__main__':
+    import signal
+    
+    def handle_sigint(signum, frame):
+        print("\nForce exiting...")
+        os._exit(0)
+        
+    signal.signal(signal.SIGINT, handle_sigint)
     App().mainloop()
 

@@ -2,7 +2,13 @@
 venv/
 processed_files.log
 .DS_Store
+.env
+venv/
+processed_files.log
+.DS_Store
 __pycache__/
 *.pyc
 config.ini
 backups/
+build/
+dist/

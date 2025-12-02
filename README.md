@@ -18,6 +18,21 @@ source venv/bin/activate
 
 .\venv\Scripts\Activate.ps1
 
+# 실행 방법
+
+## 1. 실행 파일 (권장)
+
+`dist/ExtrusionUploader.exe` 파일을 더블 클릭하여 실행합니다. (별도의 설치나
+Python 환경 설정이 필요 없습니다.)
+
+## 2. 소스 코드 실행 (개발용)
+
+# 가상환경 활성화
+
+.\venv\Scripts\Activate.ps1
+
+# 실행
+
 python uploader_gui_tk.py
 
 # 빌드하는 방식
@@ -26,7 +41,7 @@ python uploader_gui_tk.py
 
 pyinstaller --onefile --noconsole --name ExtrusionUploader --icon assets\app.ico
 --collect-data certifi --collect-data pandas --collect-data numpy
-uploader_gui_tk.py pyinstaller ExtrusionUploader.spec
+uploader_gui_tk.py pyinstaller --clean ExtrusionUploader.spec
 
 # uploader_cli.py pyinstaller
 
@@ -48,3 +63,6 @@ assets\app.ico --collect-data certifi --collect-data pandas --collect-data numpy
 1. Linux Shell (bash/sh) 진입 docker exec -it supabase-db bash
 2. PostgreSQL 클라이언트 진입 psql -U postgres -d postgres
 3. 이후 권한 명령 실행
+
+```
+```
