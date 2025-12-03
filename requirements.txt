@@ -7,3 +7,4 @@ PySimpleGUI~=5.0
 customtkinter~=5.2.2
 packaging
 Pillow
+psycopg2-binary

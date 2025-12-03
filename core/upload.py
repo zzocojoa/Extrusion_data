@@ -264,3 +264,152 @@ def upload_item(
     log_processed_fn(folder, filename)
     set_resume_offset_fn(key, 0)
     return True
+
+
+def upload_work_log_data(
+    supabase_url: str,
+    anon_key: str,
+    df: pd.DataFrame,
+    log: Callable[[str], None]
+) -> bool:
+    """
+    Upload Work Log DataFrame to 'tb_work_log' table via Supabase REST API.
+    Includes Smart Filtering to prevent duplicates based on 'start_time'.
+    """
+    if df.empty:
+        log("데이터가 없습니다.")
+        return True
+
+    # 1. Prepare Data
+    df_upload = df.copy()
+    
+    # Ensure timestamps are ISO strings
+    for col in ["start_time", "end_time"]:
+        if col in df_upload.columns:
+            df_upload[col] = df_upload[col].apply(
+                lambda x: x.isoformat() if pd.notnull(x) and not isinstance(x, str) else x
+            )
+
+    # 2. Smart Filter: Check for duplicates (Composite Key)
+    # User requested: start_time + machine_id + die_number + production_qty + production_weight + productivity
+    try:
+        machine_ids = df_upload['machine_id'].unique()
+        if len(machine_ids) > 0:
+            m_ids_str = ",".join(machine_ids)
+            query_url = f"{supabase_url}/rest/v1/tb_work_log"
+            params = {
+                "select": "start_time,machine_id,die_number,production_qty,production_weight,productivity",
+                "machine_id": f"in.({m_ids_str})"
+            }
+            headers = {
+                "apikey": anon_key,
+                "Authorization": f"Bearer {anon_key}",
+            }
+            
+            r = httpx.get(query_url, params=params, headers=headers, timeout=10.0)
+            if r.status_code == 200:
+                existing_data = r.json()
+                existing_signatures = set()
+                
+                for item in existing_data:
+                    ts = item.get('start_time')
+                    if ts:
+                        try:
+                            # Normalize DB time to UTC
+                            dt = pd.to_datetime(ts).tz_convert("UTC")
+                            
+                            # Build signature tuple
+                            sig = (
+                                item.get('machine_id'),
+                                dt,
+                                item.get('die_number'),
+                                item.get('production_qty'),
+                                item.get('production_weight'),
+                                item.get('productivity')
+                            )
+                            existing_signatures.add(sig)
+                        except Exception:
+                            pass
+
+                original_len = len(df_upload)
+                
+                def is_new(row):
+                    t = row.get('start_time')
+                    if not t: return True
+                    
+                    try:
+                        # Normalize Row time to UTC
+                        # row['start_time'] is already ISO string from step 1?
+                        # Wait, step 1 converted to ISO string. pd.to_datetime works on ISO strings.
+                        dt = pd.to_datetime(t).tz_convert("UTC")
+                        
+                        # Helper to normalize numeric values (handle None/NaN/float vs int)
+                        def norm(v):
+                            if pd.isna(v) or v is None: return None
+                            try:
+                                f = float(v)
+                                return int(f) if f.is_integer() else f
+                            except:
+                                return v
+
+                        sig = (
+                            row.get('machine_id'),
+                            dt,
+                            norm(row.get('die_number')),
+                            norm(row.get('production_qty')),
+                            norm(row.get('production_weight')),
+                            norm(row.get('productivity'))
+                        )
+                        
+                        if sig in existing_signatures:
+                            return False
+                    except Exception:
+                        pass
+                    
+                    return True
+
+                df_upload = df_upload[df_upload.apply(is_new, axis=1)]
+                filtered_len = len(df_upload)
+                
+                if original_len != filtered_len:
+                    log(f"중복 제거: {original_len - filtered_len}건 (남은 데이터: {filtered_len}건)")
+            else:
+                # Fail-Close
+                log(f"중복 체크 실패 (서버 오류 {r.status_code}). 데이터 안전을 위해 업로드를 중단합니다.")
+                return False
+
+    except Exception as e:
+        # Fail-Close
+        log(f"중복 체크 중 치명적 오류: {e}. 업로드를 중단합니다.")
+        return False
+
+    if df_upload.empty:
+        log("업로드할 새로운 데이터가 없습니다.")
+        return True
+
+    # 3. Upload
+    table_url = f"{supabase_url}/rest/v1/tb_work_log"
+    headers = {
+        "apikey": anon_key,
+        "Authorization": f"Bearer {anon_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    
+    # Convert to dict, handling NaN/pd.NA correctly
+    # 1. Convert to object to allow None in all columns
+    # 2. Replace pd.NA and np.nan with None
+    df_clean = df_upload.astype(object).where(pd.notnull(df_upload), None)
+    records = df_clean.to_dict(orient="records")
+
+    try:
+        r = httpx.post(table_url, json=records, headers=headers, timeout=30.0)
+        if r.status_code >= 300:
+            log(f"업로드 실패 ({r.status_code}): {r.text}")
+            return False
+        
+        log(f"업로드 성공: {len(records)}건")
+        return True
+    except Exception as e:
+        log(f"업로드 중 오류 발생: {e}")
+        return False

@@ -8,6 +8,8 @@ SUPABASE_URL=http://localhost:54321
 DB_PASSWORD=your_password
 ```
 
+http://127.0.0.1:54323
+
 # 가상환경 실행
 
 # macOS

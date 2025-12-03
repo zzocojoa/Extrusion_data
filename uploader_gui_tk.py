@@ -13,6 +13,7 @@ from core.config import get_data_dir, load_config as core_load_config, save_conf
 from core.transform import build_records_plc, build_records_temp
 from core import files as core_files
 from core import upload as core_upload
+from core import work_log as core_work_log
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -277,7 +278,7 @@ class App(ctk.CTk):
     def create_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(4, weight=1)
+        self.sidebar.grid_rowconfigure(5, weight=1)
         
         # Load Logo
         logo_path = resource_path(os.path.join('assets', 'logo.png'))
@@ -299,9 +300,12 @@ class App(ctk.CTk):
         self.btn_logs = ctk.CTkButton(self.sidebar, text="Logs", command=self.show_logs)
         self.btn_logs.grid(row=3, column=0, padx=20, pady=10)
         
+        self.btn_work_log = ctk.CTkButton(self.sidebar, text="Work Log", command=self.show_work_log)
+        self.btn_work_log.grid(row=4, column=0, padx=20, pady=10)
+        
         # Status indicator at bottom
         self.status_label = ctk.CTkLabel(self.sidebar, text="Ready", text_color="gray")
-        self.status_label.grid(row=5, column=0, padx=20, pady=20)
+        self.status_label.grid(row=6, column=0, padx=20, pady=20)
 
     def create_main_area(self):
         # Container for pages
@@ -423,6 +427,79 @@ class App(ctk.CTk):
         if hasattr(self, 'log_history'):
             self.log_box.insert("1.0", "\n".join(self.log_history) + "\n")
             self.log_box.see("end")
+
+    def show_work_log(self):
+        self.clear_main()
+        
+        # Header
+        ctk.CTkLabel(self.main_frame, text="작업일보 업로드", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=20)
+        
+        # File Selection
+        frame_file = ctk.CTkFrame(self.main_frame)
+        frame_file.pack(fill="x", padx=20, pady=10)
+        
+        self.lbl_work_log_file = ctk.CTkLabel(frame_file, text="선택된 파일 없음", text_color="gray")
+        self.lbl_work_log_file.pack(side="left", padx=10, expand=True)
+        
+        ctk.CTkButton(frame_file, text="파일 선택 (Excel)", command=self.on_select_work_log).pack(side="right", padx=10)
+        
+        # Upload Button
+        self.btn_upload_work_log = ctk.CTkButton(self.main_frame, text="업로드 시작", command=self.on_upload_work_log, state="disabled", fg_color="#2CC985")
+        self.btn_upload_work_log.pack(pady=20)
+        
+        # Log area
+        self.work_log_box = ctk.CTkTextbox(self.main_frame, width=600, height=300)
+        self.work_log_box.pack(fill="both", expand=True, padx=20, pady=10)
+        
+    def on_select_work_log(self):
+        f = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls *.xlsm")])
+        if f:
+            self.selected_work_log_path = f
+            self.lbl_work_log_file.configure(text=os.path.basename(f), text_color="white")
+            self.btn_upload_work_log.configure(state="normal")
+            
+    def on_upload_work_log(self):
+        if not hasattr(self, 'selected_work_log_path') or not self.selected_work_log_path:
+            return
+            
+        self.btn_upload_work_log.configure(state="disabled")
+        path = self.selected_work_log_path
+        
+        def _run():
+            self.log_to_box(f"파일 분석 시작: {os.path.basename(path)}")
+            try:
+                df = core_work_log.parse_work_log_excel(path)
+                self.log_to_box(f"분석 완료: {len(df)}건 발견")
+                
+                url = self.cfg['SUPABASE_URL']
+                anon = self.cfg['SUPABASE_ANON_KEY']
+                
+                self.log_to_box("업로드 중...")
+                ok = core_upload.upload_work_log_data(url, anon, df, self.log_to_box)
+                
+                if ok:
+                    self.log_to_box("작업 완료!")
+                    messagebox.showinfo("성공", "작업일보 업로드가 완료되었습니다.")
+                else:
+                    self.log_to_box("업로드 실패.")
+                    messagebox.showerror("실패", "업로드 중 오류가 발생했습니다.")
+                    
+            except Exception as e:
+                self.log_to_box(f"오류 발생: {e}")
+                messagebox.showerror("오류", str(e))
+            finally:
+                self.btn_upload_work_log.configure(state="normal")
+                
+        threading.Thread(target=_run, daemon=True).start()
+
+    def log_to_box(self, msg):
+        self.after(0, lambda: self._append_work_log_msg(msg))
+        
+    def _append_work_log_msg(self, msg):
+        if hasattr(self, 'work_log_box') and self.work_log_box.winfo_exists():
+            self.work_log_box.insert("end", msg + "\n")
+            self.work_log_box.see("end")
+        print(f"[WorkLog] {msg}")
 
     # --- Logic Adapters ---
     def pick_plc(self):

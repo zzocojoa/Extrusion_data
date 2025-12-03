@@ -26,7 +26,7 @@ revoke truncate on table "public"."all_metrics_processed" from "authenticated";
 
 revoke update on table "public"."all_metrics_processed" from "authenticated";
 
-revoke select on table "public"."all_metrics_processed" from "grafana";
+-- revoke select on table "public"."all_metrics_processed" from "grafana";
 
 revoke delete on table "public"."all_metrics_processed" from "service_role";
 
@@ -42,7 +42,8 @@ revoke truncate on table "public"."all_metrics_processed" from "service_role";
 
 revoke update on table "public"."all_metrics_processed" from "service_role";
 
-drop table "public"."all_metrics_processed";
+drop materialized view if exists "public"."all_metrics_processed";
+drop table if exists "public"."all_metrics_processed";
 
 set check_function_bodies = off;
 
@@ -173,11 +174,11 @@ create or replace view "public"."metrics_view" as  SELECT all_metrics_processed.
 
 grant select on table "public"."all_metrics" to "supabase_admin";
 
-grant select on table "public"."tb_work_log" to "grafana";
+-- grant select on table "public"."tb_work_log" to "grafana";
 
 grant select on table "public"."tb_work_log" to "supabase_admin";
 
-grant select on table "public"."temp_machine_starts" to "grafana";
+-- grant select on table "public"."temp_machine_starts" to "grafana";
 
 grant select on table "public"."temp_machine_starts" to "supabase_admin";
 
