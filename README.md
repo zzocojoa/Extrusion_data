@@ -24,8 +24,7 @@ source venv/bin/activate
 
 ## 1. 실행 파일 (권장)
 
-`dist/ExtrusionUploader.exe` 파일을 더블 클릭하여 실행합니다. (별도의 설치나
-Python 환경 설정이 필요 없습니다.)
+`dist/ExtrusionUploader.exe` 파일을 더블 클릭하여 실행합니다. (별도의 설치나 Python 환경 설정이 필요 없습니다.)
 
 ## 2. 소스 코드 실행 (개발용)
 

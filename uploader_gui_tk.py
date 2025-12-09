@@ -12,14 +12,10 @@ import subprocess
 from core.config import get_data_dir, load_config as core_load_config, save_config as core_save_config
 from core.transform import build_records_plc, build_records_temp
 from core import files as core_files
-from core import upload as core_upload
-from core import work_log as core_work_log
+import core.upload as core_upload
+import core.work_log as core_work_log
+import core.cycle_processing as core_cycle
 
-try:
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
-except Exception:
-    pass
 
 # Tkinter UI
 import tkinter as tk
@@ -302,6 +298,9 @@ class App(ctk.CTk):
         
         self.btn_work_log = ctk.CTkButton(self.sidebar, text="Work Log", command=self.show_work_log)
         self.btn_work_log.grid(row=4, column=0, padx=20, pady=10)
+
+        self.btn_data = ctk.CTkButton(self.sidebar, text="Data Mgmt", command=self.show_data_mgmt)
+        self.btn_data.grid(row=5, column=0, padx=20, pady=10)
         
         # Status indicator at bottom
         self.status_label = ctk.CTkLabel(self.sidebar, text="Ready", text_color="gray")
@@ -499,7 +498,109 @@ class App(ctk.CTk):
         if hasattr(self, 'work_log_box') and self.work_log_box.winfo_exists():
             self.work_log_box.insert("end", msg + "\n")
             self.work_log_box.see("end")
-        print(f"[WorkLog] {msg}")
+
+    # --- Data Management View ---
+    def show_data_mgmt(self):
+        self.clear_main()
+        
+        ctk.CTkLabel(self.main_frame, text="데이터 관리 (Data Management)", font=ctk.CTkFont(size=20, weight="bold")).pack(pady=20)
+        
+        frame_actions = ctk.CTkFrame(self.main_frame)
+        frame_actions.pack(fill="x", padx=20, pady=10)
+        
+        ctk.CTkLabel(frame_actions, text="사이클 분석 (Cycle Segmentation)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
+        ctk.CTkLabel(frame_actions, text="새로 추가된 센서 데이터를 분석하여 사이클 단위로 변환하고 DB에 저장합니다.", text_color="gray").pack(anchor="w", padx=10)
+        
+        # Range selection (similar to Settings)
+        range_frame = ctk.CTkFrame(frame_actions)
+        range_frame.pack(fill="x", padx=10, pady=5)
+        
+        ctk.CTkLabel(range_frame, text="처리 범위:").pack(side="left", padx=5)
+        self.var_cycle_range = tk.StringVar(value="incremental")
+        self.cycle_range_menu = ctk.CTkOptionMenu(
+            range_frame, 
+            variable=self.var_cycle_range,
+            values=['incremental', 'all', 'today', 'yesterday', 'custom'],
+            command=self.on_cycle_range_change
+        )
+        self.cycle_range_menu.pack(side="left", padx=5)
+        
+        # Custom date entry (hidden by default)
+        self.cycle_custom_date_frame = ctk.CTkFrame(range_frame)
+        self.var_cycle_custom_date = tk.StringVar(value="2025-01-01")
+        ctk.CTkLabel(self.cycle_custom_date_frame, text="시작일:").pack(side="left", padx=5)
+        ctk.CTkEntry(self.cycle_custom_date_frame, textvariable=self.var_cycle_custom_date, width=100).pack(side="left", padx=5)
+        
+        self.btn_run_analysis = ctk.CTkButton(frame_actions, text="분석 실행", command=self.on_run_analysis, fg_color="#2CC985")
+        self.btn_run_analysis.pack(pady=10)
+        
+        # Progress bar
+        self.data_progress_bar = ctk.CTkProgressBar(self.main_frame, width=400)
+        self.data_progress_bar.pack(pady=10)
+        self.data_progress_bar.set(0)
+        
+        self.data_progress_label = ctk.CTkLabel(self.main_frame, text="0%")
+        self.data_progress_label.pack()
+        
+        # Log area
+        self.data_log_box = ctk.CTkTextbox(self.main_frame, width=600, height=300)
+        self.data_log_box.pack(fill="both", expand=True, padx=20, pady=10)
+        
+    def on_cycle_range_change(self, choice):
+        """Show/hide custom date entry based on selection"""
+        if choice == 'custom':
+            self.cycle_custom_date_frame.pack(side="left", padx=5)
+        else:
+            self.cycle_custom_date_frame.pack_forget()
+        
+    def on_run_analysis(self):
+        self.btn_run_analysis.configure(state="disabled")
+        self.data_log_box.delete("1.0", "end")
+        self.data_progress_bar.set(0)
+        self.data_progress_label.configure(text="0%")
+        
+        range_mode = self.var_cycle_range.get()
+        custom_date = self.var_cycle_custom_date.get() if range_mode == 'custom' else None
+        
+        self.log_to_data_box(f"분석 시작 (범위: {range_mode})...")
+        
+        def _run():
+            try:
+                processor = core_cycle.CycleProcessor(
+                    log_callback=self.log_to_data_box,
+                    progress_callback=self.update_data_progress
+                )
+                
+                if range_mode == 'incremental':
+                    processor.run_incremental()
+                else:
+                    # Full history or date range processing
+                    processor.run_range(mode=range_mode, custom_date=custom_date)
+                    
+            except Exception as e:
+                self.log_to_data_box(f"오류 발생: {e}")
+                import traceback
+                self.log_to_data_box(traceback.format_exc())
+            finally:
+                self.after(0, lambda: self.btn_run_analysis.configure(state="normal"))
+                
+        threading.Thread(target=_run, daemon=True).start()
+        
+    def log_to_data_box(self, msg):
+        self.after(0, lambda: self._append_data_msg(msg))
+        
+    def _append_data_msg(self, msg):
+        if hasattr(self, 'data_log_box') and self.data_log_box.winfo_exists():
+            self.data_log_box.insert("end", str(msg) + "\n")
+            self.data_log_box.see("end")
+    
+    def update_data_progress(self, value):
+        """Update progress bar from background thread"""
+        def _update():
+            if hasattr(self, 'data_progress_bar') and self.data_progress_bar.winfo_exists():
+                self.data_progress_bar.set(value)
+                self.data_progress_label.configure(text=f"{int(value * 100)}%")
+        self.after(0, _update)
 
     # --- Logic Adapters ---
     def pick_plc(self):
