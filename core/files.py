@@ -35,14 +35,25 @@ def file_mtime_kst(path: str) -> datetime:
 
 
 def parse_plc_date_from_filename(name: str) -> datetime | None:
+    # 1. Legacy PLC: YYMMDD...
     m = re.match(r"^(\d{2})(\d{2})(\d{2})", name)
-    if not m:
-        return None
-    y, mo, d = m.groups()
-    try:
-        return datetime(int("20" + y), int(mo), int(d), tzinfo=KST)
-    except Exception:
-        return None
+    if m:
+        y, mo, d = m.groups()
+        try:
+            return datetime(int("20" + y), int(mo), int(d), tzinfo=KST)
+        except Exception:
+            pass
+            
+    # 2. Integrated Log: Factory_Integrated_Log_YYYYMMDD_...
+    m2 = re.match(r"Factory_Integrated_Log_(\d{4})(\d{2})(\d{2})_", name)
+    if m2:
+        y, mo, d = m2.groups()
+        try:
+            return datetime(int(y), int(mo), int(d), tzinfo=KST)
+        except Exception:
+            pass
+
+    return None
 
 
 def parse_temp_end_date_from_filename(name: str) -> datetime | None:
@@ -86,7 +97,7 @@ def compute_cutoff(mode: str, custom_date: str) -> datetime:
 
 def list_candidates(
     plc_dir: str,
-    temp_dir: str,
+    temp_dir: str | None,
     cutoff: datetime,
     lag_min: int,
     include_today: bool,
@@ -105,7 +116,9 @@ def list_candidates(
             if not fn.lower().endswith(".csv"):
                 continue
             fdate = parse_plc_date_from_filename(fn)
-            if not fdate or not within_cutoff(fdate, cutoff):
+            if not fdate:
+                continue
+            if not within_cutoff(fdate, cutoff):
                 continue
             path = os.path.join(plc_dir, fn)
             if f"{plc_dir}/{fn}" in processed or fn in processed:
@@ -117,28 +130,8 @@ def list_candidates(
                     continue
             items.append((plc_dir, fn, path, "plc"))
 
-    # Temperature
-    if os.path.isdir(temp_dir):
-        for fn in sorted(os.listdir(temp_dir)):
-            if not fn.lower().endswith(".csv"):
-                continue
-            fdate = parse_temp_end_date_from_filename(fn)
-            if not fdate:
-                try:
-                    fdate = file_mtime_kst(os.path.join(temp_dir, fn))
-                except Exception:
-                    fdate = None
-            if not fdate or not within_cutoff(fdate, cutoff):
-                continue
-            path = os.path.join(temp_dir, fn)
-            if f"{temp_dir}/{fn}" in processed or fn in processed:
-                continue
-            if fdate.date() == kst_now().date() and include_today:
-                if not stable_enough(path, lag_min):
-                    continue
-                if check_lock and is_locked(path):
-                    continue
-            items.append((temp_dir, fn, path, "temp"))
+    # Temperature (Removed)
+    # logic removed for single folder refactor
 
     return items
 

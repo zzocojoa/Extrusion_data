@@ -5,7 +5,7 @@ import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 type Metric = {
   timestamp: string;
-  device_id: string;
+  // device_id: string; // Removed
   temperature?: number | null;
   main_pressure?: number | null;
   billet_length?: number | null;
@@ -14,11 +14,21 @@ type Metric = {
   production_counter?: number | null;
   current_speed?: number | null;
   extrusion_end_position?: number | null;
+  // New columns
+  mold_1?: number | null;
+  mold_2?: number | null;
+  mold_3?: number | null;
+  mold_4?: number | null;
+  mold_5?: number | null;
+  mold_6?: number | null;
+  billet_temp?: number | null;
+  at_pre?: number | null;
+  at_temp?: number | null;
 };
 
 const ALLOWED_KEYS = new Set<keyof Metric>([
   "timestamp",
-  "device_id",
+  // "device_id",
   "temperature",
   "main_pressure",
   "billet_length",
@@ -27,6 +37,15 @@ const ALLOWED_KEYS = new Set<keyof Metric>([
   "production_counter",
   "current_speed",
   "extrusion_end_position",
+  "mold_1",
+  "mold_2",
+  "mold_3",
+  "mold_4",
+  "mold_5",
+  "mold_6",
+  "billet_temp",
+  "at_pre",
+  "at_temp",
 ]);
 
 // 숫자 필드 안전 캐스팅
@@ -47,19 +66,16 @@ function cleanRecord(raw: Record<string, unknown>): Metric | null {
   for (const [key, value] of Object.entries(raw)) {
     if (!ALLOWED_KEYS.has(key as keyof Metric)) continue;
 
-    if (key === "timestamp" || key === "device_id") {
+    if (key === "timestamp") {
       if (typeof value !== "string") return null;
-      cleaned[key as "timestamp" | "device_id"] = value;
+      cleaned[key] = value;
     } else {
-      // timestamp, device_id가 아닌 키는 모두 숫자형(또는 null)
+      // timestamp가 아닌 키는 모두 숫자형(또는 null)
       (cleaned as any)[key] = toNumberOrNull(value);
     }
   }
 
-  if (
-    typeof cleaned.timestamp !== "string" ||
-    typeof cleaned.device_id !== "string"
-  ) {
+  if (typeof cleaned.timestamp !== "string") {
     return null;
   }
 
@@ -80,7 +96,6 @@ function createSupabaseClient(req: Request): SupabaseClient {
   const url = getEnv("SUPABASE_URL") ??
     "http://supabase_kong_Extrusion_data:8000"; // 컨테이너 이름 사용
 
-  // Service Role Key 제거 -> Anon Key 및 요청 헤더 사용
   const anonKey = getEnv("SUPABASE_ANON_KEY");
   const authHeader = req.headers.get("Authorization");
 
@@ -88,7 +103,6 @@ function createSupabaseClient(req: Request): SupabaseClient {
     throw new Error("SUPABASE_ANON_KEY is not set");
   }
 
-  // 클라이언트의 Auth Context를 그대로 전달
   return createClient(url, anonKey, {
     global: {
       headers: {
@@ -117,20 +131,10 @@ function jsonResponse(
 // 메인 핸들러
 Deno.serve(async (req: Request): Promise<Response> => {
   // 1) 메서드 체크
+  console.log("Edge Function Filter: Version 2.0 (No Device ID)");
   if (req.method === "GET") {
     // GET: 최신 타임스탬프 조회 (Smart Sync)
-    const url = new URL(req.url);
-    const deviceId = url.searchParams.get("device_id");
-
-    if (!deviceId) {
-      return jsonResponse(
-        {
-          success: false,
-          error: "Missing device_id parameter",
-        },
-        400,
-      );
-    }
+    // device_id 파라미터는 무시합니다 (이제 단일 스트림)
 
     let supabase: SupabaseClient;
     try {
@@ -145,7 +149,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const { data, error } = await supabase
       .from("all_metrics")
       .select("timestamp")
-      .eq("device_id", deviceId)
+      // .eq("device_id", deviceId) // Removed filtering
       .order("timestamp", { ascending: false })
       .limit(1)
       .single();
@@ -188,7 +192,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
-  // 3) records 배열 추출 (배열 또는 { records: [...] } 둘 다 지원)
+  // 3) records 배열 추출
   let rawRecords: unknown;
   if (Array.isArray(body)) {
     rawRecords = body;
@@ -261,15 +265,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const { error, count } = await supabase
       .from("all_metrics")
       .upsert(batch, {
-        onConflict: "timestamp,device_id",
+        onConflict: "timestamp", // Changed from timestamp,device_id
         ignoreDuplicates: true,
         count: "exact",
       });
 
     if (error) {
       console.error("Supabase upsert error:", error);
-
-      // ✅ 여기서부터는 에러 시 500 반환 (이전의 문제였던 200 → 500으로 수정)
       return jsonResponse(
         {
           success: false,

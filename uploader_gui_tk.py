@@ -10,7 +10,7 @@ import numpy as np
 import subprocess
 
 from core.config import get_data_dir, load_config as core_load_config, save_config as core_save_config
-from core.transform import build_records_plc, build_records_temp
+from core.transform import build_records_plc
 from core import files as core_files
 import core.upload as core_upload
 import core.work_log as core_work_log
@@ -142,10 +142,8 @@ def compute_cutoff(mode: str, custom_date: str) -> datetime:
 
 def process_file(kind: str, path: str, filename: str) -> pd.DataFrame:
     try:
-        if kind == 'plc':
-            return build_records_plc(path, filename)
-        elif kind == 'temp':
-            return build_records_temp(path, filename)
+        # Single mode: always use build_records_plc (now integrated)
+        return build_records_plc(path, filename)
     except Exception:
         pass
     return pd.DataFrame()
@@ -266,10 +264,22 @@ class App(ctk.CTk):
         
         # Initial View
         self.show_dashboard()
+        
+        # Close Splash Screen
+        self.after(200, self.close_splash)
+
 
     def on_closing(self):
         self.destroy()
         os._exit(0)
+
+    def close_splash(self):
+        try:
+            import pyi_splash
+            pyi_splash.close()
+            print("Splash screen closed.")
+        except ImportError:
+            pass
 
     def create_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
@@ -304,7 +314,17 @@ class App(ctk.CTk):
         
         # Status indicator at bottom
         self.status_label = ctk.CTkLabel(self.sidebar, text="Ready", text_color="gray")
-        self.status_label.grid(row=6, column=0, padx=20, pady=20)
+
+        # Auto-Start Upload Check
+        if self.cfg.get('AUTO_UPLOAD') == 'true':
+            self.log_queue.put("자동 업로드 설정이 켜져 있습니다. 5초 후 시작합니다...")
+            self.after(5000, self.auto_start_upload)
+
+    def auto_start_upload(self):
+        """Called after delay if AUTO_UPLOAD is true"""
+        if not self.is_uploading:
+            self.log_queue.put("자동 업로드 시작!")
+            self.on_start()
 
     def create_main_area(self):
         # Container for pages
@@ -364,6 +384,10 @@ class App(ctk.CTk):
 
     def show_settings(self):
         self.clear_main()
+        # Reset grid weights (dashboard sets row 1 weight)
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(1, weight=0) 
+
         
         # Scrollable settings container
         sf = ctk.CTkScrollableFrame(self.main_frame, label_text="환경 설정")
@@ -374,8 +398,10 @@ class App(ctk.CTk):
         self.var_anon = tk.StringVar(value=self.cfg['SUPABASE_ANON_KEY'])
         self.var_edge = tk.StringVar(value=self.cfg['EDGE_FUNCTION_URL'])
         self.var_plc = tk.StringVar(value=self.cfg['PLC_DIR'])
-        self.var_temp = tk.StringVar(value=self.cfg['TEMP_DIR'])
+        # self.var_temp = tk.StringVar(value=self.cfg['TEMP_DIR']) # Removed
+
         self.var_smart_sync = tk.BooleanVar(value=(str(self.cfg.get('SMART_SYNC', 'true')).lower() == 'true'))
+        self.var_auto_upload = tk.BooleanVar(value=(str(self.cfg.get('AUTO_UPLOAD', 'false')).lower() == 'true'))
         self.var_range = tk.StringVar(value=self.cfg['RANGE_MODE'])
         
         # UI Helpers
@@ -400,8 +426,9 @@ class App(ctk.CTk):
         grp_folder = ctk.CTkFrame(sf)
         grp_folder.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(grp_folder, text="폴더 설정", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
-        add_path(grp_folder, "PLC 폴더", self.var_plc, 1, self.pick_plc)
-        add_path(grp_folder, "온도 폴더", self.var_temp, 2, self.pick_temp)
+        add_path(grp_folder, "데이터 폴더", self.var_plc, 1, self.pick_plc)
+        # Temp folder removed
+
         
         # Options
         grp_opt = ctk.CTkFrame(sf)
@@ -409,9 +436,10 @@ class App(ctk.CTk):
         ctk.CTkLabel(grp_opt, text="옵션", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=5)
         
         ctk.CTkSwitch(grp_opt, text="Smart Sync (최신 데이터만 전송)", variable=self.var_smart_sync).grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=10)
+        ctk.CTkSwitch(grp_opt, text="앱 실행 시 자동 업로드 시작", variable=self.var_auto_upload).grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=10)
         
-        ctk.CTkLabel(grp_opt, text="업로드 범위").grid(row=2, column=0, sticky="w", padx=10, pady=5)
-        ctk.CTkOptionMenu(grp_opt, variable=self.var_range, values=['today', 'yesterday', 'twodays', 'custom']).grid(row=2, column=1, sticky="w", padx=10, pady=5)
+        ctk.CTkLabel(grp_opt, text="업로드 범위").grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        ctk.CTkOptionMenu(grp_opt, variable=self.var_range, values=['today', 'yesterday', 'twodays', 'custom']).grid(row=3, column=1, sticky="w", padx=10, pady=5)
 
         # Save Button
         ctk.CTkButton(self.main_frame, text="설정 저장", command=self.on_save).grid(row=2, column=0, pady=20)
@@ -607,9 +635,10 @@ class App(ctk.CTk):
         d = filedialog.askdirectory()
         if d: self.var_plc.set(d)
         
-    def pick_temp(self):
-        d = filedialog.askdirectory()
-        if d: self.var_temp.set(d)
+    # def pick_temp(self):
+    #     d = filedialog.askdirectory()
+    #     if d: self.var_temp.set(d)
+
 
     def on_save(self):
         vals = {
@@ -617,7 +646,9 @@ class App(ctk.CTk):
             'SUPABASE_ANON_KEY': self.var_anon.get(),
             'EDGE_FUNCTION_URL': self.var_edge.get(),
             'PLC_DIR': self.var_plc.get(),
-            'TEMP_DIR': self.var_temp.get(),
+            # 'TEMP_DIR': self.var_temp.get(), # Removed
+            'AUTO_UPLOAD': str(self.var_auto_upload.get()).lower(),
+
             'SMART_SYNC': str(self.var_smart_sync.get()).lower(),
             'RANGE_MODE': self.var_range.get(),
             # Defaults for others
@@ -765,12 +796,20 @@ class App(ctk.CTk):
         check_lock = (vals.get('CHECK_LOCK', 'true') == 'true')
         enable_smart_sync = (vals.get('SMART_SYNC', 'true') == 'true')
 
-        items = list_candidates(vals['PLC_DIR'], vals['TEMP_DIR'], cutoff, lag, include_today, check_lock)
+        # Simplified: Scan only PLC_DIR (Data Folder)
+        # Note: We ignore TEMP_DIR logic
+        pdir = vals['PLC_DIR']
+        self.log(f"스캔 폴더: {pdir}")
+        items = list_candidates(pdir, None, cutoff, lag, include_today, check_lock)
+        self.log(f"발견된 파일 수: {len(items)}")
+        if not items and os.path.exists(pdir):
+             self.log(f"폴더 내 파일: {os.listdir(pdir)[:5]}")
+        
         self.total_files = len(items)
         
         if not items:
             self.is_uploading = False
-            self.log("업로드 대상 없음")
+            self.log("업로드 대상 없음 (데이터 폴더를 확인하세요)")
             return
 
         count_lock = threading.Lock()
@@ -779,6 +818,9 @@ class App(ctk.CTk):
         def upload_single_file(item):
             folder, fn, path, kind = item
             key = f'{folder}/{fn}'
+            
+            # Always use integrated builder
+            # kind is technically 'plc' coming from list_candidates
             
             def per_file_cb(done, total):
                 if total > 0:
@@ -789,7 +831,7 @@ class App(ctk.CTk):
             ok = core_upload.upload_item(
                 edge, anon, folder, fn, path, kind,
                 build_plc=build_records_plc,
-                build_temp=build_records_temp,
+                build_temp=None, # unused
                 get_resume_offset=get_resume_offset,
                 set_resume_offset_fn=set_resume_offset,
                 log_processed_fn=log_processed,

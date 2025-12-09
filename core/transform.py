@@ -91,17 +91,37 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
                             colmap["production_counter"] = cname
                             break
 
-            if "time" not in colmap:
-                # If required column missing, return empty
+            # --- [Modified] Integrated Log Detection & Date Parsing ---
+            is_integrated = False
+            if 'Date' in df.columns and 'Time' in df.columns and 'Mold1' in df.columns:
+                is_integrated = True
+            
+            if is_integrated:
+                # Factory Integrated Log: Date + Time columns
+                try:
+                    # Combine Date and Time
+                    # Date: YYYY-MM-DD, Time: HH:MM:SS.mmm
+                    df["timestamp"] = pd.to_datetime(
+                        df["Date"].astype(str) + " " + df["Time"].astype(str),
+                        errors="coerce"
+                    ).dt.strftime("%Y-%m-%dT%H:%M:%S.%f+09:00")
+                except Exception:
+                    return pd.DataFrame(), colmap
+            elif "time" in colmap:
+                # Legacy PLC: Filename Date + Time column
+                date_str = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}"
+                df["timestamp"] = df[colmap["time"]].apply(
+                    lambda t: f"{date_str}T{t}+09:00"
+                )
+            else:
+                # No time info found
                 return pd.DataFrame(), colmap
 
-            date_str = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}"
-            df["timestamp"] = df[colmap["time"]].apply(
-                lambda t: f"{date_str}T{t}+09:00"
-            )
             out = pd.DataFrame()
             out["timestamp"] = df["timestamp"]
-            out["device_id"] = "extruder_plc"
+            # out["device_id"] = "extruder_integrated" if is_integrated else "extruder_plc" # Removed
+            
+            # Map standard columns
             for key in [
                 "main_pressure",
                 "billet_length",
@@ -113,6 +133,26 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
             ]:
                 if key in colmap:
                     out[key] = df[colmap[key]]
+                    
+            # Map integrated columns if present
+            if is_integrated:
+                # Explicit mapping for integrated log
+                val_map = {
+                    "Temperature": "temperature", # Integrated log has 'Temperature' column
+                    "Mold1": "mold_1",
+                    "Mold2": "mold_2",
+                    "Mold3": "mold_3",
+                    "Mold4": "mold_4",
+                    "Mold5": "mold_5",
+                    "Mold6": "mold_6",
+                    "Billet_Temp": "billet_temp",
+                    "At_Pre": "at_pre",
+                    "At_Temp": "at_temp"
+                }
+                for src, dest in val_map.items():
+                    if src in df.columns:
+                        out[dest] = df[src]
+            
             return out, colmap
 
         # 2. Handle Chunking vs Full

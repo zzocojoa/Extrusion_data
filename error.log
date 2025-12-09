@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "C:\Users\user\Documents\GitHub\Extrusion_data\verify_integrated_etl.py", line 12, in test_integrated_log
+    df, colmap = build_records_plc(file_path, "251209")
+    ^^^^^^^^^^
+ValueError: too many values to unpack (expected 2)
