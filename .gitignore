@@ -12,3 +12,5 @@ config.ini
 backups/
 build/
 dist/
+grafana_data/
+tools/

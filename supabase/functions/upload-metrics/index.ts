@@ -24,6 +24,8 @@ type Metric = {
   billet_temp?: number | null;
   at_pre?: number | null;
   at_temp?: number | null;
+  die_id?: string | null;
+  billet_cycle_id?: number | null;
 };
 
 const ALLOWED_KEYS = new Set<keyof Metric>([
@@ -46,6 +48,8 @@ const ALLOWED_KEYS = new Set<keyof Metric>([
   "billet_temp",
   "at_pre",
   "at_temp",
+  "die_id",
+  "billet_cycle_id",
 ]);
 
 // 숫자 필드 안전 캐스팅
@@ -69,8 +73,15 @@ function cleanRecord(raw: Record<string, unknown>): Metric | null {
     if (key === "timestamp") {
       if (typeof value !== "string") return null;
       cleaned[key] = value;
+    } else if (key === "die_id") {
+      // die_id는 문자열 (null 허용)
+      if (value === null || value === undefined) {
+        cleaned[key] = null;
+      } else {
+        cleaned[key] = String(value);
+      }
     } else {
-      // timestamp가 아닌 키는 모두 숫자형(또는 null)
+      // 나머지 키는 모두 숫자형(또는 null)
       (cleaned as any)[key] = toNumberOrNull(value);
     }
   }

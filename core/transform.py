@@ -103,7 +103,8 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
                     # Date: YYYY-MM-DD, Time: HH:MM:SS.mmm
                     df["timestamp"] = pd.to_datetime(
                         df["Date"].astype(str) + " " + df["Time"].astype(str),
-                        errors="coerce"
+                        errors="coerce",
+                        format="mixed"
                     ).dt.strftime("%Y-%m-%dT%H:%M:%S.%f+09:00")
                 except Exception:
                     return pd.DataFrame(), colmap
@@ -147,7 +148,9 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
                     "Mold6": "mold_6",
                     "Billet_Temp": "billet_temp",
                     "At_Pre": "at_pre",
-                    "At_Temp": "at_temp"
+                    "At_Temp": "at_temp",
+                    "DIE_ID": "die_id",
+                    "Billet_CycleID": "billet_cycle_id"
                 }
                 for src, dest in val_map.items():
                     if src in df.columns:

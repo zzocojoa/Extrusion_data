@@ -187,7 +187,7 @@ def preview_diagnostics(plc_dir: str, temp_dir: str, cutoff: datetime, lag_min: 
                 excluded.append((plc_dir, fn, '데이터 없음'))
 
     # Temperature
-    if os.path.isdir(temp_dir):
+    if temp_dir and os.path.isdir(temp_dir):
         for fn in sorted(os.listdir(temp_dir)):
             full = os.path.join(temp_dir, fn)
             if not fn.lower().endswith('.csv'):
@@ -404,6 +404,9 @@ class App(ctk.CTk):
         self.var_auto_upload = tk.BooleanVar(value=(str(self.cfg.get('AUTO_UPLOAD', 'false')).lower() == 'true'))
         self.var_range = tk.StringVar(value=self.cfg['RANGE_MODE'])
         
+        # Custom Date Variable
+        self.var_custom_date = tk.StringVar(value=self.cfg.get('CUSTOM_DATE', ''))
+
         # UI Helpers
         def add_entry(parent, label, var, row):
             ctk.CTkLabel(parent, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=5)
@@ -439,7 +442,22 @@ class App(ctk.CTk):
         ctk.CTkSwitch(grp_opt, text="앱 실행 시 자동 업로드 시작", variable=self.var_auto_upload).grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=10)
         
         ctk.CTkLabel(grp_opt, text="업로드 범위").grid(row=3, column=0, sticky="w", padx=10, pady=5)
-        ctk.CTkOptionMenu(grp_opt, variable=self.var_range, values=['today', 'yesterday', 'twodays', 'custom']).grid(row=3, column=1, sticky="w", padx=10, pady=5)
+        
+        def on_range_change(choice):
+            if choice == 'custom':
+                self.frame_custom_date.grid(row=3, column=2, sticky="w", padx=10, pady=5)
+            else:
+                self.frame_custom_date.grid_forget()
+
+        ctk.CTkOptionMenu(grp_opt, variable=self.var_range, values=['today', 'yesterday', 'twodays', 'custom'], command=on_range_change).grid(row=3, column=1, sticky="w", padx=10, pady=5)
+        
+        # Custom Date Entry (Hidden by default)
+        self.frame_custom_date = ctk.CTkFrame(grp_opt, fg_color="transparent")
+        ctk.CTkLabel(self.frame_custom_date, text="날짜(YYYY-MM-DD):").pack(side="left", padx=5)
+        ctk.CTkEntry(self.frame_custom_date, textvariable=self.var_custom_date, width=120).pack(side="left", padx=5)
+        
+        if self.var_range.get() == 'custom':
+            self.frame_custom_date.grid(row=3, column=2, sticky="w", padx=10, pady=5)
 
         # Save Button
         ctk.CTkButton(self.main_frame, text="설정 저장", command=self.on_save).grid(row=2, column=0, pady=20)
@@ -651,8 +669,8 @@ class App(ctk.CTk):
 
             'SMART_SYNC': str(self.var_smart_sync.get()).lower(),
             'RANGE_MODE': self.var_range.get(),
+            'CUSTOM_DATE': self.var_custom_date.get(),
             # Defaults for others
-            'CUSTOM_DATE': self.cfg.get('CUSTOM_DATE', ''),
             'MTIME_LAG_MIN': self.cfg.get('MTIME_LAG_MIN', '15'),
             'CHECK_LOCK': self.cfg.get('CHECK_LOCK', 'true')
         }
@@ -746,11 +764,17 @@ class App(ctk.CTk):
         # Quick adaptation of original preview logic
         vals = self.cfg
         cutoff = compute_cutoff(vals['RANGE_MODE'], vals.get('CUSTOM_DATE', ''))
-        items = list_candidates(vals['PLC_DIR'], vals['TEMP_DIR'], cutoff, 15, vals['RANGE_MODE']=='today', True)
+        items, excluded = preview_diagnostics(vals['PLC_DIR'], vals.get('TEMP_DIR'), cutoff, 15, vals['RANGE_MODE']=='today', True)
         self.log(f"업로드 대상: {len(items)}개 파일")
         for _, fn, _, _ in items[:20]:
             self.log(f" - {fn}")
         if len(items) > 20: self.log("...")
+        
+        if excluded:
+            self.log(f"\n제외된 파일: {len(excluded)}개")
+            for _, fn, reason in excluded[:20]:
+                self.log(f" [X] {fn}: {reason}")
+            if len(excluded) > 20: self.log("...")
 
     def on_pause(self):
         if not self.is_uploading:
