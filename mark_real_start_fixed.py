@@ -91,17 +91,30 @@ def process_and_mark_real_start():
             if subset.empty:
                 continue
                 
-            # Find index of min temp in this subset
-            min_idx = subset['Temperature'].idxmin()
+            # [Logic Refinement]
+            # Instead of Absolute Min, find the FIRST point that enters the "Valley" (Min + Tolerance).
+            # This corrects the 2-4s "Too Fast" error caused by picking the end of the dwell.
             
-            # Check threshold
-            try:
-                # Need to lookup value in original df using the index
-                val = df.at[min_idx, 'Temperature']
+            # 1. Find Absolute Min in this subset
+            min_val = subset['Temperature'].min()
+            
+            # 2. Define Threshold (Min + 2.0)
+            threshold = min_val + 2.0
+            
+            # 3. Find First Occurrence <= Threshold
+            # subset is already sorted by time (as df was read sequentially)
+            candidates = subset[subset['Temperature'] <= threshold]
+            
+            if not candidates.empty:
+                # First index is the earliest time
+                target_idx = candidates.index[0]
+                
+                # Check Global Validity Threshold (< 530)
+                # The point itself must be < 530 (implied since min < 530 usually)
+                # But explicitly check per requirement
+                val = df.at[target_idx, 'Temperature']
                 if val < 530:
-                    valid_indices.append(min_idx)
-            except KeyError:
-                pass
+                    valid_indices.append(target_idx)
                 
         # 3. Mark detected points
         df['Real_Start_Point'] = 0

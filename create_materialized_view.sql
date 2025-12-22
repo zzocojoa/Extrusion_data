@@ -1,16 +1,24 @@
--- Drop the existing view/materialized view
+-- [Optimization] Ensure Source Indexes confirm existence for faster partitioning
+CREATE INDEX IF NOT EXISTS "idx_all_metrics_die_ts" ON "public"."all_metrics" ("die_id", "timestamp");
+CREATE INDEX IF NOT EXISTS "idx_all_metrics_billet_cycle" ON "public"."all_metrics" ("billet_cycle_id");
+
+-- Drop the target view (Clean Slate)
 DROP MATERIALIZED VIEW IF EXISTS public.view_aligned_metrics CASCADE;
 DROP VIEW IF EXISTS public.view_aligned_metrics CASCADE;
 
 create materialized view public.view_aligned_metrics as
 with
-  -- [Step 1: Sessionization (Time Gap Detection)]
-  -- Use LAG simply to detect massive time jumps (e.g. > 12 hours) which imply a different production run.
-  -- This protects the MAX() logic from carrying over IDs across years/resets.
+  -- [Step 1: Raw Data with Sessionization per Die]
+  -- Instead of splitting by Day (which breaks midnight cycles), 
+  -- we split by "Session" within each Die.
+  -- Session Breaks if: Time Gap > 1 Hour.
+  
   raw_with_lag as (
     select
       *,
-      lag("timestamp") over (order by "timestamp" asc) as prev_ts
+      -- Calculate Gap strictly within the same Die ID
+      -- This allows us to use the index "idx_all_metrics_die_ts" efficiently
+      lag("timestamp") over (partition by die_id order by "timestamp" asc) as prev_ts
     from
       public.all_metrics
   ),
@@ -20,34 +28,101 @@ with
       *,
       sum(case 
         when prev_ts is null then 0
-        when "timestamp" - prev_ts > interval '12 hours' then 1
+        when "timestamp" - prev_ts > interval '1 hour' then 1
+        -- Removed: "when date != date" check. We ALLOW crossing midnight now.
         else 0
-      end) over (order by "timestamp" asc) as session_id
+      end) over (partition by die_id order by "timestamp" asc) as session_id
     from
       raw_with_lag
   ),
   
-  -- [Step 2: ID Filling (Handle Nulls & Noise)]
-  -- Logic: Within a session, Billet_CycleID should be increasing. 
-  -- We use MAX() over unbounded preceding to Forward Fill the ID into Nulls and ignore 0-noise (if 0 < current max).
-  -- This creates 'calc_cycle_id' which groups the Null Tail with the preceding Cycle.
+  -- [Step 2: Hybrid Block Logic (Identify Continuous Speed Blocks)]
+  -- Python: df['is_active'] = df['현재속도'] >= 0.1
+  block_calc_1 as (
+    select
+      *,
+      -- [Parity] Revert to 0.1 to match Python exactly. 
+      -- The 'Idle Head' filter downstream handles the noise.
+      case when current_speed >= 0.1 then 1 else 0 end as is_active
+    from
+      session_calc
+  ),
+  
+  -- Partition by DIE_ID and SESSION_ID ensures continuity
+  block_calc_2 as (
+    select
+      *,
+      lag(is_active, 1, 0) over (partition by die_id, session_id order by "timestamp" asc) as prev_active
+    from
+      block_calc_1
+  ),
+  
+  block_calc_3 as (
+    select
+      *,
+      sum(case when is_active != prev_active then 1 else 0 end) 
+        over (partition by die_id, session_id order by "timestamp" asc) as block_id
+    from
+      block_calc_2
+  ),
+  
+  -- [Step 3: Map Block to Cycle ID (Mode/Max/Min)]
+  block_id_map as (
+    select
+      die_id,
+      session_id,
+      block_id,
+      -- [Parity] STRICTLY use Production Counter, ignoring Billet_CycleID.
+      MAX(production_counter) as mapped_cycle_id
+    from
+      block_calc_3
+    where
+      is_active = 1 -- Only look at active blocks for IDs
+    group by
+      die_id, session_id, block_id
+  ),
+  
+  -- [Step 4: Assign & Fill ID]
+  assigned_data as (
+    select
+      t1.*,
+      map.mapped_cycle_id
+    from
+      block_calc_3 t1
+      left join block_id_map map 
+        on t1.die_id = map.die_id
+        and t1.session_id = map.session_id
+        and t1.block_id = map.block_id
+  ),
+  
   filled_data as (
     select
       *,
-      MAX(billet_cycle_id) over (
-        partition by session_id 
+      -- Forward Fill the Mapped ID within the Session
+      -- This naturally crosses midnight if the session is unbroken
+      MAX(mapped_cycle_id) OVER (
+        partition by die_id, session_id 
         order by "timestamp" asc 
         rows between unbounded preceding and current row
       ) as calc_cycle_id
     from
-      session_calc
+      assigned_data
   ),
 
-  -- [Step 3: Base Data with Ranked Row Numbers]
-  -- Now we group by 'calc_cycle_id'.
+  -- [Step 5: Base Data with Ranked Row Numbers]
+  base_data_pre as (
+    select 
+      *,
+      -- Calculate First Active Timestamp for each Cycle
+      MIN(case when is_active = 1 then "timestamp" end) OVER (
+        partition by die_id, session_id, calc_cycle_id
+      ) as first_active_ts
+    from 
+      filled_data
+  ),
+  
   base_data as (
     select
-      -- Select all columns needed
       "timestamp",
       temperature,
       main_pressure,
@@ -67,54 +142,73 @@ with
       at_pre,
       at_temp,
       die_id,
-      billet_cycle_id, -- Keep original (with Nulls)
+      billet_cycle_id, -- Original
+      calc_cycle_id,
       session_id,
-      calc_cycle_id,   -- Used for grouping
       
-      -- Create Row Number for the WHOLE extended cycle (including tail)
+      -- Create Row Number for the WHOLE extended cycle
+      -- Partition by Die + Cycle ensures uniqueness per run
       row_number() over (
-        partition by session_id, calc_cycle_id
+        partition by die_id, session_id, calc_cycle_id
         order by "timestamp"
       ) as rn
     from
-      filled_data
+      base_data_pre
     where
-      calc_cycle_id is not null -- Filter out leading noise before first ID
+      calc_cycle_id is not null -- Filter early noise
+      AND "timestamp" >= first_active_ts -- [Fix] Exclude Idle Head (Prevents 400k rows)
   ),
   
-  -- [Step 4: Min Temp Detection within Extended Group]
-  -- Logic 3: Min Temp < 530. We search the WHOLE extended group.
-  -- [FIX] Limit search to first 300 rows (approx 1 min) to avoid finding Min Temp in the cooling tail.
+  -- [Step 6: Real Start Detection (Min + Tolerance)]
   cycle_min_candidates as (
     select
+      die_id,
+      session_id,
+      calc_cycle_id,
+      rn,
+      temperature,
+      MIN(temperature) OVER (
+        PARTITION BY die_id, session_id, calc_cycle_id
+      ) as min_temp_in_cycle
+    from
+      base_data
+    where
+      rn <= 300 -- [Constraint] First 300 rows (approx 1 min)
+  ),
+  
+  cycle_start_candidates as (
+    select 
+      die_id,
       session_id,
       calc_cycle_id,
       rn,
       temperature,
       row_number() over (
-        partition by session_id, calc_cycle_id
-        order by temperature ASC, "timestamp" ASC
-      ) as temp_rank
+        partition by die_id, session_id, calc_cycle_id
+        order by rn ASC
+      ) as time_rank
     from
-      base_data
+      cycle_min_candidates
     where
-      rn <= 300 -- [Constraint] First 300 rows only
+      temperature <= (min_temp_in_cycle + 2.0) -- Tolerance Filter
+      and temperature < 530 -- Global Safety Filter
   ),
   
   valid_start_points as (
     select
+      die_id,
       session_id,
       calc_cycle_id,
       rn as stable_rn
     from
-      cycle_min_candidates
+      cycle_start_candidates
     where
-      temp_rank = 1
-      and temperature < 530 -- Threshold
+      time_rank = 1 -- Earliest point in Valley
   ),
   
   cycle_offsets as (
     select
+      sp.die_id,
       sp.session_id,
       sp.calc_cycle_id,
       sp.stable_rn - 1 as offset_rows
@@ -124,7 +218,7 @@ with
 
 select
   t1."timestamp",
-  t1.billet_cycle_id, -- Original ID (can be Null)
+  t1.billet_cycle_id,
   t1.main_pressure,
   t1.billet_length,
   t1.container_temp_front,
@@ -144,31 +238,33 @@ select
   t1.die_id,
   t1.temperature as original_temperature,
   
-  -- Apply Alignment using Offset
-  -- If offset exists, we pull data from typical 'LEAD' logic?
-  -- Python: shift(-offset) -> Value at T comes from T+offset.
-  -- SQL: LEAD(temp, offset).
-  -- BUT we need to do this JOIN style or Window Function style.
-  -- Join style (t2.rn = t1.rn + offset) is easier for creating the view logic.
+  -- Apply Alignment
   COALESCE(t2.temperature, t1.temperature) as temperature,
   
   COALESCE(o.offset_rows, 0::bigint) as _debug_offset_rows,
-  t1.calc_cycle_id as _debug_calc_id -- Helpful for seeing how it grouped
+  t1.calc_cycle_id as _debug_calc_id,
+  t1.rn as _debug_current_rn,
+  t1.session_id as _debug_session_id
 from
   base_data t1
   left join cycle_offsets o 
     on t1.calc_cycle_id = o.calc_cycle_id 
+    and t1.die_id = o.die_id
     and t1.session_id = o.session_id
   left join base_data t2 
     on t1.calc_cycle_id = t2.calc_cycle_id 
+    and t1.die_id = t2.die_id
     and t1.session_id = t2.session_id
-    and t2.rn = (t1.rn + COALESCE(o.offset_rows, 0::bigint));
+    and t2.rn = (t1.rn + COALESCE(o.offset_rows, 0::bigint))
+WITH NO DATA; -- [Optimization]
 
 -- [Index Creation]
--- Note: 'billet_cycle_id' is not unique anymore (could be null). 
--- So unique index might need to be on (timestamp).
 CREATE UNIQUE INDEX "idx_mat_view_timestamp" 
 ON "public"."view_aligned_metrics" ("timestamp");
 
 -- [Permissions]
 GRANT SELECT ON "public"."view_aligned_metrics" TO anon, authenticated, service_role;
+
+-- [Usage Note]
+-- After running this script, you MUST run:
+-- REFRESH MATERIALIZED VIEW public.view_aligned_metrics;

@@ -24,15 +24,20 @@ cycle_min_candidates AS (
         temperature,
         main_pressure,
         
-        -- Rank rows by Temperature (Lowest first) within each cycle
+        -- Calculate Min Temp for this cycle (limited to first 300 rows)
+        MIN(temperature) OVER (
+            PARTITION BY billet_cycle_id 
+        ) as min_temp_in_cycle,
+        
+        -- Rank rows by TIME (Earliest first) to find start of valley
         ROW_NUMBER() OVER (
             PARTITION BY billet_cycle_id 
-            ORDER BY temperature ASC, "timestamp" ASC
-        ) as rn
+            ORDER BY "timestamp" ASC
+        ) as time_rank_within_cycle
     FROM
         base_with_rank
     WHERE
-        time_rn <= 300 -- [Constraint] Limit search to first 300 rows (approx 1 min)
+        time_rn <= 300 -- [Constraint] Limit search to first 300 rows
 ),
 selected_min_points AS (
     SELECT
@@ -40,18 +45,28 @@ selected_min_points AS (
     FROM
         cycle_min_candidates
     WHERE
-        rn = 1 -- Select the single lowest point
+        temperature <= (min_temp_in_cycle + 2.0) -- [Tolerance] Within +2.0 of Min
+    ORDER BY
+        "timestamp" ASC
 )
-
-SELECT
+-- We need to pick the FIRST one per cycle from selected_min_points
+, final_selection AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY billet_cycle_id 
+            ORDER BY "timestamp" ASC
+        ) as final_rn
+    FROM 
+        selected_min_points
+)
+SELECT 
     timestamp as "time",
     billet_cycle_id,
     temperature,
     main_pressure,
     1 as "Real_Start_Point(Min_Temp)"
-FROM
-    selected_min_points
-WHERE
-    temperature < 530 -- [Threshold] Validity Filter (User Code: valid_points < 530)
-ORDER BY
-    timestamp ASC;
+FROM 
+    final_selection
+WHERE 
+    final_rn = 1
