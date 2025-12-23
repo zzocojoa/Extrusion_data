@@ -179,3 +179,11 @@ WITH NO DATA;
 
 CREATE UNIQUE INDEX "idx_opt_view_ts" ON "public"."view_optimized_aligned_metrics" ("timestamp");
 GRANT SELECT ON "public"."view_optimized_aligned_metrics" TO anon, authenticated, service_role;
+
+-- [7] Setup Auto-Refresh (pg_cron)
+-- Schedule new job (Every 10 min)
+SELECT cron.schedule(
+    'refresh_view_aligned_metrics_opt',
+    '*/10 * * * *',
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY public.view_optimized_aligned_metrics'
+);
