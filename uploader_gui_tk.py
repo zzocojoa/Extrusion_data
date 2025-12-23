@@ -9,7 +9,13 @@ import pandas as pd
 import numpy as np
 import subprocess
 
-from core.config import get_data_dir, load_config as core_load_config, save_config as core_save_config
+from core.config import (
+    get_data_dir,
+    load_config as core_load_config,
+    save_config as core_save_config,
+    compute_edge_url,
+    validate_config,
+)
 from core.transform import build_records_plc
 from core import files as core_files
 import core.upload as core_upload
@@ -674,6 +680,13 @@ class App(ctk.CTk):
             'MTIME_LAG_MIN': self.cfg.get('MTIME_LAG_MIN', '15'),
             'CHECK_LOCK': self.cfg.get('CHECK_LOCK', 'true')
         }
+        # Edge URL 기본값 보완
+        if not vals['EDGE_FUNCTION_URL']:
+            vals['EDGE_FUNCTION_URL'] = compute_edge_url(vals)
+        ok_cfg, missing = validate_config(vals)
+        if not ok_cfg:
+            messagebox.showerror("설정 오류", f"필수 설정이 누락되었습니다: {', '.join(missing)}")
+            return
         save_config(vals)
         self.cfg = vals # Update memory
         messagebox.showinfo("저장", "설정이 저장되었습니다.")
@@ -706,10 +719,13 @@ class App(ctk.CTk):
             # Schedule next check
             self.after(100, self.check_log_queue)
 
-    def log(self, msg):
+    def log(self, msg, level="INFO"):
+        """Thread-safe log with timestamp/level, shown in GUI and printed to console."""
+        ts = kst_now().isoformat(timespec="seconds")
+        full = f"[{level.upper()} {ts}] {msg}"
         # Put message in queue (Thread-safe)
-        self.log_queue.put(msg)
-        print(msg) # Always print to console
+        self.log_queue.put(full)
+        print(full) # Always print to console
 
     def update_dashboard_loop(self):
         if not hasattr(self, 'hero_frame') or not self.hero_frame.winfo_exists():
@@ -808,9 +824,17 @@ class App(ctk.CTk):
     def _run_upload(self, vals: dict):
         import concurrent.futures
 
+        ok_cfg, missing = validate_config(vals)
+        if not ok_cfg:
+            self.log(f"설정 오류: {', '.join(missing)}")
+            self.is_uploading = False
+            self.btn_pause.configure(state="disabled")
+            self.btn_start.configure(state="normal")
+            return
+
         url = vals['SUPABASE_URL'].strip()
         anon = vals['SUPABASE_ANON_KEY'].strip()
-        edge = vals['EDGE_FUNCTION_URL'].strip() or (url.rstrip('/') + '/functions/v1/upload-metrics')
+        edge = vals['EDGE_FUNCTION_URL'].strip() or compute_edge_url(vals)
         cutoff = compute_cutoff(vals['RANGE_MODE'], vals.get('CUSTOM_DATE', ''))
         include_today = (vals['RANGE_MODE'] == 'today')
         try:

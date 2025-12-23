@@ -76,6 +76,29 @@ def load_config(path: str | None = None) -> tuple[Dict[str, str], str]:
     return defaults, chosen
 
 
+def compute_edge_url(cfg: Dict[str, str]) -> str:
+    """
+    Derive the edge function URL from config.
+    Prefers EDGE_FUNCTION_URL; falls back to SUPABASE_URL/functions/v1/upload-metrics.
+    """
+    base = cfg.get("SUPABASE_URL", "") or ""
+    edge = cfg.get("EDGE_FUNCTION_URL", "") or ""
+    if edge:
+        return edge
+    return f"{base.rstrip('/')}/functions/v1/upload-metrics" if base else ""
+
+
+def validate_config(cfg: Dict[str, str]) -> tuple[bool, list[str]]:
+    """
+    Validate minimal config required for upload.
+    Returns (ok, missing_keys).
+    """
+    missing = [k for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY") if not cfg.get(k)]
+    if not compute_edge_url(cfg):
+        missing.append("EDGE_FUNCTION_URL")
+    return len(missing) == 0, missing
+
+
 def save_config(values: Dict[str, str], path: str | None = None) -> str:
     """
     Save configuration dict to an INI file under AppData (or given path).
@@ -92,4 +115,3 @@ def save_config(values: Dict[str, str], path: str | None = None) -> str:
     with open(target, "w", encoding="utf-8-sig") as f:
         cfg.write(f)
     return target
-

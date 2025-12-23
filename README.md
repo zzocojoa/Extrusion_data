@@ -1,69 +1,37 @@
-# 설정 (필수)
+﻿# Extrusion Data Uploader
 
-프로젝트 루트에 `.env` 파일을 생성하고 다음 내용을 설정해야 합니다
-(`.env.example` 참고):
+로컬 Supabase 스택을 통해 압출 공정 데이터를 업로드/검증합니다. GUI/CLI 모두 `.env` 또는 `config.ini` 설정이 필요하며, `.env.example`를 참고해 환경 변수를 준비하세요.
 
-```ini
-SUPABASE_URL=http://localhost:54321
-DB_PASSWORD=your_password
-```
+## 빠른 시작
+- 가상환경 활성화
+  - macOS/WSL: `source venv/bin/activate`
+  - Windows: `.\venv\Scripts\Activate.ps1`
+- 설정: `.env` 또는 `config.ini`에 `SUPABASE_URL`, `SUPABASE_ANON_KEY`, 필요 시 `EDGE_FUNCTION_URL` 입력.
 
-http://127.0.0.1:54323
+## 로컬 실행
+- GUI: `python uploader_gui_tk.py`
+- CLI(빠른 후보 탐색): `python uploader_cli.py --quick`
 
-# 가상환경 실행
+## 업로드/재개 로직
+- `core.upload.upload_item`을 사용하며 `Authorization` + `apikey` 헤더 포함.
+- 재시도/재개 상태: `upload_resume.json`, 처리 로그: `processed_files.log` (모두 AppData 하위 관리).
 
-# macOS
+## 빌드
+- GUI 빌드: `scripts\build_gui.ps1` (PowerShell) / `bash scripts/build_gui.sh`
+- CLI 빌드: `scripts\build_cli.ps1` (PowerShell) / `bash scripts/build_cli.sh`
+- 산출물: dist/ 아래 생성.
 
-source venv/bin/activate
+## 검증 스크립트
+- ETL 샘플 검증: `python tools/verify_integrated_etl.py --file <CSV> --filename-hint 251209`
+- 뷰/API 검증: `python tools/verify_view.py --sample-limit 1`
+- 종료 코드: 0=성공, 1=실패, 2=설정 누락.
 
-# Windows
+## 백업/운영
+- Supabase 백업: `./supabase/auto/backup_daily.sh`
+- 최신 백업 복원: `./restore_latest.sh`
+- SQL 편집 저장: `./supabase/auto/save_gui_changes.sh`
 
-.\venv\Scripts\Activate.ps1
-
-# 실행 방법
-
-## 1. 실행 파일 (권장)
-
-`dist/ExtrusionUploader.exe` 파일을 더블 클릭하여 실행합니다. (별도의 설치나 Python 환경 설정이 필요 없습니다.)
-
-## 2. 소스 코드 실행 (개발용)
-
-# 가상환경 활성화
-
-.\venv\Scripts\Activate.ps1
-
-# 실행
-
-python uploader_gui_tk.py
-
-# 빌드하는 방식
-
-# uploader_gui_tk.py pyinstaller
-
-pyinstaller --onefile --noconsole --name ExtrusionUploader --icon assets\app.ico
---collect-data certifi --collect-data pandas --collect-data numpy
-uploader_gui_tk.py pyinstaller --clean ExtrusionUploader.spec
-
-# uploader_cli.py pyinstaller
-
-pyinstaller --onefile --noconsole --name ExtrusionUploaderCli --icon
-assets\app.ico --collect-data certifi --collect-data pandas --collect-data numpy
-
-# supabase CLI Data backup(우분투)
-
-1. 경로 이동 cd "/mnt/c/Users/user/Documents/GitHub/Extrusion_data"
-2. 백업 진행 ./supabase/auto/backup_daily.sh
-3. 결과 확인 ls -lh backups/ (USB 마운트 시 E:\backups 폴더에도 자동 복사됨)
-
-# supabase SQL Editor save
-
-./supabase/auto/save_gui_changes.sh
-
-# Docker container -> root shell 진입
-
-1. Linux Shell (bash/sh) 진입 docker exec -it supabase-db bash
-2. PostgreSQL 클라이언트 진입 psql -U postgres -d postgres
-3. 이후 권한 명령 실행
-
-```
-```
+## 주의사항
+- 컨테이너 내부에서는 `localhost` 대신 컨테이너 이름 사용.
+- `apikey` 헤더 제거 금지.
+- 실제 크리덴셜/백업은 커밋 금지; `data/`, `logs/`는 gitignore 대상.
