@@ -133,7 +133,11 @@ def parse_work_log_excel(file_path):
     # Rename columns
     rename_candidates = {
         "525": "출구온도",
+        "525.0": "출구온도",
         "출구온도": "출구온도",
+        "80": "스트레칭",
+        "80.0": "스트레칭",
+        "스트레칭": "스트레칭",
     }
     df = df.rename(columns={k: v for k, v in rename_candidates.items() if k in df.columns})
 
@@ -287,7 +291,11 @@ def parse_work_log_excel(file_path):
     # Rename columns
     rename_candidates = {
         "525": "출구온도",
+        "525.0": "출구온도",
         "출구온도": "출구온도",
+        "80": "스트레칭",
+        "80.0": "스트레칭",
+        "스트레칭": "스트레칭",
     }
     df = df.rename(columns={k: v for k, v in rename_candidates.items() if k in df.columns})
 
@@ -303,8 +311,43 @@ def parse_work_log_excel(file_path):
     )
 
     # Numeric conversions
-    df["온도"] = to_numeric(df.get("온도"))
-    
+    if "온도" in df.columns:
+        df["온도"] = to_numeric(df.get("온도"))
+    if "퀜칭온도" in df.columns:
+        df["퀜칭온도"] = to_numeric(df.get("퀜칭온도"))
+    if "스트레칭" in df.columns:
+        df["스트레칭"] = to_numeric(df.get("스트레칭"))
+    if "중량" in df.columns:
+        df["중량"] = to_numeric(df.get("중량"))
+    if "RAM" in df.columns:
+        df["RAM"] = to_numeric(df.get("RAM"))
+    if "길이" in df.columns:
+        df["길이"] = to_numeric(df.get("길이"))
+    if "실단중" in df.columns:
+        df["실단중"] = to_numeric(df.get("실단중"))
+    if "기포" in df.columns:
+        df["기포"] = to_numeric(df.get("기포"))
+    if "뜯김" in df.columns:
+        df["뜯김"] = to_numeric(df.get("뜯김"))
+    if "백선/흑선" in df.columns:
+        df["백선/흑선"] = to_numeric(df.get("백선/흑선"))
+    if "산화물" in df.columns:
+        df["산화물"] = to_numeric(df.get("산화물"))
+    if "스크래치" in df.columns:
+        df["스크래치"] = to_numeric(df.get("스크래치"))
+    if "휨" in df.columns:
+        df["휨"] = to_numeric(df.get("휨"))
+    if "치수" in df.columns:
+        df["치수"] = to_numeric(df.get("치수"))
+    if "라인" in df.columns:
+        df["라인"] = to_numeric(df.get("라인"))
+    if "기타" in df.columns:
+        df["기타"] = to_numeric(df.get("기타"))
+    if "S" in df.columns:
+        df["S"] = to_numeric(df.get("S"))
+    if "E" in df.columns:
+        df["E"] = to_numeric(df.get("E"))
+
     exit_col = pick_column(df, ["출구온도"])
     if exit_col:
         df[exit_col] = to_numeric(df.get(exit_col))
@@ -333,13 +376,33 @@ def parse_work_log_excel(file_path):
         "DW No.",
         # "품명",  <-- Removed
         "재질",
+        "LOT",
+        "질별",
         "온도",
+        "퀜칭온도",
         exit_col or "출구온도",
+        "스트레칭",
+        "중량",
+        "RAM",
+        "길이",
+        "실단중",
         "적합수량",
         "적합중량",
         "생산성",
         "#",    # New
         "수율",  # New
+        "기포",
+        "뜯김",
+        "백선/흑선",
+        "산화물",
+        "스크래치",
+        "휨",
+        "치수",
+        "라인",
+        "기타",
+        "S",
+        "E",
+        "OP Note (특이사항 입력란)",
     ]
 
     final_df = df[[col for col in selected_columns if col in df.columns]].copy()
@@ -353,21 +416,53 @@ def parse_work_log_excel(file_path):
             "재질": "alloy_type",
             "온도": "target_billet_temp",
             exit_col or "출구온도": "target_exit_temp",
+            "LOT": "lot",
+            "질별": "temper_type",
+            "퀜칭온도": "quenching_temp",
+            "스트레칭": "stretching",
+            "중량": "total_weight",
+            "RAM": "ram",
+            "길이": "product_length",
+            "실단중": "actual_unit_weight",
             "적합수량": "production_qty",
             "적합중량": "production_weight",
             "생산성": "productivity",
             "#": "die_number",      # New
             "수율": "yield_rate",    # New
+            "기포": "defect_bubble",
+            "뜯김": "defect_tearing",
+            "백선/흑선": "defect_white_black_line",
+            "산화물": "defect_oxide",
+            "스크래치": "defect_scratch",
+            "휨": "defect_bend",
+            "치수": "defect_dimension",
+            "라인": "defect_line",
+            "기타": "defect_etc",
+            "S": "start_cut",
+            "E": "end_cut",
+            "OP Note (특이사항 입력란)": "op_note",
         }
     )
     
-    # Fix: Ensure production_qty is integer (not float like 1972.0)
-    if "production_qty" in final_df.columns:
-        final_df["production_qty"] = final_df["production_qty"].astype("Int64")
-        
-    # Fix: Ensure die_number is integer if possible
-    if "die_number" in final_df.columns:
-        final_df["die_number"] = final_df["die_number"].astype("Int64")
+    # Fix: Ensure integer fields are Int64 (nullable)
+    for col in [
+        "production_qty",
+        "die_number",
+        "product_length",
+        "defect_bubble",
+        "defect_tearing",
+        "defect_white_black_line",
+        "defect_oxide",
+        "defect_scratch",
+        "defect_bend",
+        "defect_dimension",
+        "defect_line",
+        "defect_etc",
+        "start_cut",
+        "end_cut",
+    ]:
+        if col in final_df.columns:
+            final_df[col] = final_df[col].astype("Int64")
 
     # Fix: Rounding requirements (Integer casting for rounded values)
     if "productivity" in final_df.columns:

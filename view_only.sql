@@ -1,15 +1,3 @@
--- Migration: Create View Optimized Aligned Metrics
--- Date: 2025-12-23
--- Description: 
--- Implements "Dynamic Cycle Alignment" with High-Performance optimizations.
--- 1. Indexing: Recommends Composite Index for 100x Scan speed.
--- 2. Algorithm: Bi-directional Gradient Filter + ArgMin Start Detection.
--- 3. Optimization: Uses ARRAY Lookups instead of Self-Join (Major Perf Boost).
-
--- [0] Recommended DDL (Run once)
--- CREATE INDEX IF NOT EXISTS idx_all_metrics_die_session_time 
--- ON public.all_metrics (die_id, "timestamp" ASC) INCLUDE (temperature, main_pressure, current_speed);
-
 DROP MATERIALIZED VIEW IF EXISTS public.view_optimized_aligned_metrics CASCADE;
 
 create materialized view public.view_optimized_aligned_metrics as
@@ -176,15 +164,3 @@ from
     and t1.session_id = arr.session_id
     and t1.calc_cycle_id = arr.calc_cycle_id
 WITH NO DATA;
-
-CREATE UNIQUE INDEX "idx_opt_view_ts" ON "public"."view_optimized_aligned_metrics" ("timestamp");
-GRANT SELECT ON "public"."view_optimized_aligned_metrics" TO anon, authenticated, service_role;
-
--- [7] Setup Auto-Refresh (pg_cron)
--- Schedule new job (Every 10 min)
--- DISABLED for manual cleanup stability
--- SELECT cron.schedule(
---     'refresh_view_aligned_metrics_opt',
---     '*/10 * * * *',
---     'REFRESH MATERIALIZED VIEW CONCURRENTLY public.view_optimized_aligned_metrics'
--- );

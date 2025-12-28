@@ -1,3 +1,103 @@
+-- Migration: Restore all_metrics table
+-- Date: 2025-11-26 (Sequenced after baseline stub)
+
+CREATE TABLE IF NOT EXISTS public.all_metrics (
+    "timestamp" timestamp with time zone NOT NULL,
+    device_id text NOT NULL,
+    temperature double precision,
+    main_pressure double precision,
+    billet_length double precision,
+    container_temp_front double precision,
+    container_temp_rear double precision,
+    production_counter bigint,
+    current_speed double precision,
+    extrusion_end_position double precision
+);
+
+ALTER TABLE public.all_metrics OWNER TO postgres;
+
+-- Unique constraint from original schema (Idempotent)
+DO $$
+BEGIN
+    BEGIN
+        ALTER TABLE ONLY public.all_metrics
+            ADD CONSTRAINT all_metrics_timestamp_device_id_key UNIQUE ("timestamp", device_id);
+    EXCEPTION WHEN duplicate_object THEN
+        NULL;
+    END;
+END $$;
+
+-- Grants
+GRANT ALL ON TABLE public.all_metrics TO anon;
+GRANT ALL ON TABLE public.all_metrics TO authenticated;
+GRANT ALL ON TABLE public.all_metrics TO service_role;
+-- Function to reload PostgREST schema cache
+CREATE OR REPLACE FUNCTION public.reload_schema()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NOTIFY pgrst, 'reload schema';
+END;
+$$;
+-- Drop dependent views
+DROP VIEW IF EXISTS "public"."view_ml_learning_data";
+
+-- Modify all_metrics table
+ALTER TABLE "public"."all_metrics" DROP CONSTRAINT IF EXISTS "unique_metrics_constraint";
+ALTER TABLE "public"."all_metrics" DROP COLUMN IF EXISTS "device_id";
+
+-- Set Timestamp as Primary Key
+-- Set Timestamp as Primary Key (Safely)
+DO $$
+BEGIN
+    BEGIN
+        ALTER TABLE "public"."all_metrics" ADD CONSTRAINT "all_metrics_pkey" PRIMARY KEY ("timestamp");
+    EXCEPTION WHEN OTHERS THEN
+        NULL; -- Ignore if PK already exists
+    END;
+END $$;
+ALTER TABLE "public"."all_metrics"
+ADD COLUMN IF NOT EXISTS "mold_1" double precision,
+ADD COLUMN IF NOT EXISTS "mold_2" double precision,
+ADD COLUMN IF NOT EXISTS "mold_3" double precision,
+ADD COLUMN IF NOT EXISTS "mold_4" double precision,
+ADD COLUMN IF NOT EXISTS "mold_5" double precision,
+ADD COLUMN IF NOT EXISTS "mold_6" double precision,
+ADD COLUMN IF NOT EXISTS "billet_temp" double precision,
+ADD COLUMN IF NOT EXISTS "at_pre" double precision,
+ADD COLUMN IF NOT EXISTS "at_temp" double precision;
+-- Add new columns for integrated log data (2025-12-16)
+-- These columns are nullable to ensure backward compatibility with older data.
+
+ALTER TABLE "public"."all_metrics"
+ADD COLUMN IF NOT EXISTS "die_id" text DEFAULT NULL,
+ADD COLUMN IF NOT EXISTS "billet_cycle_id" bigint DEFAULT NULL;
+
+COMMENT ON COLUMN "public"."all_metrics"."die_id" IS '금형 ID (Integrated Log)';
+COMMENT ON COLUMN "public"."all_metrics"."billet_cycle_id" IS '빌렛 ?�이??ID (Integrated Log)';
+-- Migration: Cleanup Unused Objects
+-- Date: 2025-12-25
+-- Description: 
+-- Remove legacy views, materialized views, and unused tables.
+-- Retains ONLY 'all_metrics' and 'view_optimized_aligned_metrics'.
+-- Drops 'tb_work_log' to be re-created later.
+
+-- 1. Drop Legacy Views first (due to dependencies)
+DROP VIEW IF EXISTS "public"."metrics_view";
+
+-- 2. Drop Legacy Materialized Views (CASCADE to remove indexes/dependents)
+DROP MATERIALIZED VIEW IF EXISTS "public"."all_metrics_processed" CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS "public"."view_aligned_metrics" CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS "public"."view_aligned_metrics_v2" CASCADE;
+
+-- 3. Drop Unused Tables (CASCADE to remove RLS policies/Grants)
+DROP TABLE IF EXISTS "public"."cycle_log" CASCADE;
+DROP TABLE IF EXISTS "public"."temp_machine_starts" CASCADE;
+DROP TABLE IF EXISTS "public"."tb_work_log" CASCADE;
+
+-- 4. Clean up any orphaned functions if necessary (Optional, but good practice)
+-- (None explicitly identified as purely orphan, keeping shared helpers)
 -- Migration: Create View Optimized Aligned Metrics
 -- Date: 2025-12-23
 -- Description: 
@@ -188,3 +288,24 @@ GRANT SELECT ON "public"."view_optimized_aligned_metrics" TO anon, authenticated
 --     '*/10 * * * *',
 --     'REFRESH MATERIALIZED VIEW CONCURRENTLY public.view_optimized_aligned_metrics'
 -- );
+
+-- Manual History Sync
+INSERT INTO supabase_migrations.schema_migrations (version, name, statements) VALUES
+('20251126000000', 'baseline', NULL),
+('20251126000001', 'restore_all_metrics', NULL),
+('20251126075643', 'gui_update_20251126165619', NULL),
+('20251126235402', 'gui_update_20251127085339', NULL),
+('20251201', 'enable_rls_all_metrics', NULL),
+('20251203', 'add_reload_func', NULL),
+('20251203000002', 'create_cycle_log', NULL),
+('20251209000001', 'unified_schema', NULL),
+('20251209000002', 'add_integrated_columns', NULL),
+('20251216', 'add_die_and_cycle_id', NULL),
+('20251221', 'finalize_aligned_metrics_view', NULL),
+('20251222', 'create_view_aligned_metrics_v2', NULL),
+('20251223', 'view_optimized_aligned_metrics', NULL),
+('20251224000001', 'add_work_log_columns', NULL),
+('20251224000002', 'add_work_log_die_and_yield', NULL),
+('20251224000003', 'grant_tb_work_log', NULL),
+('20251225', 'cleanup_unused_objects', NULL)
+ON CONFLICT (version) DO NOTHING;

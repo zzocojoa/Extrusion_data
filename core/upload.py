@@ -295,10 +295,45 @@ def upload_work_log_data(
     try:
         machine_ids = df_upload['machine_id'].unique()
         if len(machine_ids) > 0:
-            m_ids_str = ",".join(machine_ids)
+            def quote_in_value(val: object) -> str | None:
+                if val is None or pd.isna(val):
+                    return None
+                s = str(val).replace('"', '\\"')
+                return f"\"{s}\""
+
+            quoted_ids = [q for q in (quote_in_value(v) for v in machine_ids) if q]
+            m_ids_str = ",".join(quoted_ids)
             query_url = f"{supabase_url}/rest/v1/tb_work_log"
+            select_cols = [
+                "start_time",
+                "machine_id",
+                "die_number",
+                "production_qty",
+                "production_weight",
+                "productivity",
+                "lot",
+                "temper_type",
+                "quenching_temp",
+                "stretching",
+                "total_weight",
+                "ram",
+                "product_length",
+                "actual_unit_weight",
+                "defect_bubble",
+                "defect_tearing",
+                "defect_white_black_line",
+                "defect_oxide",
+                "defect_scratch",
+                "defect_bend",
+                "defect_dimension",
+                "defect_line",
+                "defect_etc",
+                "start_cut",
+                "end_cut",
+                "op_note",
+            ]
             params = {
-                "select": "start_time,machine_id,die_number,production_qty,production_weight,productivity",
+                "select": ",".join(select_cols),
                 "machine_id": f"in.({m_ids_str})"
             }
             headers = {
@@ -311,6 +346,21 @@ def upload_work_log_data(
                 existing_data = r.json()
                 existing_signatures = set()
                 
+                def norm(v):
+                    if pd.isna(v) or v is None:
+                        return None
+                    try:
+                        f = float(v)
+                        return int(f) if f.is_integer() else f
+                    except Exception:
+                        return v
+
+                def norm_text(v):
+                    if v is None or pd.isna(v):
+                        return None
+                    s = str(v).strip()
+                    return s if s else None
+
                 for item in existing_data:
                     ts = item.get('start_time')
                     if ts:
@@ -320,12 +370,32 @@ def upload_work_log_data(
                             
                             # Build signature tuple
                             sig = (
-                                item.get('machine_id'),
+                                norm_text(item.get('machine_id')),
                                 dt,
-                                item.get('die_number'),
-                                item.get('production_qty'),
-                                item.get('production_weight'),
-                                item.get('productivity')
+                                norm(item.get('die_number')),
+                                norm(item.get('production_qty')),
+                                norm(item.get('production_weight')),
+                                norm(item.get('productivity')),
+                                norm_text(item.get('lot')),
+                                norm_text(item.get('temper_type')),
+                                norm(item.get('quenching_temp')),
+                                norm(item.get('stretching')),
+                                norm(item.get('total_weight')),
+                                norm(item.get('ram')),
+                                norm(item.get('product_length')),
+                                norm(item.get('actual_unit_weight')),
+                                norm(item.get('defect_bubble')),
+                                norm(item.get('defect_tearing')),
+                                norm(item.get('defect_white_black_line')),
+                                norm(item.get('defect_oxide')),
+                                norm(item.get('defect_scratch')),
+                                norm(item.get('defect_bend')),
+                                norm(item.get('defect_dimension')),
+                                norm(item.get('defect_line')),
+                                norm(item.get('defect_etc')),
+                                norm(item.get('start_cut')),
+                                norm(item.get('end_cut')),
+                                norm_text(item.get('op_note')),
                             )
                             existing_signatures.add(sig)
                         except Exception:
@@ -343,22 +413,33 @@ def upload_work_log_data(
                         # Wait, step 1 converted to ISO string. pd.to_datetime works on ISO strings.
                         dt = pd.to_datetime(t).tz_convert("UTC")
                         
-                        # Helper to normalize numeric values (handle None/NaN/float vs int)
-                        def norm(v):
-                            if pd.isna(v) or v is None: return None
-                            try:
-                                f = float(v)
-                                return int(f) if f.is_integer() else f
-                            except:
-                                return v
-
                         sig = (
-                            row.get('machine_id'),
+                            norm_text(row.get('machine_id')),
                             dt,
                             norm(row.get('die_number')),
                             norm(row.get('production_qty')),
                             norm(row.get('production_weight')),
-                            norm(row.get('productivity'))
+                            norm(row.get('productivity')),
+                            norm_text(row.get('lot')),
+                            norm_text(row.get('temper_type')),
+                            norm(row.get('quenching_temp')),
+                            norm(row.get('stretching')),
+                            norm(row.get('total_weight')),
+                            norm(row.get('ram')),
+                            norm(row.get('product_length')),
+                            norm(row.get('actual_unit_weight')),
+                            norm(row.get('defect_bubble')),
+                            norm(row.get('defect_tearing')),
+                            norm(row.get('defect_white_black_line')),
+                            norm(row.get('defect_oxide')),
+                            norm(row.get('defect_scratch')),
+                            norm(row.get('defect_bend')),
+                            norm(row.get('defect_dimension')),
+                            norm(row.get('defect_line')),
+                            norm(row.get('defect_etc')),
+                            norm(row.get('start_cut')),
+                            norm(row.get('end_cut')),
+                            norm_text(row.get('op_note')),
                         )
                         
                         if sig in existing_signatures:
@@ -375,7 +456,8 @@ def upload_work_log_data(
                     log(f"중복 제거: {original_len - filtered_len}건 (남은 데이터: {filtered_len}건)")
             else:
                 # Fail-Close
-                log(f"중복 체크 실패 (서버 오류 {r.status_code}). 데이터 안전을 위해 업로드를 중단합니다.")
+                log(f"중복 체크 실패 (서버 오류 {r.status_code}): {r.text[:500]}")
+                log("데이터 안전을 위해 업로드를 중단합니다.")
                 return False
 
     except Exception as e:

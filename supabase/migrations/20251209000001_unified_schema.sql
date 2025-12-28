@@ -6,4 +6,12 @@ ALTER TABLE "public"."all_metrics" DROP CONSTRAINT IF EXISTS "unique_metrics_con
 ALTER TABLE "public"."all_metrics" DROP COLUMN IF EXISTS "device_id";
 
 -- Set Timestamp as Primary Key
-ALTER TABLE "public"."all_metrics" ADD CONSTRAINT "all_metrics_pkey" PRIMARY KEY ("timestamp");
+-- Set Timestamp as Primary Key (Safely)
+DO $$
+BEGIN
+    BEGIN
+        ALTER TABLE "public"."all_metrics" ADD CONSTRAINT "all_metrics_pkey" PRIMARY KEY ("timestamp");
+    EXCEPTION WHEN OTHERS THEN
+        NULL; -- Ignore if PK already exists
+    END;
+END $$;

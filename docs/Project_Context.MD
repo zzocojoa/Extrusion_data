@@ -1,123 +1,118 @@
-# Project Context & Environment Summary (Master v4.1 - Final Optimized)
+﻿# 프로젝트 컨텍스트 및 환경 요약 (Master v4.1 - 최종 최적화)
 
-I am building a local data analysis pipeline for Aluminum Extrusion PLC data
-using Supabase CLI.
+Supabase CLI를 사용해 알루미늄 압출 PLC 데이터용 로컬 데이터 분석 파이프라인을
+구축 중이다.
 
-**CRITICAL:** This project uses a specific local Docker setup with strict
-network/auth rules. Do not suggest standard solutions that conflict with this
-configuration.
+**중요:** 이 프로젝트는 엄격한 네트워크/인증 규칙이 있는 특정 로컬 Docker
+구성을 사용한다. 이 설정과 충돌하는 일반적인 해법을 제안하지 말 것.
 
-## 1. Infrastructure (Local Hybrid)
+## 1. 인프라 (로컬 하이브리드)
 
-- **Host OS:** Windows 10/11 (WSL2 Backend enabled)
+- **호스트 OS:** Windows 10/11 (WSL2 백엔드 활성화)
 
-- **Guest OS (Server):** Ubuntu (running on WSL2)
+- **게스트 OS(서버):** Ubuntu (WSL2에서 실행)
 
-- **Physical Storage:**
-  - **Database:** WSL Root Filesystem (`ext4.vhdx`).
-  - **Backup Storage:** `E:\backups` (USB Drive).
-    - **Note:** `E:\supabase-data.vhdx` is attached to WSL but NOT used for live
-      DB storage. It is used as a mount point for USB backups.
+- **물리 스토리지:**
+  - **데이터베이스:** WSL 루트 파일시스템 (`ext4.vhdx`).
+  - **백업 스토리지:** `E:\backups` (USB 드라이브).
+    - **참고:** `E:\supabase-data.vhdx`는 WSL에 연결되어 있지만 실시간 DB
+      저장소로는 사용하지 않는다. USB 백업용 마운트 지점으로만 사용한다.
 
-## 2. Tech Stack & Network (Fixed)
+## 2. 기술 스택 & 네트워크 (고정)
 
-- **Tool:** Supabase CLI (executed from Project Root:
+- **도구:** Supabase CLI (프로젝트 루트에서 실행:
   `/mnt/c/Users/user/Documents/GitHub/Extrusion_data`)
 
-- **Shared Network:** `supabase_network_Extrusion_data`
+- **공유 네트워크:** `supabase_network_Extrusion_data`
 
-- **Database (Supabase):**
+- **데이터베이스 (Supabase):**
 
-  - Container Name: `supabase_db_Extrusion_data`
+  - 컨테이너 이름: `supabase_db_Extrusion_data`
 
-  - **External Port (Host/DBeaver):** `25432` (Mapped via `config.toml`)
+  - **외부 포트(호스트/DBeaver):** `25432` (`config.toml`에서 매핑)
 
-  - **Internal Port (Docker/Grafana):** `5432`
+  - **내부 포트(Docker/Grafana):** `5432`
 
-- **Visualization (Grafana):**
+- **시각화 (Grafana):**
 
-  - Container Name: `grafana_local`
+  - 컨테이너 이름: `grafana_local`
 
-  - Connection Host: `supabase_db_Extrusion_data:5432` (Direct
-    container-to-container)
+  - 연결 호스트: `supabase_db_Extrusion_data:5432` (컨테이너 간 직접 연결)
 
   - URL: `http://localhost:3001`
 
-## 3. Client Configuration (Python GUI)
+## 3. 클라이언트 설정 (Python GUI)
 
-- **File:** `core/upload.py`
+- **파일:** `core/upload.py`
 
-- **Config Management:** `config.ini` (Git-ignored).
+- **설정 관리:** `config.ini` (Git 무시).
 
-- **Auth Strategy:**
+- **인증 전략:**
 
   - URL: `http://127.0.0.1:54321` (Kong Gateway)
 
-  - Key: `sb_publishable_...` (Anon Key) from `config.ini`.
+  - Key: `config.ini`의 `sb_publishable_...` (Anon Key).
 
-  - **CRITICAL HEADER:** Requests MUST include `apikey` header (same as Anon
-    Key) to bypass Kong Gateway.
+  - **필수 헤더:** Kong Gateway를 통과하려면 요청에 `apikey` 헤더(Anon Key와
+    동일)가 반드시 포함되어야 한다.
 
-- **New Features (v4.2):**
-  - **Smart Sync:** Checks server for latest data timestamp before uploading to
-    avoid duplicates.
-  - **Parallel Upload:** Uses `ThreadPoolExecutor` for concurrent file uploads
-    (default 4 threads).
-  - **Real-time Progress:** GUI displays individual file progress and overall
-    status.
+- **신규 기능 (v4.2):**
+  - **스마트 동기화:** 업로드 전 서버 최신 데이터 타임스탬프를 확인해 중복을
+    방지한다.
+  - **병렬 업로드:** `ThreadPoolExecutor`로 동시 업로드(기본 4 스레드).
+  - **실시간 진행률:** GUI에서 파일별 진행률과 전체 상태를 표시한다.
 
-## 4. Edge Function Configuration (Deno)
+## 4. 에지 함수 설정 (Deno)
 
-- **File:** `supabase/functions/upload-metrics/index.ts`
+- **파일:** `supabase/functions/upload-metrics/index.ts`
 
-- **Auth Strategy (Env Vars):**
+- **인증 전략 (환경 변수):**
 
-  - **NO HARDCODED KEYS.** Code uses
-    `Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')`.
+  - **키 하드코딩 금지.** 코드는
+    `Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')`를 사용한다.
 
-  - **URL:** Uses `Deno.env.get('SUPABASE_URL')`.
+  - **URL:** `Deno.env.get('SUPABASE_URL')`를 사용한다.
 
-- **Logic:**
-  - `POST`: Uploads data batches.
-  - `GET`: Returns latest timestamp for a given `device_id` (used for Smart
-    Sync).
-  - Manual header validation (`getAuthToken`) is REMOVED. Relying on Gateway
-    validation.
+- **로직:**
+  - `POST`: 데이터 배치를 업로드한다.
+  - `GET`: `device_id` 기준 최신 타임스탬프를 반환한다(스마트 동기화에 사용).
+  - 수동 헤더 검증(`getAuthToken`)은 제거되었다. Gateway 검증에 의존한다.
 
-## 5. Operational Procedures & Automation
+## 5. 운영 절차 & 자동화
 
-- **System Startup (After Reboot):**
+- **시스템 시작(재부팅 후):**
 
-  1. **Windows (Admin PowerShell):**
+  1. **Windows (관리자 PowerShell):**
      `wsl --mount --vhd "E:\supabase-data.vhdx" --bare`
 
-  2. **Ubuntu (Terminal):**
+  2. **Ubuntu (터미널):**
 
      - `cd /mnt/c/Users/user/Documents/GitHub/Extrusion_data`
 
-     - Run **`./startup.sh`** (Located in Project Root)
-     - _This script checks for project directory and Docker status, starts
-       Supabase/Grafana, and ensures Cron service is running._
+     - **`./startup.sh`** 실행 (프로젝트 루트 위치)
+     - _이 스크립트는 프로젝트 디렉터리와 Docker 상태를 확인하고,
+       Supabase/Grafana를 시작하며 Cron 서비스 실행을 보장한다._
 
-- **Backup Strategy:**
+- **백업 전략:**
 
-  - Script: `./supabase/auto/backup_daily.sh` (Uses `.env` for credentials)
-  - **Scope:** `public` schema only.
-  - **Location:**
-    1. Local: `~/Documents/GitHub/Extrusion_data/backups`
-    2. USB: `/mnt/e/backups` (if mounted)
-  - **Automation:** WSL Cron job scheduled at **18:30 Daily**.
+  - 스크립트: `./supabase/auto/backup_daily.sh` (`.env`로 자격 증명 사용)
+  - **범위:** `public` 스키마만.
+  - **위치:**
+    1. 로컬: `~/Documents/GitHub/Extrusion_data/backups`
+    2. USB: `/mnt/e/backups` (마운트된 경우)
+  - **자동화:** WSL Cron 작업이 매일 **18:30**에 실행.
 
-- **Restore Strategy:** `./restore_latest.sh`
+- **복구 전략:** `./restore_latest.sh`
 
-## 6. ⛔ Constraints & Forbidden Actions (Do Not Touch)
+## 6. 제약 및 금지 사항 (건드리지 말 것)
 
-1. **NO SECRETS IN CODE:** Source files must use Environment Variables (`.env`)
-   or config files ignored by Git.
+1. **코드에 비밀 정보 금지:** 소스 파일은 환경 변수(`.env`) 또는 Git에서
+   무시되는 설정 파일을 사용해야 한다.
 
-2. **DO NOT use `localhost` inside Containers:** Use container names (e.g.,
-   `supabase_db_Extrusion_data`).
+2. **컨테이너 내부에서 `localhost` 사용 금지:** 컨테이너 이름을 사용할 것
+   (예: `supabase_db_Extrusion_data`).
 
-3. **DO NOT touch `~/supabase/docker`:** Legacy path. Work ONLY in Project Root.
+3. **`~/supabase/docker` 금지:** 레거시 경로다. 작업은 프로젝트 루트에서만
+   수행한다.
 
-4. **DO NOT remove `apikey` header:** Python client fails without it.
+4. **`apikey` 헤더 제거 금지:** Python 클라이언트가 이 헤더 없이는 실패한다.
