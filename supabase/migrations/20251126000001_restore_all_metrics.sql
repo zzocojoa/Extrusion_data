@@ -19,12 +19,20 @@ ALTER TABLE public.all_metrics OWNER TO postgres;
 -- Unique constraint from original schema (Idempotent)
 DO $$
 BEGIN
-    BEGIN
-        ALTER TABLE ONLY public.all_metrics
-            ADD CONSTRAINT all_metrics_timestamp_device_id_key UNIQUE ("timestamp", device_id);
-    EXCEPTION WHEN duplicate_object THEN
-        NULL;
-    END;
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'all_metrics'
+          AND column_name = 'device_id'
+    ) THEN
+        BEGIN
+            ALTER TABLE ONLY public.all_metrics
+                ADD CONSTRAINT all_metrics_timestamp_device_id_key UNIQUE ("timestamp", device_id);
+        EXCEPTION WHEN duplicate_object THEN
+            NULL;
+        END;
+    END IF;
 END $$;
 
 -- Grants
