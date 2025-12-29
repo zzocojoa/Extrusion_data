@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
@@ -151,6 +152,86 @@ def parse_work_log_excel(file_path):
         lambda row: pd.Series(make_timestamp(row.get("날짜"), row.get("시작"), row.get("종료"))),
         axis=1,
     )
+
+    df["source_row"] = df.index + found_header_idx + 2
+    df["source_file"] = os.path.basename(file_path)
+
+    # Fix drag-copied dates by rolling forward on day/night transitions or time reversal.
+    day_offset = 0
+    prev_start = None
+    prev_end = None
+    prev_shift = None
+    prev_base_date = None
+    prev_time_of_date = None
+    night_started = False
+    corrected_flags = []
+    start_fixed = []
+    end_fixed = []
+    for st, et in zip(df["start_time"], df["end_time"]):
+        if pd.isna(st) or pd.isna(et):
+            start_fixed.append(st)
+            end_fixed.append(et)
+            corrected_flags.append(None)
+            continue
+
+        st_time = st.time()
+        et_time = et.time()
+        base_date = st.date()
+        if prev_base_date is not None and base_date != prev_base_date:
+            # New source date: reset rollover context to avoid drift across days.
+            day_offset = 0
+            prev_start = None
+            prev_end = None
+            prev_shift = None
+            prev_time_of_date = None
+            night_started = False
+        prev_base_date = base_date
+
+        time_reversal = prev_time_of_date is not None and st_time < prev_time_of_date
+        offset = day_offset
+        reason = None
+        if offset == 0:
+            if time_reversal:
+                offset = 1
+                day_offset = 1
+                reason = "time_reversal"
+            elif st.hour < 8 and night_started:
+                offset = 1
+                day_offset = 1
+                reason = "night_rollover"
+
+        st_adj = datetime.combine(
+            base_date + timedelta(days=offset),
+            st_time,
+            tzinfo=KST,
+        )
+        end_offset = offset
+        if et_time < st_time:
+            end_offset += 1
+        et_adj = datetime.combine(
+            base_date + timedelta(days=end_offset),
+            et_time,
+            tzinfo=KST,
+        )
+
+        if reason:
+            corrected_flags.append({"date_corrected": True, "reason": reason})
+        else:
+            corrected_flags.append(None)
+
+        if st.hour >= 20:
+            night_started = True
+        prev_time_of_date = st_time
+
+        start_fixed.append(st_adj)
+        end_fixed.append(et_adj)
+        prev_start = st_adj
+        prev_end = et_adj
+        prev_shift = "day" if 8 <= st.hour < 20 else "night"
+
+    df["start_time"] = start_fixed
+    df["end_time"] = end_fixed
+    df["data_quality_flags"] = corrected_flags
 
     # Numeric conversions
     df["온도"] = to_numeric(df.get("온도"))
@@ -158,6 +239,7 @@ def parse_work_log_excel(file_path):
     exit_col = pick_column(df, ["출구온도"])
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
@@ -309,6 +391,86 @@ def parse_work_log_excel(file_path):
         lambda row: pd.Series(make_timestamp(row.get("날짜"), row.get("시작"), row.get("종료"))),
         axis=1,
     )
+
+    df["source_row"] = df.index + found_header_idx + 2
+    df["source_file"] = os.path.basename(file_path)
+
+    # Fix drag-copied dates by rolling forward on day/night transitions or time reversal.
+    day_offset = 0
+    prev_start = None
+    prev_end = None
+    prev_shift = None
+    prev_base_date = None
+    prev_time_of_date = None
+    night_started = False
+    corrected_flags = []
+    start_fixed = []
+    end_fixed = []
+    for st, et in zip(df["start_time"], df["end_time"]):
+        if pd.isna(st) or pd.isna(et):
+            start_fixed.append(st)
+            end_fixed.append(et)
+            corrected_flags.append(None)
+            continue
+
+        st_time = st.time()
+        et_time = et.time()
+        base_date = st.date()
+        if prev_base_date is not None and base_date != prev_base_date:
+            # New source date: reset rollover context to avoid drift across days.
+            day_offset = 0
+            prev_start = None
+            prev_end = None
+            prev_shift = None
+            prev_time_of_date = None
+            night_started = False
+        prev_base_date = base_date
+
+        time_reversal = prev_time_of_date is not None and st_time < prev_time_of_date
+        offset = day_offset
+        reason = None
+        if offset == 0:
+            if time_reversal:
+                offset = 1
+                day_offset = 1
+                reason = "time_reversal"
+            elif st.hour < 8 and night_started:
+                offset = 1
+                day_offset = 1
+                reason = "night_rollover"
+
+        st_adj = datetime.combine(
+            base_date + timedelta(days=offset),
+            st_time,
+            tzinfo=KST,
+        )
+        end_offset = offset
+        if et_time < st_time:
+            end_offset += 1
+        et_adj = datetime.combine(
+            base_date + timedelta(days=end_offset),
+            et_time,
+            tzinfo=KST,
+        )
+
+        if reason:
+            corrected_flags.append({"date_corrected": True, "reason": reason})
+        else:
+            corrected_flags.append(None)
+
+        if st.hour >= 20:
+            night_started = True
+        prev_time_of_date = st_time
+
+        start_fixed.append(st_adj)
+        end_fixed.append(et_adj)
+        prev_start = st_adj
+        prev_end = et_adj
+        prev_shift = "day" if 8 <= st.hour < 20 else "night"
+
+    df["start_time"] = start_fixed
+    df["end_time"] = end_fixed
+    df["data_quality_flags"] = corrected_flags
 
     # Numeric conversions
     if "온도" in df.columns:
@@ -403,6 +565,9 @@ def parse_work_log_excel(file_path):
         "S",
         "E",
         "OP Note (특이사항 입력란)",
+        "source_file",
+        "source_row",
+        "data_quality_flags",
     ]
 
     final_df = df[[col for col in selected_columns if col in df.columns]].copy()
@@ -443,7 +608,26 @@ def parse_work_log_excel(file_path):
             "OP Note (특이사항 입력란)": "op_note",
         }
     )
-    
+
+    # Fix negative productivity from cross-midnight shifts by recomputing from duration.
+    if {
+        "productivity",
+        "production_weight",
+        "start_time",
+        "end_time",
+    }.issubset(final_df.columns):
+        duration_sec = (final_df["end_time"] - final_df["start_time"]).dt.total_seconds()
+        hours = duration_sec / 3600.0
+        mask = (
+            (final_df["productivity"].isna() | (final_df["productivity"] < 0))
+            & final_df["production_weight"].notna()
+            & hours.gt(0)
+        )
+        if mask.any():
+            final_df.loc[mask, "productivity"] = (
+                final_df.loc[mask, "production_weight"].astype(float) / hours[mask]
+            ).round(0)
+
     # Fix: Ensure integer fields are Int64 (nullable)
     for col in [
         "production_qty",
@@ -460,6 +644,7 @@ def parse_work_log_excel(file_path):
         "defect_etc",
         "start_cut",
         "end_cut",
+        "source_row",
     ]:
         if col in final_df.columns:
             final_df[col] = final_df[col].astype("Int64")
