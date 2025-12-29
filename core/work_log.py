@@ -188,17 +188,14 @@ def parse_work_log_excel(file_path):
         prev_base_date = base_date
 
         time_reversal = prev_time_of_date is not None and st_time < prev_time_of_date
-        offset = day_offset
         reason = None
-        if offset == 0:
-            if time_reversal:
-                offset = 1
-                day_offset = 1
-                reason = "time_reversal"
-            elif st.hour < 8 and night_started:
-                offset = 1
-                day_offset = 1
-                reason = "night_rollover"
+        if time_reversal:
+            day_offset += 1
+            reason = "time_reversal"
+        elif st.hour < 8 and night_started and day_offset == 0:
+            day_offset += 1
+            reason = "night_rollover"
+        offset = day_offset
 
         st_adj = datetime.combine(
             base_date + timedelta(days=offset),
@@ -427,17 +424,14 @@ def parse_work_log_excel(file_path):
         prev_base_date = base_date
 
         time_reversal = prev_time_of_date is not None and st_time < prev_time_of_date
-        offset = day_offset
         reason = None
-        if offset == 0:
-            if time_reversal:
-                offset = 1
-                day_offset = 1
-                reason = "time_reversal"
-            elif st.hour < 8 and night_started:
-                offset = 1
-                day_offset = 1
-                reason = "night_rollover"
+        if time_reversal:
+            day_offset += 1
+            reason = "time_reversal"
+        elif st.hour < 8 and night_started and day_offset == 0:
+            day_offset += 1
+            reason = "night_rollover"
+        offset = day_offset
 
         st_adj = datetime.combine(
             base_date + timedelta(days=offset),
