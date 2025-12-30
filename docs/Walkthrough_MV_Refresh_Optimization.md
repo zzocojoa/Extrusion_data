@@ -1,117 +1,91 @@
-# Materialized View Refresh 성능 개선 가이드
+# mv_optimized_metrics_work_log REFRESH 성능 개선 가이드
 
-## 1. 현재 병목 요약
+## 목표
+- `REFRESH MATERIALIZED VIEW` 시간 단축
+- `tb_work_log` 보정/오차가 있는 상태에서도 매칭 정확도 유지
+- 전체 리프레시가 어려울 경우 **증분 갱신** 옵션 제공
 
-`mv_optimized_metrics_work_log`는 `view_optimized_aligned_metrics`의 대량 시계열에 대해
-`tb_work_log`를 LATERAL로 매칭한다. 이 구조는 **Row마다 범위 탐색 + 정렬 + LIMIT 1**이 반복되므로,
-`REFRESH` 시 시간이 오래 걸린다.
+## 1) 구조 개선 개요
 
-## 2. 단기 개선(즉시 적용)
+### 기존 병목
+- `view_optimized_aligned_metrics`의 대량 시계열에 대해
+  `tb_work_log`를 **Row마다 LATERAL + ORDER BY + LIMIT 1**로 매칭
+- 전체 리프레시가 오래 걸림
 
-### 2-1) 인덱스/통계 확인
+### 개선 방향
+1. **정확 매칭 범위**를 별도 MV로 미리 계산
+2. 정확 매칭은 범위 조인으로 처리
+3. 허용오차(±35분)는 **필요할 때만** fallback
+4. 전체 리프레시가 부담이면 **캐시 테이블 증분 갱신** 사용
 
-- `tb_work_log` 범위 매칭용 GIST 인덱스 확인
-- 정렬 비용 줄이기 위한 Covering Index 적용
-- 대량 변경 후 `ANALYZE` 실행
+## 2) 적용된 스키마 변경
+
+### A. tb_work_log covering index
 
 ```sql
-CREATE INDEX IF NOT EXISTS idx_work_log_time_range
-    ON public.tb_work_log
-    USING GIST (tstzrange(start_time, end_time, '[]'));
-
 CREATE INDEX IF NOT EXISTS idx_work_log_cover_perf
-    ON public.tb_work_log (start_time, end_time, created_at DESC)
+    ON public.tb_work_log (start_time, end_time, created_at DESC, id DESC)
     INCLUDE (die_id);
-
-ANALYZE public.tb_work_log;
 ```
 
-### 2-2) 작업 세션 튜닝
+### B. 정확 매칭용 MV
+
+- 파일: `supabase/migrations/20251230000002_create_mv_work_log_effective_ranges.sql`
+- 목적: 겹치는 구간을 정리해 **비겹침 범위**로 변환
 
 ```sql
-SET work_mem = '256MB'; -- 필요 시 상향
-SET maintenance_work_mem = '512MB';
+REFRESH MATERIALIZED VIEW public.mv_work_log_effective_ranges;
+```
+
+### C. mv_optimized_metrics_work_log 개선
+
+- 파일: `supabase/migrations/20251230000003_update_mv_optimized_metrics_work_log_use_ranges.sql`
+- 매칭 순서
+  1) `mv_work_log_effective_ranges`로 정확 매칭
+  2) 실패 시 ±35분 tolerance fallback
+
+```sql
 REFRESH MATERIALIZED VIEW public.mv_optimized_metrics_work_log;
 ```
 
-### 2-3) CONCURRENTLY 사용 조건 점검
+## 3) 증분 갱신(옵션)
 
-`REFRESH ... CONCURRENTLY`는 유니크 인덱스가 필요하다.
-타임스탬프 중복이 있으면 실패하므로 사전 점검이 필요하다.
+전체 리프레시가 부담이면 **캐시 테이블**로 증분 갱신을 한다.
+
+- 캐시 테이블: `public.mv_optimized_metrics_work_log_cache`
+- 함수:
+  - `refresh_mv_work_log_effective_ranges()`
+  - `refresh_mv_optimized_metrics_work_log_cache_full()`
+  - `refresh_mv_optimized_metrics_work_log_cache_range(from_ts, to_ts, pad)`
+
+### 전체 갱신
 
 ```sql
-SELECT "timestamp", COUNT(*)
-FROM public.view_optimized_aligned_metrics
-GROUP BY 1
-HAVING COUNT(*) > 1;
+SELECT public.refresh_mv_optimized_metrics_work_log_cache_full();
 ```
 
-## 3. 중기 개선(쿼리 구조 개선)
-
-### 3-1) Timeline Flattening
-
-겹치는 `tb_work_log` 구간을 사전에 정리해 **비겹침 구간**으로 만들면,
-최종 매칭은 단순 Range Join이 되어 `ORDER BY/LIMIT`가 사라진다.
+### 범위 갱신
 
 ```sql
--- 개념 예시
-CREATE MATERIALIZED VIEW public.mv_work_log_ranges AS
-SELECT DISTINCT ON (wl.start_time)
-    id,
-    die_id,
-    start_time,
-    end_time,
-    tstzrange(start_time, end_time, '[]') AS period
-FROM tb_work_log wl
-ORDER BY wl.start_time, wl.created_at DESC;
+SELECT public.refresh_mv_optimized_metrics_work_log_cache_range(
+  '2025-12-19 00:00:00+09',
+  '2025-12-19 23:59:59+09',
+  interval '35 min'
+);
 ```
 
-### 3-2) 파티셔닝/BRIN 인덱스 고려
+## 4) 운영 체크리스트
 
-`view_optimized_aligned_metrics`가 매우 크면,
-기반 테이블(all_metrics 등)에 날짜 파티셔닝 + BRIN 인덱스를 적용하면
-범위 스캔 비용이 크게 줄어든다.
-
-## 4. 장기 개선(증분 Refresh)
-
-전체 `REFRESH` 대신 **증분 갱신 방식**으로 전환하는 것이 가장 효과적이다.
-
-핵심 아이디어:
-- 새로 들어온 시계열 구간만 INSERT
-- 변경된 `tb_work_log` 구간만 DELETE + 재계산
+- `mv_work_log_effective_ranges` → `mv_optimized_metrics_work_log` 순서로 갱신
+- 대량 리프레시 전 `work_mem` 상향
+- 증분 갱신을 운영하면 Grafana는 캐시 테이블을 조회
 
 ```sql
--- 개념 예시: 변경된 기간만 재계산
-WITH changed AS (
-  SELECT MIN(start_time) AS from_ts, MAX(end_time) AS to_ts
-  FROM public.tb_work_log
-  WHERE updated_at >= now() - interval '1 hour'
-)
-DELETE FROM public.mv_optimized_metrics_work_log
-WHERE "timestamp" BETWEEN (SELECT from_ts FROM changed)
-                     AND (SELECT to_ts FROM changed);
-
-INSERT INTO public.mv_optimized_metrics_work_log
-SELECT ...
-FROM public.view_optimized_aligned_metrics
-WHERE "timestamp" BETWEEN (SELECT from_ts FROM changed)
-                      AND (SELECT to_ts FROM changed);
-```
-
-## 5. 운영 체크리스트(실무 기준)
-
-- `EXPLAIN (ANALYZE, BUFFERS)`로 인덱스 사용 여부 확인
-- `pg_stat_statements`로 실행 시간 추적
-- `REFRESH`는 비업무 시간대 예약
-- `lock_timeout`/`statement_timeout`으로 안전장치 설정
-
-```sql
-SET lock_timeout = '5s';
-SET statement_timeout = '0'; -- 대량 리프레시 시 제한 해제
+SET work_mem = '256MB';
 ```
 
 ## 요약
 
-1. 단기: 인덱스 + work_mem 조정 + 통계 갱신
-2. 중기: Timeline Flattening으로 LATERAL 제거
-3. 장기: 증분 Refresh 전환
+1. 정확 매칭을 MV로 분리해 리프레시 비용 감소
+2. 허용오차는 fallback으로 유지
+3. 필요 시 캐시 테이블로 증분 갱신 지원
