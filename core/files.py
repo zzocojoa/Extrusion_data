@@ -1,9 +1,10 @@
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from os import DirEntry
 from typing import List, Tuple
 
-from .state import load_processed
+from .state import build_file_state_lookup_keys, load_processed
 
 KST = timezone(timedelta(hours=9))
 
@@ -72,8 +73,53 @@ def parse_temp_end_date_from_filename(name: str) -> datetime | None:
         return None
 
 
-def within_cutoff(file_date: datetime, cutoff_date: datetime) -> bool:
-    return file_date.date() <= cutoff_date.date()
+def parse_iso_date(date_text: str) -> date:
+    parsed = datetime.strptime(date_text.strip(), "%Y-%m-%d")
+    return parsed.date()
+
+
+def resolve_custom_range_texts(
+    custom_date_start: str,
+    custom_date_end: str,
+    legacy_custom_date: str,
+) -> tuple[str, str]:
+    cleaned_start = custom_date_start.strip()
+    cleaned_end = custom_date_end.strip()
+    cleaned_legacy = legacy_custom_date.strip()
+
+    if cleaned_start != "" or cleaned_end != "":
+        return cleaned_start, cleaned_end
+
+    if cleaned_legacy == "":
+        return "", ""
+
+    return cleaned_legacy, cleaned_legacy
+
+
+def compute_date_window(
+    mode: str,
+    custom_date_start: str,
+    custom_date_end: str,
+) -> tuple[date | None, date]:
+    today = kst_now().date()
+    if mode == "today":
+        return None, today
+    if mode == "twodays":
+        return None, today - timedelta(days=2)
+    if mode == "custom":
+        start_date = parse_iso_date(custom_date_start)
+        end_date = parse_iso_date(custom_date_end)
+        if start_date > end_date:
+            raise ValueError("custom 시작일은 종료일보다 늦을 수 없습니다.")
+        return start_date, end_date
+    return None, today - timedelta(days=1)
+
+
+def within_date_window(file_date: datetime, start_date: date | None, end_date: date) -> bool:
+    file_day = file_date.date()
+    if start_date is not None and file_day < start_date:
+        return False
+    return file_day <= end_date
 
 
 def stable_enough(path: str, lag_minutes: int) -> bool:
@@ -81,24 +127,33 @@ def stable_enough(path: str, lag_minutes: int) -> bool:
     return last <= (kst_now() - timedelta(minutes=lag_minutes))
 
 
-def compute_cutoff(mode: str, custom_date: str) -> datetime:
-    today = kst_now().date()
-    if mode == "today":
-        return datetime(today.year, today.month, today.day, tzinfo=KST)
-    if mode == "twodays":
-        d = today - timedelta(days=2)
-        return datetime(d.year, d.month, d.day, tzinfo=KST)
-    if mode == "custom" and custom_date:
-        y, m, d = map(int, custom_date.split("-"))
-        return datetime(y, m, d, tzinfo=KST)
-    d = today - timedelta(days=1)
-    return datetime(d.year, d.month, d.day, tzinfo=KST)
+def _iter_sorted_csv_entries(folder: str) -> list[DirEntry[str]]:
+    try:
+        with os.scandir(folder) as entry_iterator:
+            csv_entries = [
+                entry
+                for entry in entry_iterator
+                if entry.is_file() and entry.name.lower().endswith(".csv")
+            ]
+    except OSError:
+        return []
+    csv_entries.sort(key=lambda entry: entry.name)
+    return csv_entries
+
+
+def _is_processed_file(processed: set[str], folder: str, filename: str, file_path: str) -> bool:
+    lookup_keys = build_file_state_lookup_keys(folder, filename, file_path)
+    for lookup_key in lookup_keys:
+        if lookup_key in processed:
+            return True
+    return False
 
 
 def list_candidates(
     plc_dir: str,
     temp_dir: str | None,
-    cutoff: datetime,
+    window_start: date | None,
+    window_end: date,
     lag_min: int,
     include_today: bool,
     check_lock: bool,
@@ -112,16 +167,15 @@ def list_candidates(
 
     # PLC
     if os.path.isdir(plc_dir):
-        for fn in sorted(os.listdir(plc_dir)):
-            if not fn.lower().endswith(".csv"):
-                continue
+        for entry in _iter_sorted_csv_entries(plc_dir):
+            fn = entry.name
             fdate = parse_plc_date_from_filename(fn)
             if not fdate:
                 continue
-            if not within_cutoff(fdate, cutoff):
+            if not within_date_window(fdate, window_start, window_end):
                 continue
-            path = os.path.join(plc_dir, fn)
-            if f"{plc_dir}/{fn}" in processed or fn in processed:
+            path = entry.path
+            if _is_processed_file(processed, plc_dir, fn, path):
                 continue
             if fdate.date() == kst_now().date() and include_today:
                 if not stable_enough(path, lag_min):
@@ -134,4 +188,3 @@ def list_candidates(
     # logic removed for single folder refactor
 
     return items
-
