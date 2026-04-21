@@ -1,6 +1,9 @@
 import json
 import os
 import threading
+import time
+from contextlib import contextmanager
+from typing import Iterator
 from typing import Any, Dict, Set, TypedDict
 
 from .config import get_data_dir
@@ -10,6 +13,9 @@ MANIFEST_FILENAME = "state_manifest.json"
 LOG_FILENAME = "processed_files.log"
 RESUME_FILENAME = "upload_resume.json"
 MANIFEST_VERSION = 1
+STATE_LOCK_SUFFIX = ".lock"
+STATE_LOCK_TIMEOUT_SECONDS = 10.0
+STATE_LOCK_POLL_SECONDS = 0.05
 
 _file_lock = threading.RLock()
 
@@ -167,6 +173,81 @@ def _atomic_write_text(path: str, content: str) -> None:
     os.replace(temp_path, path)
 
 
+def _is_pid_active(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _read_lock_pid(lock_path: str) -> int | None:
+    try:
+        with open(lock_path, "r", encoding="utf-8") as file_handle:
+            raw_value = file_handle.read().strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if raw_value == "":
+        return None
+    try:
+        return int(raw_value)
+    except ValueError:
+        return None
+
+
+@contextmanager
+def _process_file_lock(lock_path: str) -> Iterator[None]:
+    parent_dir = os.path.dirname(os.path.abspath(lock_path)) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+    deadline = time.monotonic() + STATE_LOCK_TIMEOUT_SECONDS
+    file_descriptor: int | None = None
+
+    while file_descriptor is None:
+        try:
+            file_descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            lock_pid = _read_lock_pid(lock_path)
+            if lock_pid is not None and not _is_pid_active(lock_pid):
+                try:
+                    os.remove(lock_path)
+                    continue
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"State lock timed out: {lock_path}")
+            time.sleep(STATE_LOCK_POLL_SECONDS)
+        except OSError as error:
+            raise OSError(f"Failed to acquire state lock: {lock_path}") from error
+
+    try:
+        os.write(file_descriptor, str(os.getpid()).encode("utf-8"))
+        yield
+    finally:
+        os.close(file_descriptor)
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _state_guard(manifest_path: str) -> Iterator[None]:
+    lock_path = manifest_path + STATE_LOCK_SUFFIX
+    with _file_lock:
+        with _process_file_lock(lock_path):
+            yield
+
+
 def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
     _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -190,6 +271,16 @@ def _save_state_snapshot(
     _atomic_write_json(legacy_resume_path, normalized_manifest["resume"])
 
 
+def _save_resume_snapshot(
+    manifest_path: str,
+    legacy_resume_path: str,
+    manifest: StateManifest,
+) -> None:
+    normalized_manifest = _normalize_manifest(manifest)
+    _atomic_write_json(manifest_path, normalized_manifest)
+    _atomic_write_json(legacy_resume_path, normalized_manifest["resume"])
+
+
 def _load_manifest_only(manifest_path: str) -> StateManifest:
     if not os.path.exists(manifest_path):
         return _default_manifest()
@@ -200,6 +291,7 @@ def _materialize_manifest_from_legacy(
     manifest_path: str,
     legacy_log_path: str,
     legacy_resume_path: str,
+    include_processed_snapshot: bool,
 ) -> StateManifest:
     if os.path.exists(manifest_path):
         return _load_manifest_only(manifest_path)
@@ -211,7 +303,10 @@ def _materialize_manifest_from_legacy(
     manifest["resume"] = resume_map
 
     if processed_keys or resume_map:
-        _save_state_snapshot(manifest_path, legacy_log_path, legacy_resume_path, manifest)
+        if include_processed_snapshot:
+            _save_state_snapshot(manifest_path, legacy_log_path, legacy_resume_path, manifest)
+        else:
+            _save_resume_snapshot(manifest_path, legacy_resume_path, manifest)
     return manifest
 
 
@@ -220,7 +315,25 @@ def _load_state_snapshot(
     legacy_log_path: str,
     legacy_resume_path: str,
 ) -> StateManifest:
-    return _materialize_manifest_from_legacy(manifest_path, legacy_log_path, legacy_resume_path)
+    return _materialize_manifest_from_legacy(
+        manifest_path,
+        legacy_log_path,
+        legacy_resume_path,
+        include_processed_snapshot=True,
+    )
+
+
+def _load_resume_state_snapshot(
+    manifest_path: str,
+    legacy_log_path: str,
+    legacy_resume_path: str,
+) -> StateManifest:
+    return _materialize_manifest_from_legacy(
+        manifest_path,
+        legacy_log_path,
+        legacy_resume_path,
+        include_processed_snapshot=False,
+    )
 
 
 def get_manifest_path(path: str | None = None) -> str:
@@ -258,7 +371,7 @@ def load_processed(path: str | None = None) -> Set[str]:
     log_path = get_log_path(path)
     resume_path = get_resume_path(path)
 
-    with _file_lock:
+    with _state_guard(manifest_path):
         manifest = _load_state_snapshot(manifest_path, log_path, resume_path)
         processed_keys = set(manifest["processed"])
         for key in list(processed_keys):
@@ -275,7 +388,7 @@ def log_processed(folder: str, filename: str, file_path: str, path: str | None =
     manifest_path = get_manifest_path(path)
     key = build_file_state_key(folder, filename, file_path)
 
-    with _file_lock:
+    with _state_guard(manifest_path):
         manifest = _load_state_snapshot(manifest_path, log_path, resume_path)
         processed_keys = set(manifest["processed"])
         processed_keys.add(key)
@@ -291,8 +404,8 @@ def load_resume(path: str | None = None) -> Dict[str, int]:
     log_path = get_log_path(path)
     resume_path = get_resume_path(path)
 
-    with _file_lock:
-        manifest = _load_state_snapshot(manifest_path, log_path, resume_path)
+    with _state_guard(manifest_path):
+        manifest = _load_resume_state_snapshot(manifest_path, log_path, resume_path)
         return dict(manifest["resume"])
 
 
@@ -304,10 +417,10 @@ def save_resume(data: Dict[str, int], path: str | None = None) -> None:
     resume_path = get_resume_path(path)
     manifest_path = get_manifest_path(path)
 
-    with _file_lock:
-        manifest = _load_state_snapshot(manifest_path, log_path, resume_path)
+    with _state_guard(manifest_path):
+        manifest = _load_resume_state_snapshot(manifest_path, log_path, resume_path)
         manifest["resume"] = _normalize_resume_map(data)
-        _save_state_snapshot(manifest_path, log_path, resume_path, manifest)
+        _save_resume_snapshot(manifest_path, resume_path, manifest)
 
 
 def set_resume_offset(key: str, offset: int, path: str | None = None) -> None:
@@ -318,8 +431,8 @@ def set_resume_offset(key: str, offset: int, path: str | None = None) -> None:
     resume_path = get_resume_path(path)
     manifest_path = get_manifest_path(path)
 
-    with _file_lock:
-        manifest = _load_state_snapshot(manifest_path, log_path, resume_path)
+    with _state_guard(manifest_path):
+        manifest = _load_resume_state_snapshot(manifest_path, log_path, resume_path)
         resume_map = dict(manifest["resume"])
         legacy_key = _normalize_legacy_key(key)
         if offset <= 0:
@@ -330,7 +443,7 @@ def set_resume_offset(key: str, offset: int, path: str | None = None) -> None:
             if legacy_key != key:
                 resume_map.pop(legacy_key, None)
         manifest["resume"] = resume_map
-        _save_state_snapshot(manifest_path, log_path, resume_path, manifest)
+        _save_resume_snapshot(manifest_path, resume_path, manifest)
 
 
 def get_resume_offset(key: str, path: str | None = None) -> int:
@@ -341,8 +454,8 @@ def get_resume_offset(key: str, path: str | None = None) -> int:
     log_path = get_log_path(path)
     resume_path = get_resume_path(path)
 
-    with _file_lock:
-        manifest = _load_state_snapshot(manifest_path, log_path, resume_path)
+    with _state_guard(manifest_path):
+        manifest = _load_resume_state_snapshot(manifest_path, log_path, resume_path)
         resume_map = manifest["resume"]
         legacy_key = _normalize_legacy_key(key)
         candidates = [key]
@@ -375,7 +488,7 @@ def migrate_legacy_state(script_dir: str | None = None) -> None:
     legacy_log_path = os.path.join(script_dir, LOG_FILENAME)
     legacy_resume_path = os.path.join(script_dir, RESUME_FILENAME)
 
-    with _file_lock:
+    with _state_guard(manifest_path):
         manifest = _load_manifest_only(manifest_path)
         if not manifest["processed"] and not manifest["resume"]:
             manifest = _default_manifest()

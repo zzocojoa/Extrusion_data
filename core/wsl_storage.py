@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, Literal, Mapping
+from typing import Final, Literal, Mapping, TypedDict
 
 
 StorageState = Literal["safe", "warning", "critical", "error", "unavailable"]
@@ -54,6 +54,10 @@ class WslStorageSnapshot:
     issues: tuple[WslStorageIssue, ...]
     is_partial: bool
     collected_at: datetime
+
+
+class HiddenProcessKwargs(TypedDict, total=False):
+    creationflags: int
 
 
 def parse_wsl_df_output(output_text: str) -> WslGuestStorageMetrics:
@@ -145,6 +149,15 @@ def _parse_usage_ratio(raw_value: str, used_bytes: int, total_bytes: int) -> flo
     return used_bytes / total_bytes
 
 
+def build_hidden_process_kwargs() -> HiddenProcessKwargs:
+    if os.name != "nt":
+        return {}
+    creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if creationflags == 0:
+        return {}
+    return {"creationflags": creationflags}
+
+
 def _collect_guest_metrics() -> tuple[WslGuestStorageMetrics | None, WslStorageIssue | None, StorageState]:
     try:
         completed = subprocess.run(
@@ -160,6 +173,7 @@ def _collect_guest_metrics() -> tuple[WslGuestStorageMetrics | None, WslStorageI
             errors="replace",
             timeout=10,
             check=False,
+            **build_hidden_process_kwargs(),
         )
     except FileNotFoundError:
         return None, WslStorageIssue("wsl_missing", "WSL executable was not found."), "unavailable"

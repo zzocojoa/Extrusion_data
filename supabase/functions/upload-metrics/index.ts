@@ -52,6 +52,49 @@ const ALLOWED_KEYS = new Set<keyof Metric>([
   "billet_cycle_id",
 ]);
 
+const UPSERT_BATCH_MAX_RECORDS = 1000;
+const UPSERT_BATCH_MAX_BYTES = 512 * 1024;
+const JSON_ENCODER = new TextEncoder();
+
+function getRecordSizeBytes(record: Metric): number {
+  return JSON_ENCODER.encode(JSON.stringify(record)).length + 1;
+}
+
+// 업서트 요청을 레코드 수와 대략적인 JSON 크기 기준으로 다시 나눈다.
+function splitIntoUpsertBatches(
+  records: ReadonlyArray<Metric>,
+  maxRecords: number,
+  maxBytes: number,
+): Metric[][] {
+  const batches: Metric[][] = [];
+  let currentBatch: Metric[] = [];
+  let currentBytes = 0;
+
+  for (const record of records) {
+    const recordBytes = getRecordSizeBytes(record);
+    const exceedsBatchLimit = currentBatch.length > 0 &&
+      (
+        currentBatch.length + 1 > maxRecords ||
+        currentBytes + recordBytes > maxBytes
+      );
+
+    if (exceedsBatchLimit) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBytes = 0;
+    }
+
+    currentBatch.push(record);
+    currentBytes += recordBytes;
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+
+  return batches;
+}
+
 // 숫자 필드 안전 캐스팅
 function toNumberOrNull(value: unknown): number | null {
   if (value === null || value === undefined) return null;
@@ -266,20 +309,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
   }
 
-  // 6) upsert (배치 처리)
-  const BATCH_SIZE = 500;
+  // 6) upsert (재분할 후 배치 처리)
+  const upsertBatches = splitIntoUpsertBatches(
+    cleaned,
+    UPSERT_BATCH_MAX_RECORDS,
+    UPSERT_BATCH_MAX_BYTES,
+  );
   let totalInserted = 0;
 
-  for (let i = 0; i < cleaned.length; i += BATCH_SIZE) {
-    const batch = cleaned.slice(i, i + BATCH_SIZE);
-
-    const { error, count } = await supabase
+  for (const batch of upsertBatches) {
+    const { data, error } = await supabase
       .from("all_metrics")
       .upsert(batch, {
         onConflict: "timestamp", // Changed from timestamp,device_id
         ignoreDuplicates: true,
-        count: "exact",
-      });
+      })
+      .select("timestamp");
 
     if (error) {
       console.error("Supabase upsert error:", error);
@@ -292,9 +337,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    if (typeof count === "number") {
-      totalInserted += count;
-    }
+    totalInserted += Array.isArray(data) ? data.length : 0;
   }
 
   // 7) 성공 응답

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import threading
-from typing import Callable, Literal
+from typing import Callable, Iterable, Literal
 
 import pandas as pd
 from psycopg2.extras import execute_values
@@ -15,7 +15,11 @@ PRESSURE_THRESHOLD = 30.0
 MIN_DURATION = 30.0
 MIN_MAX_PRESSURE = 100.0
 KST = timezone(timedelta(hours=9))
+METRICS_CHUNK_SIZE = 50000
+METRIC_COLUMNS = ["timestamp", "main_pressure", "production_counter"]
 LegacyIncrementalResult = Literal["completed", "requires_full_backfill"]
+WorkLogLookup = tuple[list[int], list[pd.Timestamp], list[pd.Timestamp]]
+OpenCycleState = tuple[pd.Timestamp, float, int | None]
 
 
 class CycleProcessor:
@@ -75,48 +79,91 @@ class CycleProcessor:
         work_log_frame["end_time"] = work_log_frame["end_time"].fillna(pd.Timestamp.now(tz="UTC"))
         return work_log_frame
 
-    def process_chunk(
-        self,
-        metrics_frame: pd.DataFrame,
-        work_log_frame: pd.DataFrame,
-    ) -> list[tuple[object, ...]]:
-        chunk_frame = metrics_frame.copy()
+    def _build_work_log_lookup(self, work_log_frame: pd.DataFrame) -> WorkLogLookup:
+        if work_log_frame.empty:
+            return ([], [], [])
+
+        return (
+            work_log_frame["work_log_id"].astype(int).tolist(),
+            work_log_frame["start_time"].tolist(),
+            work_log_frame["end_time"].tolist(),
+        )
+
+    def _prepare_metrics_frame(self, metrics_frame: pd.DataFrame) -> pd.DataFrame:
+        chunk_frame = metrics_frame.loc[:, METRIC_COLUMNS].copy()
+        chunk_frame["timestamp"] = pd.to_datetime(chunk_frame["timestamp"], utc=True)
+        if not chunk_frame["timestamp"].is_monotonic_increasing:
+            chunk_frame = chunk_frame.sort_values("timestamp", kind="stable")
+        chunk_frame = chunk_frame.reset_index(drop=True)
         chunk_frame["is_active"] = chunk_frame["main_pressure"] > PRESSURE_THRESHOLD
         chunk_frame["active_change"] = chunk_frame["is_active"].astype(int).diff()
+        return chunk_frame
 
-        start_indexes = chunk_frame[chunk_frame["active_change"] == 1].index
-        end_indexes = chunk_frame[chunk_frame["active_change"] == -1].index
+    def _prepare_incremental_metrics_chunk(self, metrics_chunk: pd.DataFrame) -> pd.DataFrame:
+        chunk_frame = metrics_chunk.loc[:, METRIC_COLUMNS].copy()
+        chunk_frame["timestamp"] = pd.to_datetime(chunk_frame["timestamp"], utc=True)
+        if not chunk_frame["timestamp"].is_monotonic_increasing:
+            chunk_frame = chunk_frame.sort_values("timestamp", kind="stable")
+        chunk_frame = chunk_frame.reset_index(drop=True)
+        chunk_frame["is_active"] = chunk_frame["main_pressure"] > PRESSURE_THRESHOLD
+        return chunk_frame
+
+    def _match_work_log_id(
+        self,
+        start_time: pd.Timestamp,
+        work_log_lookup: WorkLogLookup,
+        work_log_pointer: int,
+    ) -> tuple[int | None, int]:
+        work_log_ids, work_log_starts, work_log_ends = work_log_lookup
+        while work_log_pointer < len(work_log_ids) and work_log_ends[work_log_pointer] < start_time:
+            work_log_pointer += 1
+
+        if (
+            work_log_pointer < len(work_log_ids)
+            and work_log_starts[work_log_pointer] <= start_time
+            and work_log_ends[work_log_pointer] >= start_time
+        ):
+            return work_log_ids[work_log_pointer], work_log_pointer
+        return None, work_log_pointer
+
+    def _process_prepared_chunk(
+        self,
+        chunk_frame: pd.DataFrame,
+        work_log_lookup: WorkLogLookup,
+        work_log_pointer: int,
+    ) -> tuple[list[tuple[object, ...]], int]:
+        if chunk_frame.empty:
+            return [], work_log_pointer
+
+        start_positions = chunk_frame.index[chunk_frame["active_change"] == 1].tolist()
+        end_positions = chunk_frame.index[chunk_frame["active_change"] == -1].tolist()
 
         cycles: list[tuple[object, ...]] = []
         start_pointer = 0
         end_pointer = 0
-        while start_pointer < len(start_indexes) and end_pointer < len(end_indexes):
+        while start_pointer < len(start_positions) and end_pointer < len(end_positions):
             if self._stop_event.is_set():
                 break
 
-            start_index = start_indexes[start_pointer]
-            while end_pointer < len(end_indexes) and end_indexes[end_pointer] < start_index:
+            start_position = start_positions[start_pointer]
+            while end_pointer < len(end_positions) and end_positions[end_pointer] < start_position:
                 end_pointer += 1
-            if end_pointer >= len(end_indexes):
+            if end_pointer >= len(end_positions):
                 break
 
-            end_index = end_indexes[end_pointer]
-            start_time = chunk_frame.loc[start_index, "timestamp"]
-            end_time = chunk_frame.loc[end_index, "timestamp"]
+            end_position = end_positions[end_pointer]
+            start_time = chunk_frame.at[start_position, "timestamp"]
+            end_time = chunk_frame.at[end_position, "timestamp"]
             duration = (end_time - start_time).total_seconds()
-            cycle_slice = chunk_frame.loc[start_index:end_index]
+            cycle_slice = chunk_frame.iloc[start_position : end_position + 1]
             max_pressure = cycle_slice["main_pressure"].max()
-            production_counter = chunk_frame.loc[end_index, "production_counter"]
+            production_counter = chunk_frame.at[end_position, "production_counter"]
             is_valid = bool(duration >= MIN_DURATION and max_pressure >= MIN_MAX_PRESSURE)
-
-            work_log_id: int | None = None
-            if not work_log_frame.empty:
-                matched_frame = work_log_frame[
-                    (work_log_frame["start_time"] <= start_time)
-                    & (work_log_frame["end_time"] >= start_time)
-                ]
-                if not matched_frame.empty:
-                    work_log_id = int(matched_frame.iloc[0]["work_log_id"])
+            work_log_id, work_log_pointer = self._match_work_log_id(
+                start_time=start_time,
+                work_log_lookup=work_log_lookup,
+                work_log_pointer=work_log_pointer,
+            )
 
             cycles.append(
                 (
@@ -136,6 +183,148 @@ class CycleProcessor:
             start_pointer += 1
             end_pointer += 1
 
+        return cycles, work_log_pointer
+
+    def _process_incremental_chunk(
+        self,
+        metrics_chunk: pd.DataFrame,
+        work_log_lookup: WorkLogLookup,
+        work_log_pointer: int,
+        previous_is_active: bool | None,
+        open_cycle_state: OpenCycleState | None,
+    ) -> tuple[list[tuple[object, ...]], int, bool | None, OpenCycleState | None]:
+        if metrics_chunk.empty:
+            return [], work_log_pointer, previous_is_active, open_cycle_state
+
+        prepared_chunk = self._prepare_incremental_metrics_chunk(metrics_chunk)
+        cycles: list[tuple[object, ...]] = []
+
+        for row in prepared_chunk.itertuples(index=False):
+            if self._stop_event.is_set():
+                break
+
+            timestamp = row.timestamp
+            max_pressure = float(row.main_pressure)
+            production_counter = int(row.production_counter) if pd.notnull(row.production_counter) else None
+            is_active = bool(row.is_active)
+
+            if is_active and previous_is_active is not True:
+                work_log_id, work_log_pointer = self._match_work_log_id(
+                    start_time=timestamp,
+                    work_log_lookup=work_log_lookup,
+                    work_log_pointer=work_log_pointer,
+                )
+                open_cycle_state = (timestamp, max_pressure, work_log_id)
+            elif is_active and open_cycle_state is not None:
+                open_cycle_state = (
+                    open_cycle_state[0],
+                    max(open_cycle_state[1], max_pressure),
+                    open_cycle_state[2],
+                )
+            elif not is_active and previous_is_active is True and open_cycle_state is not None:
+                start_time, cycle_max_pressure, work_log_id = open_cycle_state
+                duration = (timestamp - start_time).total_seconds()
+                is_valid = bool(duration >= MIN_DURATION and cycle_max_pressure >= MIN_MAX_PRESSURE)
+                cycles.append(
+                    (
+                        self.machine_id,
+                        start_time,
+                        timestamp,
+                        production_counter,
+                        work_log_id,
+                        float(duration),
+                        float(cycle_max_pressure),
+                        is_valid,
+                        False,
+                        self.source_mode,
+                        self.algorithm_version,
+                    )
+                )
+                open_cycle_state = None
+
+            previous_is_active = is_active
+
+        return cycles, work_log_pointer, previous_is_active, open_cycle_state
+
+    def _collect_incremental_cycles(
+        self,
+        metrics_chunk_iter: Iterable[pd.DataFrame],
+        work_log_frame: pd.DataFrame,
+    ) -> tuple[list[tuple[object, ...]], int]:
+        work_log_lookup = self._build_work_log_lookup(work_log_frame)
+        work_log_pointer = 0
+        total_metric_rows = 0
+        collected_cycles: list[tuple[object, ...]] = []
+        previous_is_active: bool | None = None
+        open_cycle_state: OpenCycleState | None = None
+
+        for metrics_chunk in metrics_chunk_iter:
+            if self._stop_event.is_set():
+                break
+            if metrics_chunk.empty:
+                continue
+
+            total_metric_rows += len(metrics_chunk)
+            chunk_cycles, work_log_pointer, previous_is_active, open_cycle_state = self._process_incremental_chunk(
+                metrics_chunk=metrics_chunk,
+                work_log_lookup=work_log_lookup,
+                work_log_pointer=work_log_pointer,
+                previous_is_active=previous_is_active,
+                open_cycle_state=open_cycle_state,
+            )
+            collected_cycles.extend(chunk_cycles)
+
+        return collected_cycles, total_metric_rows
+
+    def _upsert_incremental_cycles_by_chunk(
+        self,
+        cursor: object,
+        metrics_chunk_iter: Iterable[pd.DataFrame],
+        work_log_frame: pd.DataFrame,
+        last_processed: datetime,
+    ) -> tuple[int, int]:
+        work_log_lookup = self._build_work_log_lookup(work_log_frame)
+        work_log_pointer = 0
+        total_metric_rows = 0
+        total_upserted_cycles = 0
+        previous_is_active: bool | None = None
+        open_cycle_state: OpenCycleState | None = None
+
+        for metrics_chunk in metrics_chunk_iter:
+            if self._stop_event.is_set():
+                break
+            if metrics_chunk.empty:
+                continue
+
+            total_metric_rows += len(metrics_chunk)
+            chunk_cycles, work_log_pointer, previous_is_active, open_cycle_state = self._process_incremental_chunk(
+                metrics_chunk=metrics_chunk,
+                work_log_lookup=work_log_lookup,
+                work_log_pointer=work_log_pointer,
+                previous_is_active=previous_is_active,
+                open_cycle_state=open_cycle_state,
+            )
+            new_chunk_cycles = [cycle for cycle in chunk_cycles if cycle[2] > last_processed]
+            if new_chunk_cycles == []:
+                continue
+
+            self._upsert_cycles(cursor, new_chunk_cycles)
+            total_upserted_cycles += len(new_chunk_cycles)
+
+        return total_metric_rows, total_upserted_cycles
+
+    def process_chunk(
+        self,
+        metrics_frame: pd.DataFrame,
+        work_log_frame: pd.DataFrame,
+    ) -> list[tuple[object, ...]]:
+        chunk_frame = self._prepare_metrics_frame(metrics_frame=metrics_frame)
+        work_log_lookup = self._build_work_log_lookup(work_log_frame)
+        cycles, _ = self._process_prepared_chunk(
+            chunk_frame=chunk_frame,
+            work_log_lookup=work_log_lookup,
+            work_log_pointer=0,
+        )
         return cycles
 
     def _upsert_cycles(self, cursor, cycles: list[tuple[object, ...]]) -> None:
@@ -218,7 +407,7 @@ class CycleProcessor:
                 self.update_progress(0.4)
 
                 self.log("신규 metrics 로딩 중")
-                metrics_frame = pd.read_sql(
+                metrics_chunk_iter = pd.read_sql(
                     """
                     SELECT "timestamp", main_pressure, production_counter
                     FROM public.all_metrics
@@ -227,31 +416,34 @@ class CycleProcessor:
                     """,
                     connection,
                     params=(start_time,),
+                    chunksize=METRICS_CHUNK_SIZE,
                 )
-                if metrics_frame.empty:
+                total_metric_rows, total_upserted_cycles = self._upsert_incremental_cycles_by_chunk(
+                    cursor=cursor,
+                    metrics_chunk_iter=metrics_chunk_iter,
+                    work_log_frame=work_log_frame,
+                    last_processed=last_processed,
+                )
+                if total_metric_rows == 0:
                     self.log("신규 metrics가 없습니다.")
                     self.update_progress(1.0)
                     return "completed"
 
-                metrics_frame["timestamp"] = pd.to_datetime(metrics_frame["timestamp"], utc=True)
-                self.log(f"metrics row 수: {len(metrics_frame)}")
+                self.log(f"metrics row 수: {total_metric_rows}")
                 self.update_progress(0.6)
-
-                cycles = self.process_chunk(metrics_frame, work_log_frame)
                 if self._stop_event.is_set():
                     self.log("legacy backfill이 중단되었습니다.")
                     return "completed"
 
-                new_cycles = [cycle for cycle in cycles if cycle[2] > last_processed]
                 self.update_progress(0.8)
-                if not new_cycles:
+                if total_upserted_cycles == 0:
                     self.log("추가로 저장할 cycle이 없습니다.")
                     self.update_progress(1.0)
                     return "completed"
 
-                self.log(f"legacy cycle upsert 시작: {len(new_cycles)}건")
-                self._upsert_cycles(cursor, new_cycles)
+                self.log(f"legacy cycle upsert 시작: {total_upserted_cycles}건")
                 connection.commit()
+                self.log(f"legacy cycle upsert completed: {total_upserted_cycles}")
                 self.update_progress(1.0)
                 self.log("legacy incremental backfill 완료")
         except Exception as error:

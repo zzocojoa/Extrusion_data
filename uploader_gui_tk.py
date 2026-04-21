@@ -79,6 +79,7 @@ from PIL import Image
 
 KST = timezone(timedelta(hours=9))
 PROJECT_ROOT = Path(__file__).resolve().parent
+PREVIEW_VALIDATION_SAMPLE_ROWS = 32
 
 # Data directory (AppData) for persistent state
 # Data directory (AppData) for persistent state
@@ -329,7 +330,7 @@ def process_file(kind: str, path: str, filename: str) -> pd.DataFrame:
 
 def preview_diagnostics(
     plc_dir: str,
-    temp_dir: str,
+    temp_dir: str | None,
     window_start: "date | None",
     window_end: "date",
     lag_min: int,
@@ -343,10 +344,12 @@ def preview_diagnostics(
     excluded = []  # (folder, filename, reason)
     processed = load_processed()
 
-    # Helper to validate content
     def has_data(kind: str, path: str, filename: str) -> bool:
-        df = process_file(kind, path, filename)
-        return not df.empty
+        del filename
+        try:
+            return core_files.preview_has_data(kind, path, PREVIEW_VALIDATION_SAMPLE_ROWS)
+        except (OSError, UnicodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            return False
 
     # PLC
     if os.path.isdir(plc_dir):
@@ -513,6 +516,10 @@ class WslStorageSnapshot:
     state: str
     status_text: str
     status_color: str
+    used_label_text: str
+    available_label_text: str
+    total_label_text: str
+    usage_label_text: str
     used_text: str
     available_text: str
     total_text: str
@@ -527,6 +534,62 @@ class WslStorageSnapshot:
     is_refreshing: bool
     is_partial: bool
     is_available: bool
+
+
+@dataclass(frozen=True)
+class ResponsiveLayoutState:
+    window_width: int
+    is_compact: bool
+    sidebar_width: int
+    main_pad_x: int
+    main_pad_y: int
+    logo_wraplength: int
+
+
+@dataclass(frozen=True)
+class LabelWrapBinding:
+    widget: tk.Misc
+    container: tk.Misc
+    horizontal_padding: int
+    min_wraplength: int
+
+
+@dataclass(frozen=True)
+class ResponsiveLayoutModeSignature:
+    is_compact: bool
+    sidebar_width: int
+    main_pad_x: int
+    main_pad_y: int
+    logo_wraplength: int
+
+
+@dataclass(frozen=True)
+class LabelWrapSignature:
+    container_width: int
+    wraplength: int
+
+
+@dataclass(frozen=True)
+class WidgetLayoutSignature:
+    layout_name: str
+    mode: str
+    child_count: int
+    detail: str
+
+
+@dataclass(frozen=True)
+class DashboardLayoutSignature:
+    is_split_body: bool
+    metric_column_count: int
+    info_column_count: int
+    is_split_footer: bool
+    button_stack: bool
+
+
+@dataclass(frozen=True)
+class WorkLogViewState:
+    selected_path: str
+    messages: tuple[str, ...]
 
 
 WSL_STORAGE_WARNING_THRESHOLD = 0.80
@@ -599,6 +662,24 @@ def _format_storage_timestamp(raw_value: object) -> str:
     if not isinstance(raw_value, datetime):
         return "—"
     return raw_value.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_compact_path(raw_value: object, max_length: int) -> str:
+    if not isinstance(raw_value, str):
+        return ""
+    normalized_path = raw_value.strip()
+    if normalized_path == "":
+        return ""
+    if len(normalized_path) <= max_length:
+        return normalized_path
+    tail_length = max(max_length - 3, 8)
+    return "..." + normalized_path[-tail_length:]
+
+
+def _format_storage_ratio(raw_value: float | None) -> str:
+    if raw_value is None:
+        return "—"
+    return f"{raw_value * 100:.0f}%"
 
 
 def _resolve_wsl_storage_status_color(state: str) -> str:
@@ -1321,10 +1402,11 @@ class App(ctk.CTk):
             self.cfg.get("UI_LANGUAGE", DEFAULT_UI_LANGUAGE)
         )
         self.translation_bundle = load_translation_bundle(PROJECT_ROOT, self.ui_language)
+        self.is_shutting_down = False
         self.title(self.tr("app.title"))
         
         # Shared state
-        self.active_progress = {}
+        self.active_progress: dict[str, tuple[int, int]] = {}
         self.progress_lock = threading.Lock()
         self.total_files = 0
         self.processed_count = 0
@@ -1367,10 +1449,27 @@ class App(ctk.CTk):
         self.settings_calendar_year = 0
         self.settings_calendar_month = 0
         self.current_view = ""
+        self.dashboard_layout_after_id: str | None = None
+        self.dashboard_update_after_id: str | None = None
+        self.is_dashboard_update_loop_running = False
+        self.dashboard_view_generation = 0
+        self.selected_work_log_path = ""
+        self.work_log_messages: list[str] = []
+        self.responsive_layout_state = self.build_responsive_layout_state(1240)
+        self.responsive_layout_mode_signature = self.build_responsive_layout_mode_signature(
+            self.responsive_layout_state
+        )
+        self.resize_debounce_after_id: str | None = None
+        self.resize_debounce_ms = 120
+        self.last_window_width = 0
+        self.label_wrap_bindings: dict[str, LabelWrapBinding] = {}
+        self.label_wrap_after_id: str | None = None
         self.wsl_storage_raw_snapshot: object | None = None
         self.wsl_storage_error_detail = ""
         self.is_wsl_storage_refreshing = False
         self.wsl_storage_snapshot = self.build_wsl_storage_ui_snapshot()
+        self.rendered_wsl_storage_snapshot: WslStorageSnapshot | None = None
+        self.dashboard_layout_signature: DashboardLayoutSignature | None = None
         archive_environment = load_archive_environment(PROJECT_ROOT)
         self.var_archive_before_date = tk.StringVar(value=kst_now().date().isoformat())
         self.var_archive_dir = tk.StringVar(value=archive_environment.get("ARCHIVE_DIR", ""))
@@ -1411,21 +1510,257 @@ class App(ctk.CTk):
             print(f"[i18n] {key}: {error}")
             raise
 
-    def bind_label_wrap(self, widget, horizontal_padding: int, min_wraplength: int) -> None:
-        def _apply_wrap(_event=None):
-            try:
-                parent_width = widget.master.winfo_width()
-                if parent_width <= 1:
-                    return
-                widget.configure(
-                    wraplength=max(min_wraplength, parent_width - horizontal_padding),
-                )
-            except Exception:
-                return
+    def build_responsive_layout_state(self, window_width: int) -> ResponsiveLayoutState:
+        is_compact = window_width < 1320
+        if is_compact:
+            return ResponsiveLayoutState(
+                window_width=window_width,
+                is_compact=True,
+                sidebar_width=210,
+                main_pad_x=16,
+                main_pad_y=16,
+                logo_wraplength=150,
+            )
+        return ResponsiveLayoutState(
+            window_width=window_width,
+            is_compact=False,
+            sidebar_width=230,
+            main_pad_x=20,
+            main_pad_y=20,
+            logo_wraplength=170,
+        )
 
-        widget.after(0, _apply_wrap)
-        widget.bind("<Configure>", _apply_wrap, add="+")
-        widget.master.bind("<Configure>", _apply_wrap, add="+")
+    def build_responsive_layout_mode_signature(
+        self,
+        layout_state: ResponsiveLayoutState,
+    ) -> ResponsiveLayoutModeSignature:
+        return ResponsiveLayoutModeSignature(
+            is_compact=layout_state.is_compact,
+            sidebar_width=layout_state.sidebar_width,
+            main_pad_x=layout_state.main_pad_x,
+            main_pad_y=layout_state.main_pad_y,
+            logo_wraplength=layout_state.logo_wraplength,
+        )
+
+    def bind_responsive_resize(self) -> None:
+        self.bind("<Configure>", self.on_responsive_configure, add="+")
+        self.main_shell.bind("<Configure>", self.on_responsive_configure, add="+")
+        self.after(0, self.refresh_responsive_layout)
+
+    def on_responsive_configure(self, _event: object) -> None:
+        current_width = self.winfo_width()
+        if current_width <= 1:
+            return
+        if current_width == self.last_window_width:
+            return
+        self.last_window_width = current_width
+        self.schedule_responsive_layout_refresh()
+
+    def schedule_responsive_layout_refresh(self) -> None:
+        if self.is_shutting_down:
+            return
+        if self.resize_debounce_after_id is not None:
+            return
+        try:
+            self.resize_debounce_after_id = self.after(
+                self.resize_debounce_ms,
+                self.refresh_responsive_layout,
+            )
+        except (RuntimeError, tk.TclError):
+            self.resize_debounce_after_id = None
+
+    def refresh_responsive_layout(self) -> None:
+        self.resize_debounce_after_id = None
+        current_width = self.winfo_width()
+        if current_width <= 1:
+            current_width = self.winfo_reqwidth()
+        if current_width <= 1:
+            return
+
+        layout_state = self.build_responsive_layout_state(current_width)
+        layout_mode_signature = self.build_responsive_layout_mode_signature(layout_state)
+        self.responsive_layout_state = layout_state
+        self.last_window_width = current_width
+
+        if self.responsive_layout_mode_signature != layout_mode_signature:
+            self.responsive_layout_mode_signature = layout_mode_signature
+            if hasattr(self, "sidebar") and self.sidebar.winfo_exists():
+                self.sidebar.configure(width=layout_state.sidebar_width)
+            if hasattr(self, "logo_label") and self.logo_label.winfo_exists():
+                self.logo_label.configure(wraplength=layout_state.logo_wraplength)
+            if hasattr(self, "main_shell") and self.main_shell.winfo_exists():
+                self.main_shell.grid_configure(
+                    padx=layout_state.main_pad_x,
+                    pady=layout_state.main_pad_y,
+                )
+
+        self.refresh_label_wraps()
+        if self.current_view == "dashboard" and hasattr(self, "dashboard_body_frame"):
+            self.schedule_dashboard_layout_refresh(None)
+        if self.current_view == "cycle_ops":
+            self.layout_cycle_legacy_range_row()
+        if self.current_view == "data_mgmt":
+            self.layout_training_mode_row()
+            self.layout_archive_date_row()
+
+    def is_widget_alive(self, widget: tk.Misc) -> bool:
+        try:
+            return bool(widget.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def forget_widget_geometry(self, widget: tk.Misc) -> None:
+        if not self.is_widget_alive(widget):
+            return
+        manager = widget.winfo_manager()
+        if manager == "":
+            return
+        if manager == "grid":
+            widget.grid_forget()
+            return
+        if manager == "pack":
+            widget.pack_forget()
+            return
+        if manager == "place":
+            widget.place_forget()
+            return
+        raise RuntimeError(f"Unsupported geometry manager: {manager}")
+
+    def resolve_wrap_container_width(self, binding: LabelWrapBinding) -> int:
+        if self.is_widget_alive(binding.container):
+            container_width = binding.container.winfo_width()
+            if container_width > 1:
+                return container_width
+            requested_width = binding.container.winfo_reqwidth()
+            if requested_width > 1:
+                return requested_width
+        if hasattr(self, "main_shell") and self.is_widget_alive(self.main_shell):
+            main_shell_width = self.main_shell.winfo_width()
+            if main_shell_width > 1:
+                return main_shell_width
+        return 0
+
+    def read_wraplength(self, widget: tk.Misc) -> int:
+        raw_wraplength = widget.cget("wraplength")
+        if isinstance(raw_wraplength, int):
+            return raw_wraplength
+        if isinstance(raw_wraplength, float):
+            return int(raw_wraplength)
+        if isinstance(raw_wraplength, str):
+            stripped_wraplength = raw_wraplength.strip()
+            if stripped_wraplength == "":
+                return 0
+            return int(float(stripped_wraplength))
+        raise TypeError(f"Unsupported wraplength value: {raw_wraplength!r}")
+
+    def read_label_wrap_signature(self, widget: tk.Misc) -> LabelWrapSignature | None:
+        cached_signature = getattr(widget, "_responsive_wrap_signature", None)
+        if isinstance(cached_signature, LabelWrapSignature):
+            return cached_signature
+        return None
+
+    def write_label_wrap_signature(
+        self,
+        widget: tk.Misc,
+        signature: LabelWrapSignature,
+    ) -> None:
+        setattr(widget, "_responsive_wrap_signature", signature)
+
+    def clear_label_wrap_signature(self, widget: tk.Misc) -> None:
+        if hasattr(widget, "_responsive_wrap_signature"):
+            delattr(widget, "_responsive_wrap_signature")
+
+    def read_widget_layout_signature(
+        self,
+        widget: tk.Misc,
+    ) -> WidgetLayoutSignature | None:
+        cached_signature = getattr(widget, "_responsive_layout_signature", None)
+        if isinstance(cached_signature, WidgetLayoutSignature):
+            return cached_signature
+        return None
+
+    def write_widget_layout_signature(
+        self,
+        widget: tk.Misc,
+        signature: WidgetLayoutSignature,
+    ) -> None:
+        setattr(widget, "_responsive_layout_signature", signature)
+
+    def refresh_label_wraps(self) -> None:
+        self.label_wrap_after_id = None
+        stale_keys: list[str] = []
+        for binding_key, binding in self.label_wrap_bindings.items():
+            if not self.is_widget_alive(binding.widget):
+                stale_keys.append(binding_key)
+                continue
+            if not self.is_widget_alive(binding.container):
+                stale_keys.append(binding_key)
+                continue
+
+            container_width = self.resolve_wrap_container_width(binding)
+            if container_width <= 1:
+                continue
+
+            wraplength = max(
+                binding.min_wraplength,
+                container_width - binding.horizontal_padding,
+            )
+            wrap_signature = LabelWrapSignature(
+                container_width=container_width,
+                wraplength=wraplength,
+            )
+            if self.read_label_wrap_signature(binding.widget) == wrap_signature:
+                continue
+            current_wraplength = self.read_wraplength(binding.widget)
+            if current_wraplength != wraplength:
+                binding.widget.configure(wraplength=wraplength)
+            self.write_label_wrap_signature(binding.widget, wrap_signature)
+
+        for binding_key in stale_keys:
+            self.label_wrap_bindings.pop(binding_key, None)
+
+    def schedule_label_wrap_refresh(self) -> None:
+        if self.is_shutting_down:
+            return
+        if self.label_wrap_after_id is not None:
+            return
+        try:
+            self.label_wrap_after_id = self.after(0, self.refresh_label_wraps)
+        except (RuntimeError, tk.TclError):
+            self.label_wrap_after_id = None
+
+    def on_label_wrap_configure(self, _event: object) -> None:
+        self.schedule_label_wrap_refresh()
+
+    def on_label_wrap_destroy(self, event: object) -> None:
+        widget = getattr(event, "widget", None)
+        if isinstance(widget, tk.Misc):
+            self.label_wrap_bindings.pop(str(widget), None)
+            self.clear_label_wrap_signature(widget)
+
+    def bind_label_wrap(self, widget: tk.Misc, horizontal_padding: int, min_wraplength: int) -> None:
+        container = widget.master
+        if container is None:
+            raise RuntimeError("Label wrap binding requires a parent container.")
+
+        binding = LabelWrapBinding(
+            widget=widget,
+            container=container,
+            horizontal_padding=horizontal_padding,
+            min_wraplength=min_wraplength,
+        )
+        previous_binding = self.label_wrap_bindings.get(str(widget))
+        self.label_wrap_bindings[str(widget)] = binding
+        if not bool(getattr(widget, "_responsive_wrap_bound", False)):
+            widget.bind("<Destroy>", self.on_label_wrap_destroy, add="+")
+            setattr(widget, "_responsive_wrap_bound", True)
+        if not bool(getattr(container, "_responsive_wrap_bound", False)):
+            container.bind("<Configure>", self.on_label_wrap_configure, add="+")
+            setattr(container, "_responsive_wrap_bound", True)
+        if previous_binding == binding:
+            return
+        self.clear_label_wrap_signature(widget)
+        self.schedule_label_wrap_refresh()
 
     def reload_translations(self) -> None:
         self.ui_language = normalize_language_code(
@@ -1433,6 +1768,20 @@ class App(ctk.CTk):
         )
         self.translation_bundle = load_translation_bundle(PROJECT_ROOT, self.ui_language)
         self.title(self.tr("app.title"))
+
+    def schedule_gui_callback(
+        self,
+        delay_ms: int,
+        callback: Callable[..., object],
+        *args: object,
+    ) -> bool:
+        if self.is_shutting_down:
+            return False
+        try:
+            self.after(delay_ms, callback, *args)
+            return True
+        except (RuntimeError, tk.TclError):
+            return False
 
     def show_info(self, title_key: str, message_key: str, **params: object) -> None:
         messagebox.showinfo(self.tr(title_key), self.tr(message_key, **params))
@@ -1609,8 +1958,28 @@ class App(ctk.CTk):
         self.close_application()
 
     def close_application(self):
-        self.destroy()
-        os._exit(0)
+        self.is_shutting_down = True
+        if self.resize_debounce_after_id is not None:
+            try:
+                self.after_cancel(self.resize_debounce_after_id)
+            except tk.TclError:
+                pass
+            self.resize_debounce_after_id = None
+        if self.label_wrap_after_id is not None:
+            try:
+                self.after_cancel(self.label_wrap_after_id)
+            except tk.TclError:
+                pass
+            self.label_wrap_after_id = None
+        self.cancel_dashboard_callbacks()
+        try:
+            self.quit()
+        except tk.TclError:
+            pass
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
 
     def close_splash(self):
         try:
@@ -1683,15 +2052,77 @@ class App(ctk.CTk):
             self.on_start()
 
     def create_main_area(self):
-        # Container for pages
-        self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
-        self.main_frame.grid_rowconfigure(0, weight=1)
-        self.main_frame.grid_columnconfigure(0, weight=1)
+        # 페이지 셸과 실제 페이지 루트를 분리해 공통 레이아웃 기준을 유지한다.
+        self.main_shell = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.main_shell.grid(row=0, column=1, sticky="nsew")
+        self.main_shell.grid_rowconfigure(0, weight=1)
+        self.main_shell.grid_columnconfigure(0, weight=1)
+        self.main_frame = self.create_page_root(self.main_shell)
+        self.bind_responsive_resize()
+
+    def create_page_root(self, parent: tk.Misc) -> ctk.CTkFrame:
+        page_root = ctk.CTkFrame(parent, corner_radius=0, fg_color="transparent")
+        page_root.grid(row=0, column=0, sticky="nsew")
+        page_root.grid_rowconfigure(0, weight=1)
+        page_root.grid_columnconfigure(0, weight=1)
+        return page_root
+
+    def cancel_dashboard_callbacks(self) -> None:
+        if self.dashboard_layout_after_id is not None:
+            try:
+                self.after_cancel(self.dashboard_layout_after_id)
+            except tk.TclError:
+                pass
+            self.dashboard_layout_after_id = None
+        if self.dashboard_update_after_id is not None:
+            try:
+                self.after_cancel(self.dashboard_update_after_id)
+            except tk.TclError:
+                pass
+            self.dashboard_update_after_id = None
+        self.is_dashboard_update_loop_running = False
+        self.dashboard_view_generation += 1
+        self.dashboard_layout_signature = None
+        self.rendered_wsl_storage_snapshot = None
+
+    def build_work_log_view_state(self) -> WorkLogViewState:
+        return WorkLogViewState(
+            selected_path=self.selected_work_log_path,
+            messages=tuple(self.work_log_messages),
+        )
+
+    def restore_work_log_view_state(self, view_state: WorkLogViewState) -> None:
+        if view_state.selected_path.strip() == "":
+            self.lbl_work_log_file.configure(
+                text=self.tr("work_log.label.no_file"),
+                text_color="gray",
+            )
+            self.btn_upload_work_log.configure(state="disabled")
+        else:
+            self.lbl_work_log_file.configure(
+                text=os.path.basename(view_state.selected_path),
+                text_color="white",
+            )
+            self.btn_upload_work_log.configure(state="normal")
+
+        if view_state.messages == ():
+            return
+        self.work_log_box.insert("end", "\n".join(view_state.messages) + "\n")
+        self.work_log_box.see("end")
 
     def clear_main(self):
-        for widget in self.main_frame.winfo_children():
-            widget.destroy()
+        self.cancel_dashboard_callbacks()
+        if self.label_wrap_after_id is not None:
+            try:
+                self.after_cancel(self.label_wrap_after_id)
+            except tk.TclError:
+                pass
+            self.label_wrap_after_id = None
+        self.label_wrap_bindings.clear()
+        if hasattr(self, "main_frame") and self.main_frame.winfo_exists():
+            self.main_frame.destroy()
+        self.main_frame = self.create_page_root(self.main_shell)
+        self.schedule_responsive_layout_refresh()
 
     def confirm_leave_settings(self, target_name: str) -> bool:
         if self.current_view != "settings":
@@ -1721,36 +2152,53 @@ class App(ctk.CTk):
 
     # --- Views ---
     def show_dashboard(self):
+        if self.current_view == "dashboard":
+            if hasattr(self, "hero_frame") and self.hero_frame.winfo_exists():
+                self.refresh_local_supabase_button()
+                self.render_wsl_storage_card()
+                self.schedule_dashboard_update_loop(0)
+                self.schedule_dashboard_layout_refresh(None)
+                return
         if not self.confirm_leave_data_tasks(self.tr("sidebar.dashboard")):
             return
         if not self.confirm_leave_settings(self.tr("navigation.dashboard")):
             return
         self.current_view = "dashboard"
         self.clear_main()
-        
-        # Hero Section (Progress)
+
+        self.main_frame.grid_rowconfigure(0, weight=0)
+        self.main_frame.grid_rowconfigure(1, weight=1)
+        self.main_frame.grid_rowconfigure(2, weight=0)
+
         self.hero_frame = ctk.CTkFrame(self.main_frame)
-        self.hero_frame.grid(row=0, column=0, sticky="ew", pady=(0, 20))
-        
+        self.hero_frame.grid(row=0, column=0, sticky="ew", pady=(0, 16))
+        self.hero_frame.grid_columnconfigure(0, weight=1)
+
+        self.hero_status_frame = ctk.CTkFrame(self.hero_frame, fg_color="transparent")
+        self.hero_status_frame.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 14))
+        self.hero_status_frame.grid_columnconfigure(0, weight=1)
+
         self.lbl_big_status = ctk.CTkLabel(
-            self.hero_frame,
+            self.hero_status_frame,
             text=self.tr("common.status.waiting"),
             font=ctk.CTkFont(size=24, weight="bold"),
+            anchor="w",
         )
-        self.lbl_big_status.pack(pady=(20, 10))
-        
-        self.prog_bar = ctk.CTkProgressBar(self.hero_frame, width=400)
-        self.prog_bar.pack(pady=10)
+        self.lbl_big_status.grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+        self.prog_bar = ctk.CTkProgressBar(self.hero_status_frame)
+        self.prog_bar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         self.prog_bar.set(0)
-        
+
         self.lbl_prog_text = ctk.CTkLabel(
-            self.hero_frame,
+            self.hero_status_frame,
             text=self.format_progress_summary(0.0, 0, 0),
+            anchor="w",
         )
-        self.lbl_prog_text.pack(pady=(0, 20))
+        self.lbl_prog_text.grid(row=2, column=0, sticky="w", pady=(0, 18))
 
         self.lbl_runtime_context = ctk.CTkLabel(
-            self.hero_frame,
+            self.hero_status_frame,
             text=build_runtime_context_text(
                 self.config_metadata,
                 self.cfg.get('SUPABASE_URL', ''),
@@ -1761,64 +2209,66 @@ class App(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.lbl_runtime_context.pack(fill="x", pady=(0, 10), padx=10, anchor="w")
+        self.lbl_runtime_context.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         self.bind_label_wrap(self.lbl_runtime_context, horizontal_padding=20, min_wraplength=420)
         self.lbl_local_supabase_status = ctk.CTkLabel(
-            self.hero_frame,
+            self.hero_status_frame,
             textvariable=self.var_local_supabase_status,
             justify="left",
             anchor="w",
         )
-        self.lbl_local_supabase_status.pack(fill="x", pady=(0, 6), padx=10, anchor="w")
+        self.lbl_local_supabase_status.grid(row=4, column=0, sticky="ew", pady=(0, 6))
         self.bind_label_wrap(self.lbl_local_supabase_status, horizontal_padding=20, min_wraplength=420)
         self.local_supabase_progress = ctk.CTkProgressBar(
-            self.hero_frame,
+            self.hero_status_frame,
             width=320,
             mode="indeterminate",
         )
 
-        self.wsl_storage_frame = ctk.CTkFrame(self.hero_frame)
-        self.wsl_storage_frame.pack(fill="x", padx=10, pady=(6, 14))
+        self.dashboard_body_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.dashboard_body_frame.grid(row=1, column=0, sticky="nsew")
+
+        self.wsl_storage_frame = ctk.CTkFrame(self.dashboard_body_frame)
+        self.wsl_storage_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
         self.wsl_storage_frame.grid_columnconfigure(0, weight=1)
-        self.wsl_storage_frame.grid_columnconfigure(1, weight=0)
-        self.wsl_storage_frame.grid_columnconfigure(2, weight=0)
+        self.wsl_storage_frame.grid_rowconfigure(5, weight=0)
+
+        self.wsl_storage_header_frame = ctk.CTkFrame(self.wsl_storage_frame, fg_color="transparent")
+        self.wsl_storage_header_frame.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 6))
+        self.wsl_storage_header_frame.grid_columnconfigure(0, weight=1)
 
         self.lbl_wsl_storage_title = ctk.CTkLabel(
-            self.wsl_storage_frame,
+            self.wsl_storage_header_frame,
             text=self.tr("dashboard.wsl_storage.title"),
             font=ctk.CTkFont(size=16, weight="bold"),
             anchor="w",
         )
-        self.lbl_wsl_storage_title.grid(row=0, column=0, sticky="w", padx=(16, 8), pady=(14, 6))
+        self.lbl_wsl_storage_title.grid(row=0, column=0, sticky="w")
 
         self.lbl_wsl_storage_badge = ctk.CTkLabel(
-            self.wsl_storage_frame,
+            self.wsl_storage_header_frame,
             text="",
             corner_radius=999,
             padx=10,
             pady=4,
             anchor="center",
         )
-        self.lbl_wsl_storage_badge.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=(14, 6))
+        self.lbl_wsl_storage_badge.grid(row=0, column=1, sticky="e", padx=(8, 8))
 
         self.btn_refresh_wsl_storage = ctk.CTkButton(
-            self.wsl_storage_frame,
+            self.wsl_storage_header_frame,
             text=self.tr("dashboard.wsl_storage.button.refresh"),
             command=self.request_wsl_storage_refresh,
             width=110,
             fg_color="#3B8ED0",
             hover_color="#2D6FA6",
         )
-        self.btn_refresh_wsl_storage.grid(row=0, column=2, sticky="e", padx=(0, 16), pady=(14, 6))
+        self.btn_refresh_wsl_storage.grid(row=0, column=2, sticky="e")
 
         self.wsl_storage_metrics_frame = ctk.CTkFrame(self.wsl_storage_frame, fg_color="transparent")
-        self.wsl_storage_metrics_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 8))
-        self.wsl_storage_metrics_frame.grid_columnconfigure(0, weight=1)
-        self.wsl_storage_metrics_frame.grid_columnconfigure(1, weight=1)
-        self.wsl_storage_metrics_frame.grid_columnconfigure(2, weight=1)
+        self.wsl_storage_metrics_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
 
         self.wsl_storage_used_card = ctk.CTkFrame(self.wsl_storage_metrics_frame)
-        self.wsl_storage_used_card.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.wsl_storage_used_card.grid_columnconfigure(0, weight=1)
         self.lbl_wsl_storage_used_label = ctk.CTkLabel(
             self.wsl_storage_used_card,
@@ -1871,8 +2321,14 @@ class App(ctk.CTk):
         )
         self.lbl_wsl_storage_total_value.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 12))
 
+        self.wsl_storage_metric_cards: list[ctk.CTkFrame] = [
+            self.wsl_storage_used_card,
+            self.wsl_storage_available_card,
+            self.wsl_storage_total_card,
+        ]
+
         self.wsl_storage_usage_row = ctk.CTkFrame(self.wsl_storage_frame, fg_color="transparent")
-        self.wsl_storage_usage_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 4))
+        self.wsl_storage_usage_row.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 4))
         self.wsl_storage_usage_row.grid_columnconfigure(0, weight=1)
         self.wsl_storage_usage_row.grid_columnconfigure(1, weight=0)
 
@@ -1891,11 +2347,11 @@ class App(ctk.CTk):
         self.lbl_wsl_storage_usage_value.grid(row=0, column=1, sticky="e")
 
         self.wsl_storage_progress = ctk.CTkProgressBar(self.wsl_storage_frame, height=14)
-        self.wsl_storage_progress.grid(row=3, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 8))
+        self.wsl_storage_progress.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.wsl_storage_progress.set(0)
 
         self.wsl_storage_detail_frame = ctk.CTkFrame(self.wsl_storage_frame)
-        self.wsl_storage_detail_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 8))
+        self.wsl_storage_detail_frame.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
         self.wsl_storage_detail_frame.grid_columnconfigure(0, weight=1)
         self.lbl_wsl_storage_detail = ctk.CTkLabel(
             self.wsl_storage_detail_frame,
@@ -1909,105 +2365,121 @@ class App(ctk.CTk):
         self.bind_label_wrap(self.lbl_wsl_storage_detail, horizontal_padding=32, min_wraplength=420)
 
         self.wsl_storage_info_frame = ctk.CTkFrame(self.wsl_storage_frame, fg_color="transparent")
-        self.wsl_storage_info_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 14))
-        self.wsl_storage_info_frame.grid_columnconfigure(0, weight=1)
-        self.wsl_storage_info_frame.grid_columnconfigure(1, weight=1)
+        self.wsl_storage_info_frame.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 14))
+
+        self.wsl_storage_distro_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_distro_item.grid_columnconfigure(0, weight=1)
 
         self.lbl_wsl_storage_distro_label = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_distro_item,
             text=self.tr("dashboard.wsl_storage.label.distro"),
             text_color="gray",
             anchor="w",
         )
         self.lbl_wsl_storage_distro_label.grid(row=0, column=0, sticky="w")
-        self.lbl_wsl_storage_source_label = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
-            text=self.tr("dashboard.wsl_storage.label.source"),
-            text_color="gray",
-            anchor="w",
-        )
-        self.lbl_wsl_storage_source_label.grid(row=0, column=1, sticky="w", padx=(18, 0))
-
         self.lbl_wsl_storage_distro_value = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_distro_item,
             text="—",
             anchor="w",
         )
         self.lbl_wsl_storage_distro_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self.wsl_storage_source_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_source_item.grid_columnconfigure(0, weight=1)
+        self.lbl_wsl_storage_source_label = ctk.CTkLabel(
+            self.wsl_storage_source_item,
+            text=self.tr("dashboard.wsl_storage.label.source"),
+            text_color="gray",
+            anchor="w",
+        )
+        self.lbl_wsl_storage_source_label.grid(row=0, column=0, sticky="w")
         self.lbl_wsl_storage_source_value = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_source_item,
             text="—",
             anchor="w",
         )
-        self.lbl_wsl_storage_source_value.grid(row=1, column=1, sticky="w", padx=(18, 0), pady=(0, 8))
+        self.lbl_wsl_storage_source_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self.wsl_storage_vhdx_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_vhdx_item.grid_columnconfigure(0, weight=1)
 
         self.lbl_wsl_storage_vhdx_label = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_vhdx_item,
             text=self.tr("dashboard.wsl_storage.label.host_vhdx_size"),
             text_color="gray",
             anchor="w",
         )
-        self.lbl_wsl_storage_vhdx_label.grid(row=2, column=0, sticky="w")
+        self.lbl_wsl_storage_vhdx_label.grid(row=0, column=0, sticky="w")
+        self.lbl_wsl_storage_vhdx_value = ctk.CTkLabel(
+            self.wsl_storage_vhdx_item,
+            text="—",
+            anchor="w",
+        )
+        self.lbl_wsl_storage_vhdx_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self.wsl_storage_host_free_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_host_free_item.grid_columnconfigure(0, weight=1)
         self.lbl_wsl_storage_host_free_label = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_host_free_item,
             text=self.tr("dashboard.wsl_storage.label.host_drive_free"),
             text_color="gray",
             anchor="w",
         )
-        self.lbl_wsl_storage_host_free_label.grid(row=2, column=1, sticky="w", padx=(18, 0))
-
-        self.lbl_wsl_storage_vhdx_value = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
-            text="—",
-            anchor="w",
-        )
-        self.lbl_wsl_storage_vhdx_value.grid(row=3, column=0, sticky="w", pady=(0, 8))
+        self.lbl_wsl_storage_host_free_label.grid(row=0, column=0, sticky="w")
         self.lbl_wsl_storage_host_free_value = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_host_free_item,
             text="—",
             anchor="w",
         )
-        self.lbl_wsl_storage_host_free_value.grid(row=3, column=1, sticky="w", padx=(18, 0), pady=(0, 8))
+        self.lbl_wsl_storage_host_free_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self.wsl_storage_meta_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_meta_item.grid_columnconfigure(0, weight=1)
 
         self.lbl_wsl_storage_meta_label = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_meta_item,
             text=self.tr("dashboard.wsl_storage.label.last_updated"),
             text_color="gray",
             anchor="w",
         )
-        self.lbl_wsl_storage_meta_label.grid(row=4, column=0, sticky="w")
+        self.lbl_wsl_storage_meta_label.grid(row=0, column=0, sticky="w")
         self.lbl_wsl_storage_meta_value = ctk.CTkLabel(
-            self.wsl_storage_info_frame,
+            self.wsl_storage_meta_item,
             text="—",
             anchor="w",
         )
-        self.lbl_wsl_storage_meta_value.grid(row=5, column=0, columnspan=2, sticky="w")
+        self.lbl_wsl_storage_meta_value.grid(row=1, column=0, sticky="w")
 
-        # Active Tasks Section
+        self.wsl_storage_info_items: list[ctk.CTkFrame] = [
+            self.wsl_storage_distro_item,
+            self.wsl_storage_source_item,
+            self.wsl_storage_vhdx_item,
+            self.wsl_storage_host_free_item,
+            self.wsl_storage_meta_item,
+        ]
+
         self.tasks_frame = ctk.CTkScrollableFrame(
-            self.main_frame,
+            self.dashboard_body_frame,
             label_text=self.tr("dashboard.label.task_status"),
         )
-        self.tasks_frame.grid(row=1, column=0, sticky="nsew")
-        self.main_frame.grid_rowconfigure(1, weight=1)
+        self.tasks_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
 
-        self.task_labels = {} # {filename: label_widget}
+        self.task_labels = {}
 
-        # Action Buttons
         self.action_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
-        self.action_frame.grid(row=2, column=0, sticky="ew", pady=10)
+        self.action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self.action_frame.grid_columnconfigure(0, weight=1)
         self.action_frame.grid_columnconfigure(1, weight=1)
 
-        supabase_action_row = ctk.CTkFrame(self.action_frame, fg_color="transparent")
-        supabase_action_row.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        self.supabase_action_row = ctk.CTkFrame(self.action_frame)
+        self.supabase_action_row.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
 
-        upload_action_row = ctk.CTkFrame(self.action_frame, fg_color="transparent")
-        upload_action_row.grid(row=1, column=0, sticky="e")
-        
+        self.upload_action_row = ctk.CTkFrame(self.action_frame)
+        self.upload_action_row.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 8))
+
         start_state = "disabled" if self.is_uploading else "normal"
         self.btn_start = ctk.CTkButton(
-            upload_action_row,
+            self.upload_action_row,
             text=self.tr("dashboard.button.start_upload"),
             command=self.on_start,
             state=start_state,
@@ -2015,18 +2487,16 @@ class App(ctk.CTk):
             fg_color="#2CC985",
             hover_color="#26A670",
         )
-        self.btn_start.pack(side="right", padx=10)
-        
-        # Determine initial state based on current upload status
+
         pause_state = "normal" if self.is_uploading else "disabled"
         pause_text = (
             self.tr("dashboard.button.resume")
             if self.is_uploading and not self.pause_event.is_set()
             else self.tr("dashboard.button.pause")
         )
-        
+
         self.btn_pause = ctk.CTkButton(
-            upload_action_row,
+            self.upload_action_row,
             text=pause_text,
             command=self.on_pause,
             state=pause_state,
@@ -2034,47 +2504,218 @@ class App(ctk.CTk):
             fg_color="#E5C07B",
             hover_color="#D1A03D",
         )
-        self.btn_pause.pack(side="right", padx=10)
-
-        ctk.CTkButton(
-            upload_action_row,
+        self.btn_preview = ctk.CTkButton(
+            self.upload_action_row,
             text=self.tr("common.button.preview"),
             command=self.on_preview,
             width=120,
-        ).pack(side="right", padx=10)
+        )
         self.btn_start_supabase = ctk.CTkButton(
-            supabase_action_row,
+            self.supabase_action_row,
             text=self.tr("dashboard.local_supabase.button.start"),
             command=self.on_start_local_supabase,
             width=180,
             fg_color="#3B8ED0",
             hover_color="#2D6FA6",
         )
-        self.btn_start_supabase.pack(side="left", padx=10)
         self.btn_open_studio = ctk.CTkButton(
-            supabase_action_row,
+            self.supabase_action_row,
             text=self.tr("dashboard.local_supabase.button.studio"),
             command=self.on_open_local_supabase_studio,
             width=150,
             fg_color="#3B8ED0",
             hover_color="#2D6FA6",
         )
-        self.btn_open_studio.pack(side="left", padx=10)
         self.btn_stop_supabase = ctk.CTkButton(
-            supabase_action_row,
+            self.supabase_action_row,
             text=self.tr("dashboard.local_supabase.button.stop"),
             command=self.on_stop_local_supabase,
             width=180,
             fg_color="#D97706",
             hover_color="#B45309",
         )
-        self.btn_stop_supabase.pack(side="left", padx=10)
+        self.supabase_action_buttons: list[ctk.CTkButton] = [
+            self.btn_start_supabase,
+            self.btn_open_studio,
+            self.btn_stop_supabase,
+        ]
+        self.upload_action_buttons: list[ctk.CTkButton] = [
+            self.btn_preview,
+            self.btn_pause,
+            self.btn_start,
+        ]
 
-        # Start update loop
+        self.dashboard_body_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
+        self.wsl_storage_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
+        self.action_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
+
+        self.schedule_dashboard_layout_refresh(None)
         self.refresh_local_supabase_button()
-        self.render_wsl_storage_card()
-        self.request_wsl_storage_refresh()
-        self.update_dashboard_loop()
+        if self.is_wsl_storage_refreshing:
+            self.render_wsl_storage_card()
+        else:
+            self.request_wsl_storage_refresh()
+        self.schedule_dashboard_update_loop(0)
+
+    def schedule_dashboard_update_loop(self, delay_ms: int) -> None:
+        if self.current_view != "dashboard":
+            return
+        if self.dashboard_update_after_id is not None:
+            return
+        if self.is_dashboard_update_loop_running:
+            return
+        dashboard_view_generation = self.dashboard_view_generation
+        try:
+            self.dashboard_update_after_id = self.after(
+                delay_ms,
+                self.update_dashboard_loop,
+                dashboard_view_generation,
+            )
+        except (RuntimeError, tk.TclError):
+            self.dashboard_update_after_id = None
+
+    def schedule_dashboard_layout_refresh(self, event: object) -> None:
+        if self.current_view != "dashboard":
+            self.dashboard_layout_after_id = None
+            return
+        if not hasattr(self, "dashboard_body_frame") or not self.dashboard_body_frame.winfo_exists():
+            self.dashboard_layout_after_id = None
+            return
+        if self.dashboard_layout_after_id is not None:
+            return
+        try:
+            self.dashboard_layout_after_id = self.after(0, self.refresh_dashboard_layout)
+        except (RuntimeError, tk.TclError):
+            self.dashboard_layout_after_id = None
+
+    def refresh_dashboard_layout(self) -> None:
+        self.dashboard_layout_after_id = None
+        if not hasattr(self, "dashboard_body_frame") or not self.dashboard_body_frame.winfo_exists():
+            return
+
+        body_width = self.dashboard_body_frame.winfo_width()
+        if body_width <= 1:
+            body_width = self.main_frame.winfo_width()
+
+        is_split_body = body_width >= 1180
+        self.dashboard_body_frame.grid_columnconfigure(0, weight=1)
+        self.dashboard_body_frame.grid_columnconfigure(1, weight=1 if is_split_body else 0)
+        self.dashboard_body_frame.grid_rowconfigure(0, weight=1 if is_split_body else 0)
+        self.dashboard_body_frame.grid_rowconfigure(1, weight=1 if not is_split_body else 0)
+
+        wsl_width = self.wsl_storage_frame.winfo_width()
+        if wsl_width <= 1:
+            wsl_width = body_width
+
+        metric_column_count = 3 if wsl_width >= 900 else 2 if wsl_width >= 560 else 1
+        info_column_count = 3 if wsl_width >= 900 else 2 if wsl_width >= 620 else 1
+        footer_width = self.action_frame.winfo_width()
+        if footer_width <= 1:
+            footer_width = body_width
+
+        is_split_footer = footer_width >= 1040
+        button_stack = footer_width < 760
+        layout_signature = DashboardLayoutSignature(
+            is_split_body=is_split_body,
+            metric_column_count=metric_column_count,
+            info_column_count=info_column_count,
+            is_split_footer=is_split_footer,
+            button_stack=button_stack,
+        )
+        if self.dashboard_layout_signature == layout_signature:
+            return
+        self.dashboard_layout_signature = layout_signature
+
+        self.wsl_storage_frame.grid_forget()
+        self.tasks_frame.grid_forget()
+        if is_split_body:
+            self.wsl_storage_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
+            self.tasks_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
+        else:
+            self.wsl_storage_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 10))
+            self.tasks_frame.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 10))
+
+        self.layout_dashboard_collection(
+            self.wsl_storage_metrics_frame,
+            self.wsl_storage_metric_cards,
+            metric_column_count,
+        )
+        self.layout_dashboard_collection(
+            self.wsl_storage_info_frame,
+            self.wsl_storage_info_items,
+            info_column_count,
+        )
+        self.action_frame.grid_columnconfigure(0, weight=1)
+        self.action_frame.grid_columnconfigure(1, weight=1 if is_split_footer else 0)
+
+        if is_split_footer:
+            self.supabase_action_row.grid_configure(row=0, column=0, padx=(0, 8), pady=(0, 8))
+            self.upload_action_row.grid_configure(row=0, column=1, padx=(8, 0), pady=(0, 8))
+        else:
+            self.supabase_action_row.grid_configure(row=0, column=0, padx=0, pady=(0, 8))
+            self.upload_action_row.grid_configure(row=1, column=0, padx=0, pady=(0, 8))
+
+        self.layout_dashboard_button_row(self.supabase_action_row, self.supabase_action_buttons, button_stack)
+        self.layout_dashboard_button_row(self.upload_action_row, self.upload_action_buttons, button_stack)
+
+    def layout_dashboard_collection(
+        self,
+        container: ctk.CTkFrame,
+        items: list[ctk.CTkFrame],
+        column_count: int,
+    ) -> None:
+        effective_column_count = min(max(column_count, 1), len(items))
+        for column_index in range(len(items)):
+            container.grid_columnconfigure(
+                column_index,
+                weight=1 if column_index < effective_column_count else 0,
+            )
+
+        for item_index, item in enumerate(items):
+            row_index = item_index // effective_column_count
+            column_index = item_index % effective_column_count
+            left_padding = 0 if column_index == 0 else 6
+            right_padding = 0 if column_index == effective_column_count - 1 else 6
+            item.grid(
+                row=row_index,
+                column=column_index,
+                sticky="nsew",
+                padx=(left_padding, right_padding),
+                pady=(0, 10),
+            )
+
+    def layout_dashboard_button_row(
+        self,
+        container: ctk.CTkFrame,
+        buttons: list[ctk.CTkButton],
+        stack_buttons: bool,
+    ) -> None:
+        if stack_buttons:
+            for column_index in range(len(buttons)):
+                container.grid_columnconfigure(column_index, weight=0)
+            container.grid_columnconfigure(0, weight=1)
+            for button_index, button in enumerate(buttons):
+                button.grid(
+                    row=button_index,
+                    column=0,
+                    sticky="ew",
+                    padx=12,
+                    pady=(0, 8),
+                )
+            return
+
+        for column_index in range(len(buttons)):
+            container.grid_columnconfigure(column_index, weight=1)
+        for button_index, button in enumerate(buttons):
+            left_padding = 0 if button_index == 0 else 6
+            right_padding = 0 if button_index == len(buttons) - 1 else 6
+            button.grid(
+                row=0,
+                column=button_index,
+                sticky="ew",
+                padx=(left_padding, right_padding),
+                pady=12,
+            )
 
     def show_settings(self):
         if self.current_view == "settings":
@@ -2083,20 +2724,21 @@ class App(ctk.CTk):
             return
         self.current_view = "settings"
         self.clear_main()
-        # Reset grid weights (dashboard sets row 1 weight)
         self.main_frame.grid_rowconfigure(0, weight=1)
-        self.main_frame.grid_rowconfigure(1, weight=0) 
+        self.main_frame.grid_rowconfigure(1, weight=0)
+        self.main_frame.grid_rowconfigure(2, weight=0)
+        self.main_frame.grid_rowconfigure(3, weight=0)
+        self.main_frame.grid_columnconfigure(0, weight=1)
 
-        
-        # Scrollable settings container
         sf = ctk.CTkScrollableFrame(self.main_frame, label_text=self.tr("settings.title"))
         sf.grid(row=0, column=0, sticky="nsew")
-        
-        # Variables (sync with self.cfg)
+        sf.grid_columnconfigure(0, weight=1)
+
         self.var_url = tk.StringVar(value=self.cfg['SUPABASE_URL'])
         self.var_anon = tk.StringVar(value=self.cfg['SUPABASE_ANON_KEY'])
         self.var_edge = tk.StringVar(value=self.cfg['EDGE_FUNCTION_URL'])
         self.var_plc = tk.StringVar(value=self.cfg['PLC_DIR'])
+        self.var_wsl_vhdx_path = tk.StringVar(value=self.cfg.get('WSL_VHDX_PATH', ''))
 
         self.var_smart_sync = tk.BooleanVar(value=(str(self.cfg.get('SMART_SYNC', 'true')).lower() == 'true'))
         self.var_auto_upload = tk.BooleanVar(value=(str(self.cfg.get('AUTO_UPLOAD', 'false')).lower() == 'true'))
@@ -2115,24 +2757,95 @@ class App(ctk.CTk):
         self.var_custom_date_end = tk.StringVar(value=custom_date_end)
         self.var_custom_range_summary = tk.StringVar(value="")
 
-        # UI Helpers
-        def add_entry(parent, label, var, row):
-            ctk.CTkLabel(parent, text=label, width=170, anchor="w").grid(row=row, column=0, sticky="w", padx=10, pady=5)
-            ctk.CTkEntry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=10, pady=5)
-            
-        def add_path(parent, label, var, row, cmd):
-            ctk.CTkLabel(parent, text=label, width=170, anchor="w").grid(row=row, column=0, sticky="w", padx=10, pady=5)
-            ctk.CTkEntry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=10, pady=5)
-            ctk.CTkButton(
-                parent,
+        def add_entry(parent: ctk.CTkFrame, label: str, var: tk.StringVar, row: int) -> ctk.CTkEntry:
+            row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+            row_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+            label_widget = ctk.CTkLabel(
+                row_frame,
+                text=label,
+                width=170,
+                anchor="w",
+                justify="left",
+            )
+            entry_widget = ctk.CTkEntry(row_frame, textvariable=var)
+            row_frame.bind(
+                "<Configure>",
+                lambda _event, frame=row_frame, lw=label_widget, ew=entry_widget: self.layout_responsive_labeled_entry_row(
+                    frame,
+                    lw,
+                    ew,
+                ),
+            )
+            self.layout_responsive_labeled_entry_row(row_frame, label_widget, entry_widget)
+            return entry_widget
+
+        def add_path(
+            parent: ctk.CTkFrame,
+            label: str,
+            var: tk.StringVar,
+            row: int,
+            cmd: Callable[[], None],
+        ) -> tuple[ctk.CTkEntry, ctk.CTkButton]:
+            row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+            row_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+            label_widget = ctk.CTkLabel(
+                row_frame,
+                text=label,
+                width=170,
+                anchor="w",
+                justify="left",
+            )
+            entry_widget = ctk.CTkEntry(row_frame, textvariable=var)
+            button_widget = ctk.CTkButton(
+                row_frame,
                 text=self.tr("common.button.browse"),
                 width=80,
                 command=cmd,
-            ).grid(row=row, column=2, padx=10, pady=5)
+            )
+            row_frame.bind(
+                "<Configure>",
+                lambda _event, frame=row_frame, lw=label_widget, ew=entry_widget, bw=button_widget: self.layout_responsive_labeled_entry_action_row(
+                    frame,
+                    lw,
+                    ew,
+                    bw,
+                ),
+            )
+            self.layout_responsive_labeled_entry_action_row(
+                row_frame,
+                label_widget,
+                entry_widget,
+                button_widget,
+            )
+            return entry_widget, button_widget
 
-        # Connection
+        def add_option_row(
+            parent: ctk.CTkFrame,
+            label: str,
+            control_widget: ctk.CTkBaseClass,
+            row: int,
+        ) -> None:
+            row_frame = ctk.CTkFrame(parent, fg_color="transparent")
+            row_frame.grid(row=row, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+            label_widget = ctk.CTkLabel(
+                row_frame,
+                text=label,
+                width=170,
+                anchor="w",
+                justify="left",
+            )
+            row_frame.bind(
+                "<Configure>",
+                lambda _event, frame=row_frame, lw=label_widget, cw=control_widget: self.layout_responsive_labeled_entry_row(
+                    frame,
+                    lw,
+                    cw,
+                ),
+            )
+            self.layout_responsive_labeled_entry_row(row_frame, label_widget, control_widget)
+
         grp_conn = ctk.CTkFrame(sf)
-        grp_conn.pack(fill="x", padx=10, pady=10)
+        grp_conn.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         grp_conn.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             grp_conn,
@@ -2141,14 +2854,37 @@ class App(ctk.CTk):
         ).grid(row=0, column=0, sticky="w", padx=10, pady=5)
         add_entry(grp_conn, self.tr("settings.label.supabase_url"), self.var_url, 1)
         add_entry(grp_conn, self.tr("settings.label.anon_key"), self.var_anon, 2)
-        ctk.CTkLabel(grp_conn, text=self.tr("settings.label.edge_url"), width=170, anchor="w").grid(row=3, column=0, sticky="w", padx=10, pady=5)
-        ctk.CTkEntry(grp_conn, textvariable=self.var_edge).grid(row=3, column=1, sticky="ew", padx=10, pady=5)
-        ctk.CTkButton(
-            grp_conn,
+        edge_row_frame = ctk.CTkFrame(grp_conn, fg_color="transparent")
+        edge_row_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+        edge_label = ctk.CTkLabel(
+            edge_row_frame,
+            text=self.tr("settings.label.edge_url"),
+            width=170,
+            anchor="w",
+            justify="left",
+        )
+        edge_entry = ctk.CTkEntry(edge_row_frame, textvariable=self.var_edge)
+        edge_button = ctk.CTkButton(
+            edge_row_frame,
             text=self.tr("common.button.clear"),
             width=80,
             command=self.on_restore_auto_edge_url,
-        ).grid(row=3, column=2, padx=10, pady=5)
+        )
+        edge_row_frame.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                edge_row_frame,
+                edge_label,
+                edge_entry,
+                edge_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            edge_row_frame,
+            edge_label,
+            edge_entry,
+            edge_button,
+        )
         edge_help_label = ctk.CTkLabel(
             grp_conn,
             text=self.tr("settings.edge_url.help"),
@@ -2177,15 +2913,13 @@ class App(ctk.CTk):
         ctk.CTkButton(
             grp_conn,
             text=self.tr("settings.button.open_appdata_dir"),
-            width=170,
             command=self.open_appdata_dir,
         ).grid(
             row=6, column=0, sticky="w", padx=10, pady=(0, 5)
         )
-        
-        # Folders
+
         grp_folder = ctk.CTkFrame(sf)
-        grp_folder.pack(fill="x", padx=10, pady=10)
+        grp_folder.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
         grp_folder.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             grp_folder,
@@ -2193,6 +2927,24 @@ class App(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=10, pady=5)
         add_path(grp_folder, self.tr("settings.label.data_folder"), self.var_plc, 1, self.pick_plc)
+        add_path(
+            grp_folder,
+            self.tr("settings.label.wsl_vhdx_path"),
+            self.var_wsl_vhdx_path,
+            2,
+            self.pick_wsl_vhdx,
+        )
+        wsl_vhdx_help_label = ctk.CTkLabel(
+            grp_folder,
+            text=self.tr("settings.wsl_vhdx.help"),
+            text_color="gray",
+            justify="left",
+            anchor="w",
+        )
+        wsl_vhdx_help_label.grid(
+            row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 5)
+        )
+        self.bind_label_wrap(wsl_vhdx_help_label, horizontal_padding=30, min_wraplength=420)
         folder_help_label = ctk.CTkLabel(
             grp_folder,
             text=self.tr("settings.temp_dir.unused"),
@@ -2201,31 +2953,42 @@ class App(ctk.CTk):
             anchor="w",
         )
         folder_help_label.grid(
-            row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 5)
+            row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 5)
         )
         self.bind_label_wrap(folder_help_label, horizontal_padding=30, min_wraplength=420)
 
-        
-        # Options
         grp_opt = ctk.CTkFrame(sf)
-        grp_opt.pack(fill="x", padx=10, pady=10)
+        grp_opt.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
         grp_opt.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
             grp_opt,
             text=self.tr("settings.section.options"),
             font=ctk.CTkFont(weight="bold"),
         ).grid(row=0, column=0, sticky="w", padx=10, pady=5)
-        
-        ctk.CTkSwitch(grp_opt, text=self.tr("settings.label.smart_sync"), variable=self.var_smart_sync).grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=10)
-        ctk.CTkSwitch(grp_opt, text=self.tr("settings.label.auto_upload"), variable=self.var_auto_upload).grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=10)
-        ctk.CTkLabel(grp_opt, text=self.tr("settings.label.ui_language")).grid(row=3, column=0, sticky="w", padx=10, pady=5)
-        ctk.CTkOptionMenu(
+
+        self.smart_sync_switch = ctk.CTkSwitch(
+            grp_opt,
+            text=self.tr("settings.label.smart_sync"),
+            variable=self.var_smart_sync,
+        )
+        self.smart_sync_switch.grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=10)
+        self.auto_upload_switch = ctk.CTkSwitch(
+            grp_opt,
+            text=self.tr("settings.label.auto_upload"),
+            variable=self.var_auto_upload,
+        )
+        self.auto_upload_switch.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=10)
+        self.settings_language_menu = ctk.CTkOptionMenu(
             grp_opt,
             variable=self.var_ui_language,
             values=list(SUPPORTED_UI_LANGUAGES),
-        ).grid(row=3, column=1, sticky="w", padx=10, pady=5)
-        
-        ctk.CTkLabel(grp_opt, text=self.tr("settings.label.range_mode")).grid(row=4, column=0, sticky="w", padx=10, pady=5)
+        )
+        add_option_row(
+            grp_opt,
+            self.tr("settings.label.ui_language"),
+            self.settings_language_menu,
+            3,
+        )
 
         def on_range_change(choice):
             selected_range_mode = choice
@@ -2234,39 +2997,64 @@ class App(ctk.CTk):
             if choice in reverse_options:
                 selected_range_mode = reverse_options[choice]
             if selected_range_mode == 'custom':
-                self.frame_custom_range.grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 10))
+                self.frame_custom_range.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
+                layout_custom_range_fields()
             else:
                 self.frame_custom_range.grid_forget()
 
-        ctk.CTkOptionMenu(
+        self.settings_range_menu = ctk.CTkOptionMenu(
             grp_opt,
             variable=self.var_range,
             values=list(self.get_range_mode_options().values()),
             command=on_range_change,
-        ).grid(row=4, column=1, sticky="w", padx=10, pady=5)
+        )
+        add_option_row(
+            grp_opt,
+            self.tr("settings.label.range_mode"),
+            self.settings_range_menu,
+            4,
+        )
 
         self.frame_custom_range = ctk.CTkFrame(grp_opt, fg_color="#1F2430")
-        ctk.CTkLabel(
+        self.frame_custom_range.grid_columnconfigure(1, weight=1)
+        self.frame_custom_range.grid_columnconfigure(4, weight=1)
+        custom_range_title = ctk.CTkLabel(
             self.frame_custom_range,
             text=self.tr("settings.custom_range.title"),
             font=ctk.CTkFont(weight="bold"),
-        ).grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 4))
-        ctk.CTkLabel(self.frame_custom_range, text=self.tr("settings.label.custom_start_date")).grid(row=1, column=0, sticky="w", padx=(10, 5), pady=6)
-        ctk.CTkEntry(self.frame_custom_range, textvariable=self.var_custom_date_start, width=120).grid(row=1, column=1, sticky="w", padx=(0, 6), pady=6)
-        ctk.CTkButton(
+        )
+        self.custom_start_label = ctk.CTkLabel(
+            self.frame_custom_range,
+            text=self.tr("settings.label.custom_start_date"),
+            anchor="w",
+            justify="left",
+        )
+        self.custom_start_entry = ctk.CTkEntry(
+            self.frame_custom_range,
+            textvariable=self.var_custom_date_start,
+        )
+        self.custom_start_button = ctk.CTkButton(
             self.frame_custom_range,
             text=self.tr("settings.button.calendar"),
             width=70,
             command=lambda: self.open_settings_calendar("start"),
-        ).grid(row=1, column=2, sticky="w", padx=(0, 12), pady=6)
-        ctk.CTkLabel(self.frame_custom_range, text=self.tr("settings.label.custom_end_date")).grid(row=1, column=3, sticky="w", padx=(0, 5), pady=6)
-        ctk.CTkEntry(self.frame_custom_range, textvariable=self.var_custom_date_end, width=120).grid(row=1, column=4, sticky="w", padx=(0, 6), pady=6)
-        ctk.CTkButton(
+        )
+        self.custom_end_label = ctk.CTkLabel(
+            self.frame_custom_range,
+            text=self.tr("settings.label.custom_end_date"),
+            anchor="w",
+            justify="left",
+        )
+        self.custom_end_entry = ctk.CTkEntry(
+            self.frame_custom_range,
+            textvariable=self.var_custom_date_end,
+        )
+        self.custom_end_button = ctk.CTkButton(
             self.frame_custom_range,
             text=self.tr("settings.button.calendar"),
             width=70,
             command=lambda: self.open_settings_calendar("end"),
-        ).grid(row=1, column=5, sticky="w", padx=(0, 10), pady=6)
+        )
         custom_range_help_label = ctk.CTkLabel(
             self.frame_custom_range,
             text=self.tr("settings.custom_range.help"),
@@ -2286,8 +3074,49 @@ class App(ctk.CTk):
         custom_range_summary_label.grid(row=3, column=0, columnspan=6, sticky="ew", padx=10, pady=(0, 8))
         self.bind_label_wrap(custom_range_summary_label, horizontal_padding=30, min_wraplength=360)
 
+        def layout_custom_range_fields() -> None:
+            frame_width = self.frame_custom_range.winfo_width()
+            if frame_width <= 1:
+                frame_width = self.frame_custom_range.winfo_reqwidth()
+            custom_range_title.grid_forget()
+            self.custom_start_label.grid_forget()
+            self.custom_start_entry.grid_forget()
+            self.custom_start_button.grid_forget()
+            self.custom_end_label.grid_forget()
+            self.custom_end_entry.grid_forget()
+            self.custom_end_button.grid_forget()
+            if frame_width < 1000:
+                self.frame_custom_range.grid_columnconfigure(0, weight=1)
+                self.frame_custom_range.grid_columnconfigure(1, weight=0)
+                custom_range_title.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+                self.custom_start_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 2))
+                self.custom_start_entry.grid(row=2, column=0, sticky="ew", padx=(10, 6), pady=2)
+                self.custom_start_button.grid(row=2, column=1, sticky="e", padx=(0, 10), pady=2)
+                self.custom_end_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 2))
+                self.custom_end_entry.grid(row=4, column=0, sticky="ew", padx=(10, 6), pady=2)
+                self.custom_end_button.grid(row=4, column=1, sticky="e", padx=(0, 10), pady=2)
+                custom_range_help_label.grid_configure(row=5, column=0, columnspan=2)
+                custom_range_summary_label.grid_configure(row=6, column=0, columnspan=2)
+                return
+            for column_index in range(6):
+                self.frame_custom_range.grid_columnconfigure(column_index, weight=0)
+            self.frame_custom_range.grid_columnconfigure(1, weight=1)
+            self.frame_custom_range.grid_columnconfigure(4, weight=1)
+            custom_range_title.grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 4))
+            self.custom_start_label.grid(row=1, column=0, sticky="w", padx=(10, 5), pady=6)
+            self.custom_start_entry.grid(row=1, column=1, sticky="ew", padx=(0, 6), pady=6)
+            self.custom_start_button.grid(row=1, column=2, sticky="e", padx=(0, 12), pady=6)
+            self.custom_end_label.grid(row=1, column=3, sticky="w", padx=(0, 5), pady=6)
+            self.custom_end_entry.grid(row=1, column=4, sticky="ew", padx=(0, 6), pady=6)
+            self.custom_end_button.grid(row=1, column=5, sticky="e", padx=(0, 10), pady=6)
+            custom_range_help_label.grid_configure(row=2, column=0, columnspan=6)
+            custom_range_summary_label.grid_configure(row=3, column=0, columnspan=6)
+
+        self.frame_custom_range.bind("<Configure>", lambda _event: layout_custom_range_fields())
+        layout_custom_range_fields()
+
         if self.get_selected_range_mode() == 'custom':
-            self.frame_custom_range.grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 10))
+            self.frame_custom_range.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 10))
 
         self.lbl_settings_dirty = ctk.CTkLabel(
             self.main_frame,
@@ -2320,6 +3149,8 @@ class App(ctk.CTk):
         self.refresh_settings_form_state()
 
     def show_logs(self):
+        if self.current_view == "logs":
+            return
         if not self.confirm_leave_data_tasks(self.tr("sidebar.logs")):
             return
         if not self.confirm_leave_settings(self.tr("navigation.logs")):
@@ -2336,10 +3167,13 @@ class App(ctk.CTk):
             self.log_box.see("end")
 
     def show_work_log(self):
+        if self.current_view == "work_log":
+            return
         if not self.confirm_leave_data_tasks(self.tr("sidebar.work_log")):
             return
         if not self.confirm_leave_settings(self.tr("navigation.work_log")):
             return
+        work_log_view_state = self.build_work_log_view_state()
         self.current_view = "work_log"
         self.clear_main()
         
@@ -2383,6 +3217,7 @@ class App(ctk.CTk):
         # Log area
         self.work_log_box = ctk.CTkTextbox(self.main_frame, width=600, height=300)
         self.work_log_box.pack(fill="both", expand=True, padx=20, pady=10)
+        self.restore_work_log_view_state(work_log_view_state)
         
     def on_select_work_log(self):
         f = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls *.xlsm")])
@@ -2392,7 +3227,7 @@ class App(ctk.CTk):
             self.btn_upload_work_log.configure(state="normal")
             
     def on_upload_work_log(self):
-        if not hasattr(self, 'selected_work_log_path') or not self.selected_work_log_path:
+        if self.selected_work_log_path.strip() == "":
             return
             if not self.ensure_local_supabase_ready(self.tr("work_log.action.upload")):
                 return
@@ -2432,12 +3267,315 @@ class App(ctk.CTk):
         threading.Thread(target=_run, daemon=True).start()
 
     def log_to_box(self, msg):
-        self.after(0, lambda: self._append_work_log_msg(msg))
+        self.work_log_messages.append(msg)
+        if len(self.work_log_messages) > 400:
+            self.work_log_messages = self.work_log_messages[-300:]
+        self.schedule_gui_callback(0, lambda: self._append_work_log_msg(msg))
         
     def _append_work_log_msg(self, msg):
         if hasattr(self, 'work_log_box') and self.work_log_box.winfo_exists():
             self.work_log_box.insert("end", msg + "\n")
             self.work_log_box.see("end")
+
+    def layout_responsive_labeled_entry_action_row(
+        self,
+        row_frame: ctk.CTkFrame,
+        label_widget: ctk.CTkBaseClass,
+        entry_widget: ctk.CTkBaseClass,
+        action_widget: ctk.CTkBaseClass,
+    ) -> None:
+        width = row_frame.winfo_width()
+        if width <= 1:
+            width = row_frame.winfo_reqwidth()
+        layout_mode = "stack" if width < 640 else "split" if width < 980 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="responsive_labeled_entry_action_row",
+            mode=layout_mode,
+            child_count=3,
+            detail="",
+        )
+        if self.read_widget_layout_signature(row_frame) == layout_signature:
+            return
+        for column_index in range(3):
+            row_frame.grid_columnconfigure(column_index, weight=0)
+        self.forget_widget_geometry(label_widget)
+        self.forget_widget_geometry(entry_widget)
+        self.forget_widget_geometry(action_widget)
+        if width < 640:
+            row_frame.grid_columnconfigure(0, weight=1)
+            label_widget.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+            entry_widget.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+            action_widget.grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(row_frame, layout_signature)
+            return
+        if width < 980:
+            row_frame.grid_columnconfigure(0, weight=1)
+            row_frame.grid_columnconfigure(1, weight=0)
+            label_widget.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+            entry_widget.grid(row=1, column=0, sticky="ew", padx=5, pady=(2, 4))
+            action_widget.grid(row=1, column=1, sticky="e", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(row_frame, layout_signature)
+            return
+        row_frame.grid_columnconfigure(1, weight=1)
+        label_widget.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        entry_widget.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        action_widget.grid(row=0, column=2, sticky="e", padx=5, pady=5)
+        self.write_widget_layout_signature(row_frame, layout_signature)
+
+    def layout_responsive_labeled_entry_row(
+        self,
+        row_frame: ctk.CTkFrame,
+        label_widget: ctk.CTkBaseClass,
+        entry_widget: ctk.CTkBaseClass,
+    ) -> None:
+        width = row_frame.winfo_width()
+        if width <= 1:
+            width = row_frame.winfo_reqwidth()
+        layout_mode = "stack" if width < 900 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="responsive_labeled_entry_row",
+            mode=layout_mode,
+            child_count=2,
+            detail="",
+        )
+        if self.read_widget_layout_signature(row_frame) == layout_signature:
+            return
+        row_frame.grid_columnconfigure(0, weight=0)
+        row_frame.grid_columnconfigure(1, weight=0)
+        self.forget_widget_geometry(label_widget)
+        self.forget_widget_geometry(entry_widget)
+        if width < 900:
+            row_frame.grid_columnconfigure(0, weight=1)
+            label_widget.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+            entry_widget.grid(row=1, column=0, sticky="ew", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(row_frame, layout_signature)
+            return
+        row_frame.grid_columnconfigure(1, weight=1)
+        label_widget.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        entry_widget.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        self.write_widget_layout_signature(row_frame, layout_signature)
+
+    def layout_responsive_button_row(
+        self,
+        row_frame: ctk.CTkFrame,
+        button_widgets: list[ctk.CTkButton],
+    ) -> None:
+        width = row_frame.winfo_width()
+        if width <= 1:
+            width = row_frame.winfo_reqwidth()
+        layout_mode = "stack"
+        if width >= 640:
+            layout_mode = "two_column" if width < 980 and len(button_widgets) >= 3 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="responsive_button_row",
+            mode=layout_mode,
+            child_count=len(button_widgets),
+            detail="",
+        )
+        if self.read_widget_layout_signature(row_frame) == layout_signature:
+            return
+        for column_index in range(max(len(button_widgets), 3)):
+            row_frame.grid_columnconfigure(column_index, weight=0)
+        for button_widget in button_widgets:
+            self.forget_widget_geometry(button_widget)
+        if width < 640:
+            row_frame.grid_columnconfigure(0, weight=1)
+            for row_index, button_widget in enumerate(button_widgets):
+                button_widget.grid(row=row_index, column=0, sticky="ew", padx=5, pady=4)
+            self.write_widget_layout_signature(row_frame, layout_signature)
+            return
+        if width < 980 and len(button_widgets) >= 3:
+            row_frame.grid_columnconfigure(0, weight=1)
+            row_frame.grid_columnconfigure(1, weight=1)
+            for button_index, button_widget in enumerate(button_widgets):
+                row_index = button_index // 2
+                column_index = button_index % 2
+                if button_index == len(button_widgets) - 1 and len(button_widgets) % 2 == 1:
+                    button_widget.grid(row=row_index, column=0, columnspan=2, sticky="ew", padx=5, pady=4)
+                    continue
+                button_widget.grid(row=row_index, column=column_index, sticky="ew", padx=5, pady=4)
+            self.write_widget_layout_signature(row_frame, layout_signature)
+            return
+        for column_index in range(len(button_widgets)):
+            row_frame.grid_columnconfigure(column_index, weight=1)
+        for column_index, button_widget in enumerate(button_widgets):
+            button_widget.grid(row=0, column=column_index, sticky="ew", padx=5, pady=4)
+        self.write_widget_layout_signature(row_frame, layout_signature)
+
+    def layout_cycle_legacy_custom_date_row(self) -> None:
+        if not hasattr(self, "legacy_cycle_custom_date_frame") or not self.legacy_cycle_custom_date_frame.winfo_exists():
+            return
+        width = self.legacy_cycle_custom_date_frame.winfo_width()
+        if width <= 1:
+            width = self.legacy_cycle_custom_date_frame.winfo_reqwidth()
+        layout_mode = "stack" if width < 720 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="cycle_legacy_custom_date_row",
+            mode=layout_mode,
+            child_count=3,
+            detail="",
+        )
+        if self.read_widget_layout_signature(self.legacy_cycle_custom_date_frame) == layout_signature:
+            return
+        self.legacy_cycle_custom_date_frame.grid_columnconfigure(0, weight=0)
+        self.legacy_cycle_custom_date_frame.grid_columnconfigure(1, weight=0)
+        self.legacy_cycle_custom_date_frame.grid_columnconfigure(2, weight=0)
+        self.forget_widget_geometry(self.legacy_cycle_custom_date_label)
+        self.forget_widget_geometry(self.legacy_cycle_custom_date_entry)
+        self.forget_widget_geometry(self.legacy_cycle_custom_date_hint)
+        if width < 720:
+            self.legacy_cycle_custom_date_frame.grid_columnconfigure(0, weight=1)
+            self.legacy_cycle_custom_date_label.grid(row=0, column=0, sticky="w", padx=0, pady=(0, 2))
+            self.legacy_cycle_custom_date_entry.grid(row=1, column=0, sticky="ew", padx=0, pady=2)
+            self.legacy_cycle_custom_date_hint.grid(row=2, column=0, sticky="w", padx=0, pady=(2, 0))
+            self.write_widget_layout_signature(
+                self.legacy_cycle_custom_date_frame,
+                layout_signature,
+            )
+            return
+        self.legacy_cycle_custom_date_label.grid(row=0, column=0, sticky="w", padx=(0, 5), pady=0)
+        self.legacy_cycle_custom_date_entry.grid(row=0, column=1, sticky="w", padx=5, pady=0)
+        self.legacy_cycle_custom_date_hint.grid(row=0, column=2, sticky="w", padx=5, pady=0)
+        self.write_widget_layout_signature(
+            self.legacy_cycle_custom_date_frame,
+            layout_signature,
+        )
+
+    def layout_cycle_legacy_range_row(self) -> None:
+        if not hasattr(self, "legacy_range_row") or not self.legacy_range_row.winfo_exists():
+            return
+        width = self.legacy_range_row.winfo_width()
+        if width <= 1:
+            width = self.legacy_range_row.winfo_reqwidth()
+        selected_mode = self.get_selected_legacy_cycle_mode()
+        layout_mode = "stack" if width < 640 else "split" if width < 980 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="cycle_legacy_range_row",
+            mode=layout_mode,
+            child_count=3,
+            detail=selected_mode,
+        )
+        if self.read_widget_layout_signature(self.legacy_range_row) == layout_signature:
+            return
+        self.legacy_range_row.grid_columnconfigure(0, weight=0)
+        self.legacy_range_row.grid_columnconfigure(1, weight=0)
+        self.legacy_range_row.grid_columnconfigure(2, weight=0)
+        self.forget_widget_geometry(self.legacy_range_label)
+        self.forget_widget_geometry(self.legacy_cycle_range_menu)
+        self.forget_widget_geometry(self.legacy_cycle_custom_date_frame)
+        if width < 640:
+            self.legacy_range_row.grid_columnconfigure(0, weight=1)
+            self.legacy_range_label.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+            self.legacy_cycle_range_menu.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+            if selected_mode == "custom":
+                self.legacy_cycle_custom_date_frame.grid(row=2, column=0, sticky="ew", padx=5, pady=(2, 4))
+            self.layout_cycle_legacy_custom_date_row()
+            self.write_widget_layout_signature(self.legacy_range_row, layout_signature)
+            return
+        if width < 980:
+            self.legacy_range_row.grid_columnconfigure(0, weight=1)
+            self.legacy_range_row.grid_columnconfigure(1, weight=0)
+            self.legacy_range_label.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+            self.legacy_cycle_range_menu.grid(row=1, column=0, sticky="w", padx=5, pady=(2, 4))
+            if selected_mode == "custom":
+                self.legacy_cycle_custom_date_frame.grid(row=1, column=1, sticky="ew", padx=5, pady=(2, 4))
+            self.layout_cycle_legacy_custom_date_row()
+            self.write_widget_layout_signature(self.legacy_range_row, layout_signature)
+            return
+        self.legacy_range_row.grid_columnconfigure(2, weight=1)
+        self.legacy_range_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.legacy_cycle_range_menu.grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        if selected_mode == "custom":
+            self.legacy_cycle_custom_date_frame.grid(row=0, column=2, sticky="ew", padx=5, pady=5)
+        self.layout_cycle_legacy_custom_date_row()
+        self.write_widget_layout_signature(self.legacy_range_row, layout_signature)
+
+    def layout_training_mode_row(self) -> None:
+        if not hasattr(self, "training_mode_row") or not self.training_mode_row.winfo_exists():
+            return
+        width = self.training_mode_row.winfo_width()
+        if width <= 1:
+            width = self.training_mode_row.winfo_reqwidth()
+        layout_mode = "stack" if width < 640 else "split" if width < 980 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="training_mode_row",
+            mode=layout_mode,
+            child_count=3,
+            detail="",
+        )
+        if self.read_widget_layout_signature(self.training_mode_row) == layout_signature:
+            return
+        self.training_mode_row.grid_columnconfigure(0, weight=0)
+        self.training_mode_row.grid_columnconfigure(1, weight=0)
+        self.training_mode_row.grid_columnconfigure(2, weight=0)
+        self.forget_widget_geometry(self.training_mode_label)
+        self.forget_widget_geometry(self.training_mode_menu)
+        self.forget_widget_geometry(self.training_mode_status_label)
+        if width < 640:
+            self.training_mode_row.grid_columnconfigure(0, weight=1)
+            self.training_mode_label.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+            self.training_mode_menu.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+            self.training_mode_status_label.grid(row=2, column=0, sticky="w", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(self.training_mode_row, layout_signature)
+            return
+        if width < 980:
+            self.training_mode_row.grid_columnconfigure(0, weight=1)
+            self.training_mode_row.grid_columnconfigure(1, weight=0)
+            self.training_mode_label.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+            self.training_mode_menu.grid(row=1, column=0, sticky="w", padx=5, pady=(2, 4))
+            self.training_mode_status_label.grid(row=1, column=1, sticky="e", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(self.training_mode_row, layout_signature)
+            return
+        self.training_mode_row.grid_columnconfigure(2, weight=1)
+        self.training_mode_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.training_mode_menu.grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        self.training_mode_status_label.grid(row=0, column=2, sticky="w", padx=12, pady=5)
+        self.write_widget_layout_signature(self.training_mode_row, layout_signature)
+
+    def layout_archive_date_row(self) -> None:
+        if not hasattr(self, "archive_date_row") or not self.archive_date_row.winfo_exists():
+            return
+        width = self.archive_date_row.winfo_width()
+        if width <= 1:
+            width = self.archive_date_row.winfo_reqwidth()
+        layout_mode = "stack" if width < 640 else "split" if width < 980 else "inline"
+        layout_signature = WidgetLayoutSignature(
+            layout_name="archive_date_row",
+            mode=layout_mode,
+            child_count=4,
+            detail="",
+        )
+        if self.read_widget_layout_signature(self.archive_date_row) == layout_signature:
+            return
+        for column_index in range(4):
+            self.archive_date_row.grid_columnconfigure(column_index, weight=0)
+        self.forget_widget_geometry(self.archive_date_label)
+        self.forget_widget_geometry(self.archive_date_entry)
+        self.forget_widget_geometry(self.archive_date_hint)
+        self.forget_widget_geometry(self.archive_status_label)
+        if width < 640:
+            self.archive_date_row.grid_columnconfigure(0, weight=1)
+            self.archive_date_label.grid(row=0, column=0, sticky="w", padx=5, pady=(4, 2))
+            self.archive_date_entry.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+            self.archive_date_hint.grid(row=2, column=0, sticky="w", padx=5, pady=(2, 0))
+            self.archive_status_label.grid(row=3, column=0, sticky="w", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(self.archive_date_row, layout_signature)
+            return
+        if width < 980:
+            self.archive_date_row.grid_columnconfigure(0, weight=1)
+            self.archive_date_row.grid_columnconfigure(1, weight=0)
+            self.archive_date_label.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(4, 2))
+            self.archive_date_entry.grid(row=1, column=0, sticky="ew", padx=5, pady=2)
+            self.archive_date_hint.grid(row=1, column=1, sticky="w", padx=5, pady=2)
+            self.archive_status_label.grid(row=2, column=0, columnspan=2, sticky="w", padx=5, pady=(2, 4))
+            self.write_widget_layout_signature(self.archive_date_row, layout_signature)
+            return
+        self.archive_date_row.grid_columnconfigure(3, weight=1)
+        self.archive_date_label.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.archive_date_entry.grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        self.archive_date_hint.grid(row=0, column=2, sticky="w", padx=5, pady=5)
+        self.archive_status_label.grid(row=0, column=3, sticky="w", padx=12, pady=5)
+        self.write_widget_layout_signature(self.archive_date_row, layout_signature)
 
     def show_cycle_ops(self):
         if self.current_view == "cycle_ops":
@@ -2487,9 +3625,6 @@ class App(ctk.CTk):
 
         canonical_button_row = ctk.CTkFrame(canonical_frame, fg_color="transparent")
         canonical_button_row.pack(fill="x", padx=10, pady=(0, 10))
-        canonical_button_row.grid_columnconfigure(0, weight=1)
-        canonical_button_row.grid_columnconfigure(1, weight=1)
-        canonical_button_row.grid_columnconfigure(2, weight=1)
         self.btn_run_canonical_refresh = ctk.CTkButton(
             canonical_button_row,
             text=self.tr("cycle_ops.canonical.button.refresh"),
@@ -2497,21 +3632,37 @@ class App(ctk.CTk):
             fg_color="#2CC985",
             width=0,
         )
-        self.btn_run_canonical_refresh.grid(row=0, column=0, sticky="ew", padx=5)
         self.btn_run_cycle_snapshot = ctk.CTkButton(
             canonical_button_row,
             text=self.tr("cycle_ops.canonical.button.snapshot_sync"),
             command=self.on_run_cycle_snapshot_sync,
             width=0,
         )
-        self.btn_run_cycle_snapshot.grid(row=0, column=1, sticky="ew", padx=5)
         self.btn_run_cycle_health = ctk.CTkButton(
             canonical_button_row,
             text=self.tr("cycle_ops.canonical.button.health"),
             command=self.on_run_cycle_health_check,
             width=0,
         )
-        self.btn_run_cycle_health.grid(row=0, column=2, sticky="ew", padx=5)
+        canonical_button_row.bind(
+            "<Configure>",
+            lambda _event=None: self.layout_responsive_button_row(
+                canonical_button_row,
+                [
+                    self.btn_run_canonical_refresh,
+                    self.btn_run_cycle_snapshot,
+                    self.btn_run_cycle_health,
+                ],
+            ),
+        )
+        self.layout_responsive_button_row(
+            canonical_button_row,
+            [
+                self.btn_run_canonical_refresh,
+                self.btn_run_cycle_snapshot,
+                self.btn_run_cycle_health,
+            ],
+        )
 
         legacy_frame = ctk.CTkFrame(scroll_frame)
         legacy_frame.pack(fill="x", padx=10, pady=(0, 10))
@@ -2530,57 +3681,67 @@ class App(ctk.CTk):
         legacy_help_label.pack(fill="x", anchor="w", padx=10)
         self.bind_label_wrap(legacy_help_label, horizontal_padding=30, min_wraplength=420)
 
-        legacy_machine_row = ctk.CTkFrame(legacy_frame)
+        legacy_machine_row = ctk.CTkFrame(legacy_frame, fg_color="transparent")
         legacy_machine_row.pack(fill="x", padx=10, pady=(10, 5))
-        ctk.CTkLabel(
+        legacy_machine_label = ctk.CTkLabel(
             legacy_machine_row,
             text=self.tr("cycle_ops.legacy.label.machine_id"),
             width=180,
             anchor="w",
-        ).pack(side="left", padx=5)
-        ctk.CTkEntry(legacy_machine_row, textvariable=self.var_legacy_cycle_machine_id).pack(
-            side="left",
-            fill="x",
-            expand=True,
-            padx=5,
+        )
+        legacy_machine_entry = ctk.CTkEntry(legacy_machine_row, textvariable=self.var_legacy_cycle_machine_id)
+        legacy_machine_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_row(
+                legacy_machine_row,
+                legacy_machine_label,
+                legacy_machine_entry,
+            ),
+        )
+        self.layout_responsive_labeled_entry_row(
+            legacy_machine_row,
+            legacy_machine_label,
+            legacy_machine_entry,
         )
 
-        legacy_range_row = ctk.CTkFrame(legacy_frame)
-        legacy_range_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(
-            legacy_range_row,
+        self.legacy_range_row = ctk.CTkFrame(legacy_frame, fg_color="transparent")
+        self.legacy_range_row.pack(fill="x", padx=10, pady=5)
+        self.legacy_range_label = ctk.CTkLabel(
+            self.legacy_range_row,
             text=self.tr("cycle_ops.legacy.label.mode"),
             width=180,
             anchor="w",
-        ).pack(side="left", padx=5)
+        )
         self.legacy_cycle_range_menu = ctk.CTkOptionMenu(
-            legacy_range_row,
+            self.legacy_range_row,
             variable=self.var_legacy_cycle_range,
             values=list(self.get_legacy_cycle_mode_options().values()),
             command=self.on_legacy_cycle_range_change,
         )
-        self.legacy_cycle_range_menu.pack(side="left", padx=5)
-
-        self.legacy_cycle_custom_date_frame = ctk.CTkFrame(legacy_range_row, fg_color="transparent")
-        ctk.CTkLabel(
+        self.legacy_cycle_custom_date_frame = ctk.CTkFrame(self.legacy_range_row, fg_color="transparent")
+        self.legacy_cycle_custom_date_label = ctk.CTkLabel(
             self.legacy_cycle_custom_date_frame,
             text=self.tr("settings.label.custom_start_date"),
-        ).pack(side="left", padx=(12, 5))
-        ctk.CTkEntry(
+        )
+        self.legacy_cycle_custom_date_entry = ctk.CTkEntry(
             self.legacy_cycle_custom_date_frame,
             textvariable=self.var_legacy_cycle_custom_date,
             width=120,
-        ).pack(side="left", padx=5)
-        ctk.CTkLabel(
+        )
+        self.legacy_cycle_custom_date_hint = ctk.CTkLabel(
             self.legacy_cycle_custom_date_frame,
             text=self.tr("common.date.iso_format"),
             text_color="gray",
-        ).pack(
-            side="left",
-            padx=5,
         )
-        if self.get_selected_legacy_cycle_mode() == "custom":
-            self.legacy_cycle_custom_date_frame.pack(side="left", padx=5)
+        self.legacy_cycle_custom_date_frame.bind(
+            "<Configure>",
+            lambda _event: self.layout_cycle_legacy_custom_date_row(),
+        )
+        self.legacy_range_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_cycle_legacy_range_row(),
+        )
+        self.layout_cycle_legacy_range_row()
 
         legacy_status_label = ctk.CTkLabel(
             legacy_frame,
@@ -2601,16 +3762,20 @@ class App(ctk.CTk):
         )
         self.btn_run_legacy_cycle.pack(anchor="w", padx=10, pady=(0, 10))
 
-        self.data_progress_bar = ctk.CTkProgressBar(scroll_frame, width=400)
-        self.data_progress_bar.pack(pady=10)
+        outputs_frame = ctk.CTkFrame(scroll_frame)
+        outputs_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        progress_frame = ctk.CTkFrame(outputs_frame, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=10, pady=(10, 0))
+        self.data_progress_bar = ctk.CTkProgressBar(progress_frame, width=400)
+        self.data_progress_bar.pack(fill="x", pady=(0, 8))
         self.data_progress_bar.set(0)
         self.data_progress_label = ctk.CTkLabel(
-            scroll_frame,
+            progress_frame,
             text=self.format_percent_text(0.0),
         )
-        self.data_progress_label.pack()
-        self.data_log_box = ctk.CTkTextbox(scroll_frame, width=600, height=300)
-        self.data_log_box.pack(fill="both", expand=True, padx=20, pady=10)
+        self.data_progress_label.pack(anchor="w")
+        self.data_log_box = ctk.CTkTextbox(outputs_frame, width=600, height=300)
+        self.data_log_box.pack(fill="both", expand=True, padx=10, pady=10)
 
     # --- Data Management View ---
     def show_data_mgmt(self):
@@ -2663,46 +3828,204 @@ class App(ctk.CTk):
             self.get_training_mode_label(self.get_selected_training_mode())
         )
 
-        mode_frame = ctk.CTkFrame(training_frame)
-        mode_frame.pack(fill="x", padx=10, pady=(10, 5))
-        ctk.CTkLabel(mode_frame, text=self.tr("data_mgmt.training.label.mode")).pack(side="left", padx=5)
+        self.training_mode_row = ctk.CTkFrame(training_frame, fg_color="transparent")
+        self.training_mode_row.pack(fill="x", padx=10, pady=(10, 5))
+        self.training_mode_label = ctk.CTkLabel(self.training_mode_row, text=self.tr("data_mgmt.training.label.mode"))
         self.training_mode_menu = ctk.CTkOptionMenu(
-            mode_frame,
+            self.training_mode_row,
             variable=self.var_training_mode,
             values=list(self.get_training_mode_options().values()),
             command=self.on_training_mode_change,
         )
-        self.training_mode_menu.pack(side="left", padx=5)
-        ctk.CTkLabel(mode_frame, textvariable=self.var_training_status, text_color="gray").pack(side="left", padx=12)
+        self.training_mode_status_label = ctk.CTkLabel(
+            self.training_mode_row,
+            textvariable=self.var_training_status,
+            text_color="gray",
+        )
+        self.training_mode_row.bind("<Configure>", lambda _event=None: self.layout_training_mode_row())
+        self.layout_training_mode_row()
 
-        self.training_plc_row = ctk.CTkFrame(training_frame)
-        ctk.CTkLabel(self.training_plc_row, text=self.tr("data_mgmt.training.label.raw_csv"), width=210, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(self.training_plc_row, textvariable=self.var_training_plc_file).pack(side="left", fill="x", expand=True, padx=5)
-        ctk.CTkButton(self.training_plc_row, text=self.tr("common.button.select"), width=90, command=self.pick_training_plc_file).pack(side="left", padx=5)
+        training_fields_frame = ctk.CTkFrame(training_frame, fg_color="transparent")
+        training_fields_frame.pack(fill="x", padx=10, pady=(0, 0))
+        training_fields_frame.grid_columnconfigure(0, weight=1)
 
-        self.training_spot_row = ctk.CTkFrame(training_frame)
-        ctk.CTkLabel(self.training_spot_row, text=self.tr("data_mgmt.training.label.spot_csv"), width=210, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(self.training_spot_row, textvariable=self.var_training_spot_file).pack(side="left", fill="x", expand=True, padx=5)
-        ctk.CTkButton(self.training_spot_row, text=self.tr("common.button.select"), width=90, command=self.pick_training_spot_file).pack(side="left", padx=5)
+        self.training_plc_row = ctk.CTkFrame(training_fields_frame, fg_color="transparent")
+        self.training_plc_row.grid(row=0, column=0, sticky="ew", pady=5)
+        self.training_plc_label = ctk.CTkLabel(
+            self.training_plc_row,
+            text=self.tr("data_mgmt.training.label.raw_csv"),
+            width=210,
+            anchor="w",
+        )
+        self.training_plc_entry = ctk.CTkEntry(self.training_plc_row, textvariable=self.var_training_plc_file)
+        self.training_plc_button = ctk.CTkButton(
+            self.training_plc_row,
+            text=self.tr("common.button.select"),
+            width=90,
+            command=self.pick_training_plc_file,
+        )
+        self.training_plc_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                self.training_plc_row,
+                self.training_plc_label,
+                self.training_plc_entry,
+                self.training_plc_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            self.training_plc_row,
+            self.training_plc_label,
+            self.training_plc_entry,
+            self.training_plc_button,
+        )
 
-        self.training_base_input_row = ctk.CTkFrame(training_frame)
-        ctk.CTkLabel(self.training_base_input_row, text=self.tr("data_mgmt.training.label.base_input"), width=210, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(self.training_base_input_row, textvariable=self.var_training_base_file).pack(side="left", fill="x", expand=True, padx=5)
-        ctk.CTkButton(self.training_base_input_row, text=self.tr("common.button.select"), width=90, command=self.pick_training_base_file).pack(side="left", padx=5)
+        self.training_spot_row = ctk.CTkFrame(training_fields_frame, fg_color="transparent")
+        self.training_spot_row.grid(row=1, column=0, sticky="ew", pady=5)
+        self.training_spot_label = ctk.CTkLabel(
+            self.training_spot_row,
+            text=self.tr("data_mgmt.training.label.spot_csv"),
+            width=210,
+            anchor="w",
+        )
+        self.training_spot_entry = ctk.CTkEntry(self.training_spot_row, textvariable=self.var_training_spot_file)
+        self.training_spot_button = ctk.CTkButton(
+            self.training_spot_row,
+            text=self.tr("common.button.select"),
+            width=90,
+            command=self.pick_training_spot_file,
+        )
+        self.training_spot_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                self.training_spot_row,
+                self.training_spot_label,
+                self.training_spot_entry,
+                self.training_spot_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            self.training_spot_row,
+            self.training_spot_label,
+            self.training_spot_entry,
+            self.training_spot_button,
+        )
 
-        self.training_base_output_row = ctk.CTkFrame(training_frame)
-        ctk.CTkLabel(self.training_base_output_row, text=self.tr("data_mgmt.training.label.base_output"), width=210, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(self.training_base_output_row, textvariable=self.var_training_base_output).pack(side="left", fill="x", expand=True, padx=5)
-        ctk.CTkButton(self.training_base_output_row, text=self.tr("common.button.save"), width=90, command=self.pick_training_base_output).pack(side="left", padx=5)
+        self.training_base_input_row = ctk.CTkFrame(training_fields_frame, fg_color="transparent")
+        self.training_base_input_row.grid(row=2, column=0, sticky="ew", pady=5)
+        self.training_base_input_label = ctk.CTkLabel(
+            self.training_base_input_row,
+            text=self.tr("data_mgmt.training.label.base_input"),
+            width=210,
+            anchor="w",
+        )
+        self.training_base_input_entry = ctk.CTkEntry(self.training_base_input_row, textvariable=self.var_training_base_file)
+        self.training_base_input_button = ctk.CTkButton(
+            self.training_base_input_row,
+            text=self.tr("common.button.select"),
+            width=90,
+            command=self.pick_training_base_file,
+        )
+        self.training_base_input_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                self.training_base_input_row,
+                self.training_base_input_label,
+                self.training_base_input_entry,
+                self.training_base_input_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            self.training_base_input_row,
+            self.training_base_input_label,
+            self.training_base_input_entry,
+            self.training_base_input_button,
+        )
 
-        self.training_dataset_output_row = ctk.CTkFrame(training_frame)
-        ctk.CTkLabel(self.training_dataset_output_row, text=self.tr("data_mgmt.training.label.dataset_output"), width=210, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(self.training_dataset_output_row, textvariable=self.var_training_dataset_output).pack(side="left", fill="x", expand=True, padx=5)
-        ctk.CTkButton(self.training_dataset_output_row, text=self.tr("common.button.save"), width=90, command=self.pick_training_dataset_output).pack(side="left", padx=5)
+        self.training_base_output_row = ctk.CTkFrame(training_fields_frame, fg_color="transparent")
+        self.training_base_output_row.grid(row=3, column=0, sticky="ew", pady=5)
+        self.training_base_output_label = ctk.CTkLabel(
+            self.training_base_output_row,
+            text=self.tr("data_mgmt.training.label.base_output"),
+            width=210,
+            anchor="w",
+        )
+        self.training_base_output_entry = ctk.CTkEntry(self.training_base_output_row, textvariable=self.var_training_base_output)
+        self.training_base_output_button = ctk.CTkButton(
+            self.training_base_output_row,
+            text=self.tr("common.button.save"),
+            width=90,
+            command=self.pick_training_base_output,
+        )
+        self.training_base_output_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                self.training_base_output_row,
+                self.training_base_output_label,
+                self.training_base_output_entry,
+                self.training_base_output_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            self.training_base_output_row,
+            self.training_base_output_label,
+            self.training_base_output_entry,
+            self.training_base_output_button,
+        )
 
-        self.training_filename_row = ctk.CTkFrame(training_frame)
-        ctk.CTkLabel(self.training_filename_row, text=self.tr("data_mgmt.training.label.filename_hint"), width=210, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(self.training_filename_row, textvariable=self.var_training_filename_hint).pack(side="left", fill="x", expand=True, padx=5)
+        self.training_dataset_output_row = ctk.CTkFrame(training_fields_frame, fg_color="transparent")
+        self.training_dataset_output_row.grid(row=4, column=0, sticky="ew", pady=5)
+        self.training_dataset_output_label = ctk.CTkLabel(
+            self.training_dataset_output_row,
+            text=self.tr("data_mgmt.training.label.dataset_output"),
+            width=210,
+            anchor="w",
+        )
+        self.training_dataset_output_entry = ctk.CTkEntry(self.training_dataset_output_row, textvariable=self.var_training_dataset_output)
+        self.training_dataset_output_button = ctk.CTkButton(
+            self.training_dataset_output_row,
+            text=self.tr("common.button.save"),
+            width=90,
+            command=self.pick_training_dataset_output,
+        )
+        self.training_dataset_output_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                self.training_dataset_output_row,
+                self.training_dataset_output_label,
+                self.training_dataset_output_entry,
+                self.training_dataset_output_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            self.training_dataset_output_row,
+            self.training_dataset_output_label,
+            self.training_dataset_output_entry,
+            self.training_dataset_output_button,
+        )
+
+        self.training_filename_row = ctk.CTkFrame(training_fields_frame, fg_color="transparent")
+        self.training_filename_row.grid(row=5, column=0, sticky="ew", pady=5)
+        self.training_filename_label = ctk.CTkLabel(
+            self.training_filename_row,
+            text=self.tr("data_mgmt.training.label.filename_hint"),
+            width=210,
+            anchor="w",
+        )
+        self.training_filename_entry = ctk.CTkEntry(self.training_filename_row, textvariable=self.var_training_filename_hint)
+        self.training_filename_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_row(
+                self.training_filename_row,
+                self.training_filename_label,
+                self.training_filename_entry,
+            ),
+        )
+        self.layout_responsive_labeled_entry_row(
+            self.training_filename_row,
+            self.training_filename_label,
+            self.training_filename_entry,
+        )
 
         self.btn_run_training_build = ctk.CTkButton(
             training_frame,
@@ -2731,18 +4054,62 @@ class App(ctk.CTk):
         archive_help_label.pack(fill="x", anchor="w", padx=10)
         self.bind_label_wrap(archive_help_label, horizontal_padding=30, min_wraplength=420)
 
-        archive_date_row = ctk.CTkFrame(archive_frame)
-        archive_date_row.pack(fill="x", padx=10, pady=(10, 5))
-        ctk.CTkLabel(archive_date_row, text=self.tr("data_mgmt.archive.label.before_date"), width=180, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(archive_date_row, textvariable=self.var_archive_before_date, width=140).pack(side="left", padx=5)
-        ctk.CTkLabel(archive_date_row, text=self.tr("common.date.iso_format"), text_color="gray").pack(side="left", padx=5)
-        ctk.CTkLabel(archive_date_row, textvariable=self.var_archive_status, text_color="gray").pack(side="left", padx=12)
+        self.archive_date_row = ctk.CTkFrame(archive_frame, fg_color="transparent")
+        self.archive_date_row.pack(fill="x", padx=10, pady=(10, 5))
+        self.archive_date_label = ctk.CTkLabel(
+            self.archive_date_row,
+            text=self.tr("data_mgmt.archive.label.before_date"),
+            width=180,
+            anchor="w",
+        )
+        self.archive_date_entry = ctk.CTkEntry(
+            self.archive_date_row,
+            textvariable=self.var_archive_before_date,
+            width=140,
+        )
+        self.archive_date_hint = ctk.CTkLabel(
+            self.archive_date_row,
+            text=self.tr("common.date.iso_format"),
+            text_color="gray",
+        )
+        self.archive_status_label = ctk.CTkLabel(
+            self.archive_date_row,
+            textvariable=self.var_archive_status,
+            text_color="gray",
+        )
+        self.archive_date_row.bind("<Configure>", lambda _event=None: self.layout_archive_date_row())
+        self.layout_archive_date_row()
 
-        archive_dir_row = ctk.CTkFrame(archive_frame)
+        archive_dir_row = ctk.CTkFrame(archive_frame, fg_color="transparent")
         archive_dir_row.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(archive_dir_row, text=self.tr("data_mgmt.archive.label.archive_dir"), width=180, anchor="w").pack(side="left", padx=5)
-        ctk.CTkEntry(archive_dir_row, textvariable=self.var_archive_dir).pack(side="left", fill="x", expand=True, padx=5)
-        ctk.CTkButton(archive_dir_row, text=self.tr("common.button.select"), width=90, command=self.pick_archive_dir).pack(side="left", padx=5)
+        archive_dir_label = ctk.CTkLabel(
+            archive_dir_row,
+            text=self.tr("data_mgmt.archive.label.archive_dir"),
+            width=180,
+            anchor="w",
+        )
+        archive_dir_entry = ctk.CTkEntry(archive_dir_row, textvariable=self.var_archive_dir)
+        archive_dir_button = ctk.CTkButton(
+            archive_dir_row,
+            text=self.tr("common.button.select"),
+            width=90,
+            command=self.pick_archive_dir,
+        )
+        archive_dir_row.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_labeled_entry_action_row(
+                archive_dir_row,
+                archive_dir_label,
+                archive_dir_entry,
+                archive_dir_button,
+            ),
+        )
+        self.layout_responsive_labeled_entry_action_row(
+            archive_dir_row,
+            archive_dir_label,
+            archive_dir_entry,
+            archive_dir_button,
+        )
 
         archive_dir_help_label = ctk.CTkLabel(
             archive_frame,
@@ -2777,25 +4144,43 @@ class App(ctk.CTk):
             text=self.tr("data_mgmt.archive.button.preview"),
             command=self.on_run_archive_preview,
         )
-        self.btn_archive_preview.pack(side="left", padx=5)
         self.btn_archive_export = ctk.CTkButton(
             archive_button_row,
             text=self.tr("data_mgmt.archive.button.run"),
             command=self.on_run_archive_export,
             fg_color="#2CC985",
         )
-        self.btn_archive_export.pack(side="left", padx=5)
+        archive_button_row.bind(
+            "<Configure>",
+            lambda _event=None: self.layout_responsive_button_row(
+                archive_button_row,
+                [
+                    self.btn_archive_preview,
+                    self.btn_archive_export,
+                ],
+            ),
+        )
+        self.layout_responsive_button_row(
+            archive_button_row,
+            [
+                self.btn_archive_preview,
+                self.btn_archive_export,
+            ],
+        )
         
-        # Progress bar
-        self.data_progress_bar = ctk.CTkProgressBar(scroll_frame, width=400)
-        self.data_progress_bar.pack(pady=10)
+        outputs_frame = ctk.CTkFrame(scroll_frame)
+        outputs_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        progress_frame = ctk.CTkFrame(outputs_frame, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=10, pady=(10, 0))
+        self.data_progress_bar = ctk.CTkProgressBar(progress_frame, width=400)
+        self.data_progress_bar.pack(fill="x", pady=(0, 8))
         self.data_progress_bar.set(0)
         
-        self.data_progress_label = ctk.CTkLabel(scroll_frame, text=self.format_percent_text(0.0))
-        self.data_progress_label.pack()
+        self.data_progress_label = ctk.CTkLabel(progress_frame, text=self.format_percent_text(0.0))
+        self.data_progress_label.pack(anchor="w")
         
-        self.data_log_box = ctk.CTkTextbox(scroll_frame, width=600, height=300)
-        self.data_log_box.pack(fill="both", expand=True, padx=20, pady=10)
+        self.data_log_box = ctk.CTkTextbox(outputs_frame, width=600, height=300)
+        self.data_log_box.pack(fill="both", expand=True, padx=10, pady=10)
         
     def on_run_canonical_refresh(self):
         self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
@@ -2817,22 +4202,22 @@ class App(ctk.CTk):
                     self.log_to_data_box,
                     self.update_data_progress,
                 )
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.var_cycle_ops_status.set(
                         self.tr("cycle_ops.canonical.status.completed", cycle_count=result.stats.cycle_count)
                     ),
                 )
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.show_info("dialog.completed.title", "cycle_ops.canonical.dialog.completed"),
                 )
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.canonical.status.failed")))
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.canonical.status.failed")))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2856,22 +4241,22 @@ class App(ctk.CTk):
                     self.log_to_data_box,
                     self.update_data_progress,
                 )
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.var_cycle_ops_status.set(
                         self.tr("cycle_ops.snapshot.status.completed", row_count=result.affected_row_count)
                     ),
                 )
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.show_info("dialog.completed.title", "cycle_ops.snapshot.dialog.completed"),
                 )
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.snapshot.status.failed")))
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.snapshot.status.failed")))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2894,13 +4279,13 @@ class App(ctk.CTk):
                 for line in format_cycle_health_report(report, self.tr_map):
                     self.log_to_data_box(line)
                 self.update_data_progress(1.0)
-                self.after(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.health.status.completed")))
+                self.schedule_gui_callback(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.health.status.completed")))
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.health.status.failed")))
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: self.var_cycle_ops_status.set(self.tr("cycle_ops.health.status.failed")))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2910,10 +4295,7 @@ class App(ctk.CTk):
         reverse_options = {label: key for key, label in legacy_mode_options.items()}
         if choice in reverse_options:
             selected_mode = reverse_options[choice]
-        if selected_mode == "custom":
-            self.legacy_cycle_custom_date_frame.pack(side="left", padx=5)
-            return
-        self.legacy_cycle_custom_date_frame.pack_forget()
+        self.layout_cycle_legacy_range_row()
 
     def on_run_legacy_cycle(self):
         self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
@@ -2963,21 +4345,21 @@ class App(ctk.CTk):
                 else:
                     custom_date = request.custom_date if request.mode == "custom" else None
                     processor.run_range(request.mode, custom_date)
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.var_legacy_cycle_status.set(status_text),
                 )
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.var_legacy_cycle_status.set(
                         self.tr("cycle_ops.legacy.status.failed", mode=mode_label)
                     ),
                 )
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2991,25 +4373,25 @@ class App(ctk.CTk):
         is_v1_mode = selected_mode in ("build-all", "build-v1")
 
         if is_base_mode:
-            self.training_plc_row.pack(fill="x", padx=10, pady=5)
-            self.training_spot_row.pack(fill="x", padx=10, pady=5)
-            self.training_base_output_row.pack(fill="x", padx=10, pady=5)
-            self.training_filename_row.pack(fill="x", padx=10, pady=5)
+            self.training_plc_row.grid()
+            self.training_spot_row.grid()
+            self.training_base_output_row.grid()
+            self.training_filename_row.grid()
         else:
-            self.training_plc_row.pack_forget()
-            self.training_spot_row.pack_forget()
-            self.training_base_output_row.pack_forget()
-            self.training_filename_row.pack_forget()
+            self.training_plc_row.grid_remove()
+            self.training_spot_row.grid_remove()
+            self.training_base_output_row.grid_remove()
+            self.training_filename_row.grid_remove()
 
         if selected_mode == "build-v1":
-            self.training_base_input_row.pack(fill="x", padx=10, pady=5)
+            self.training_base_input_row.grid()
         else:
-            self.training_base_input_row.pack_forget()
+            self.training_base_input_row.grid_remove()
 
         if is_v1_mode:
-            self.training_dataset_output_row.pack(fill="x", padx=10, pady=5)
+            self.training_dataset_output_row.grid()
         else:
-            self.training_dataset_output_row.pack_forget()
+            self.training_dataset_output_row.grid_remove()
 
         self.var_training_status.set(
             self.tr(
@@ -3050,13 +4432,13 @@ class App(ctk.CTk):
                 self.log_to_data_box(self.tr("data_mgmt.training.log.completed"))
                 for written_path in written_paths:
                     self.log_to_data_box(self.tr("data_mgmt.training.log.output_path", output_path=written_path))
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.var_training_status.set(
                         self.tr("data_mgmt.training.status.completed", mode=mode_label)
                     ),
                 )
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: messagebox.showinfo(
                         self.tr("dialog.completed.title"),
@@ -3068,15 +4450,15 @@ class App(ctk.CTk):
                 )
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.var_training_status.set(
                         self.tr("data_mgmt.training.status.failed", mode=mode_label)
                     ),
                 )
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3105,8 +4487,8 @@ class App(ctk.CTk):
                     self.update_data_progress,
                     self.tr_map,
                 )
-                self.after(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.preview_completed")))
-                self.after(
+                self.schedule_gui_callback(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.preview_completed")))
+                self.schedule_gui_callback(
                     0,
                     lambda: messagebox.showinfo(
                         self.tr("dialog.completed.title"),
@@ -3115,10 +4497,10 @@ class App(ctk.CTk):
                 )
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.preview_failed")))
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.preview_failed")))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3165,8 +4547,8 @@ class App(ctk.CTk):
                         self.update_data_progress,
                         self.tr_map,
                     )
-                self.after(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.completed")))
-                self.after(
+                self.schedule_gui_callback(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.completed")))
+                self.schedule_gui_callback(
                     0,
                     lambda: messagebox.showinfo(
                         self.tr("dialog.completed.title"),
@@ -3175,10 +4557,10 @@ class App(ctk.CTk):
                 )
             except Exception as error:
                 self.log_to_data_box(self.tr("common.log.error", error=error))
-                self.after(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.failed")))
-                self.after(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.failed")))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
             finally:
-                self.after(0, self.enable_data_mgmt_buttons)
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3278,7 +4660,7 @@ class App(ctk.CTk):
         return True
         
     def log_to_data_box(self, msg):
-        self.after(0, lambda: self._append_data_msg(msg))
+        self.schedule_gui_callback(0, lambda: self._append_data_msg(msg))
         
     def _append_data_msg(self, msg):
         if hasattr(self, 'data_log_box') and self.data_log_box.winfo_exists():
@@ -3291,7 +4673,7 @@ class App(ctk.CTk):
             if hasattr(self, 'data_progress_bar') and self.data_progress_bar.winfo_exists():
                 self.data_progress_bar.set(value)
                 self.data_progress_label.configure(text=self.format_percent_text(value))
-        self.after(0, _update)
+        self.schedule_gui_callback(0, _update)
 
     def refresh_runtime_context_labels(self, supabase_url: str, edge_url: str):
         context_text = build_runtime_context_text(
@@ -3316,6 +4698,7 @@ class App(ctk.CTk):
             'SUPABASE_ANON_KEY': self.cfg.get('SUPABASE_ANON_KEY', ''),
             'EDGE_FUNCTION_URL': self.cfg.get('EDGE_FUNCTION_URL', ''),
             'PLC_DIR': self.cfg.get('PLC_DIR', ''),
+            'WSL_VHDX_PATH': self.cfg.get('WSL_VHDX_PATH', ''),
             'AUTO_UPLOAD': str(self.cfg.get('AUTO_UPLOAD', 'false')).lower(),
             'SMART_SYNC': str(self.cfg.get('SMART_SYNC', 'true')).lower(),
             'UI_LANGUAGE': normalize_language_code(
@@ -3332,6 +4715,7 @@ class App(ctk.CTk):
             'SUPABASE_ANON_KEY': self.var_anon.get(),
             'EDGE_FUNCTION_URL': normalize_edge_url(self.var_edge.get(), self.var_url.get()),
             'PLC_DIR': self.var_plc.get(),
+            'WSL_VHDX_PATH': self.var_wsl_vhdx_path.get(),
             'AUTO_UPLOAD': str(self.var_auto_upload.get()).lower(),
             'SMART_SYNC': str(self.var_smart_sync.get()).lower(),
             'UI_LANGUAGE': normalize_language_code(self.var_ui_language.get()),
@@ -3407,6 +4791,7 @@ class App(ctk.CTk):
             self.var_anon,
             self.var_edge,
             self.var_plc,
+            self.var_wsl_vhdx_path,
             self.var_smart_sync,
             self.var_auto_upload,
             self.var_ui_language,
@@ -3669,6 +5054,13 @@ class App(ctk.CTk):
     def pick_plc(self):
         d = filedialog.askdirectory()
         if d: self.var_plc.set(d)
+
+    def pick_wsl_vhdx(self):
+        selected_path = filedialog.askopenfilename(
+            filetypes=[("WSL VHDX", "*.vhdx"), ("All Files", "*.*")],
+        )
+        if selected_path:
+            self.var_wsl_vhdx_path.set(selected_path)
         
     # def pick_temp(self):
     #     d = filedialog.askdirectory()
@@ -3698,13 +5090,13 @@ class App(ctk.CTk):
 
         is_mapped = self.local_supabase_progress.winfo_manager() != ""
         if is_visible and not is_mapped:
-            self.local_supabase_progress.pack(pady=(0, 12), padx=10, anchor="w")
+            self.local_supabase_progress.grid(row=5, column=0, sticky="w", pady=(0, 12))
             self.local_supabase_progress.start()
             return
 
         if not is_visible and is_mapped:
             self.local_supabase_progress.stop()
-            self.local_supabase_progress.pack_forget()
+            self.local_supabase_progress.grid_remove()
 
     def set_local_supabase_status_override(self, status_text: str, status_color: str):
         self.local_supabase_status_override = LocalSupabaseStatusOverride(
@@ -3867,11 +5259,19 @@ class App(ctk.CTk):
         supabase_url = self.cfg.get("SUPABASE_URL", "")
         raw_snapshot = self.wsl_storage_raw_snapshot
         has_refresh_error = self.wsl_storage_error_detail.strip() != ""
+        default_used_label_text = self.tr("dashboard.wsl_storage.label.used")
+        default_available_label_text = self.tr("dashboard.wsl_storage.label.available")
+        default_total_label_text = self.tr("dashboard.wsl_storage.label.total")
+        default_usage_label_text = self.tr("dashboard.wsl_storage.label.usage")
         if not is_local_supabase_target(supabase_url):
             return WslStorageSnapshot(
                 state="unavailable",
                 status_text=self.tr("dashboard.wsl_storage.badge.unavailable"),
                 status_color=_resolve_wsl_storage_status_color("unavailable"),
+                used_label_text=default_used_label_text,
+                available_label_text=default_available_label_text,
+                total_label_text=default_total_label_text,
+                usage_label_text=default_usage_label_text,
                 used_text="—",
                 available_text="—",
                 total_text="—",
@@ -3893,6 +5293,10 @@ class App(ctk.CTk):
                 state="error",
                 status_text=self.tr("dashboard.wsl_storage.badge.error"),
                 status_color=_resolve_wsl_storage_status_color("error"),
+                used_label_text=default_used_label_text,
+                available_label_text=default_available_label_text,
+                total_label_text=default_total_label_text,
+                usage_label_text=default_usage_label_text,
                 used_text="—",
                 available_text="—",
                 total_text="—",
@@ -3925,6 +5329,10 @@ class App(ctk.CTk):
                 state=badge_state,
                 status_text=self.tr(f"dashboard.wsl_storage.badge.{badge_state}"),
                 status_color=_resolve_wsl_storage_status_color(badge_state),
+                used_label_text=default_used_label_text,
+                available_label_text=default_available_label_text,
+                total_label_text=default_total_label_text,
+                usage_label_text=default_usage_label_text,
                 used_text="—",
                 available_text="—",
                 total_text="—",
@@ -3961,6 +5369,7 @@ class App(ctk.CTk):
         vhdx_bytes = _coerce_optional_int(_extract_source_value(host_metrics, "file_size_bytes"))
         host_free_bytes = _coerce_optional_int(_extract_source_value(host_metrics, "drive_free_bytes"))
         source_name = str(_extract_source_value(host_metrics, "source") or "").strip()
+        source_path = str(_extract_source_value(host_metrics, "vhdx_path") or "").strip()
         raw_issues = _extract_source_value(raw_snapshot, "issues")
         issue_messages: list[str] = []
         if isinstance(raw_issues, (list, tuple)):
@@ -3987,44 +5396,93 @@ class App(ctk.CTk):
             detail_lines.append(
                 f"{self.tr('dashboard.wsl_storage.label.distro')}: {distro_name}"
             )
+        if used_bytes is not None:
+            detail_lines.append(
+                f"{self.tr('dashboard.wsl_storage.label.guest_used')}: {_format_storage_bytes(used_bytes)}"
+            )
+        if available_bytes is not None:
+            detail_lines.append(
+                f"{self.tr('dashboard.wsl_storage.label.guest_available')}: {_format_storage_bytes(available_bytes)}"
+            )
+        if total_bytes is not None:
+            detail_lines.append(
+                f"{self.tr('dashboard.wsl_storage.label.guest_total')}: {_format_storage_bytes(total_bytes)}"
+            )
 
         source_text = self.tr("dashboard.wsl_storage.source.unavailable")
+        translated_source_text = source_text
         if source_name in {"config_override", "registry"}:
-            source_text = self.tr(f"dashboard.wsl_storage.source.{source_name}")
+            translated_source_text = self.tr(f"dashboard.wsl_storage.source.{source_name}")
+            source_text = translated_source_text
+        compact_source_path = _format_compact_path(source_path, 52)
+        if compact_source_path != "":
+            source_text = compact_source_path
         detail_lines.append(
-            f"{self.tr('dashboard.wsl_storage.label.source')}: {source_text}"
+            f"{self.tr('dashboard.wsl_storage.label.source')}: {translated_source_text}"
         )
+        if source_path != "":
+            detail_lines.append(source_path)
         if issue_messages != []:
             detail_lines.extend(issue_messages)
 
         collected_at = _extract_source_value(raw_snapshot, "collected_at")
+        used_label_text = default_used_label_text
+        available_label_text = default_available_label_text
+        total_label_text = default_total_label_text
+        usage_label_text = default_usage_label_text
+        used_text = _format_storage_bytes(used_bytes)
+        available_text = _format_storage_bytes(available_bytes)
+        total_text = _format_storage_bytes(total_bytes)
+        usage_text = _format_storage_ratio(usage_ratio)
+        progress_value = None if usage_ratio is None else max(0.0, min(1.0, usage_ratio))
+
+        if vhdx_bytes is not None and host_free_bytes is not None:
+            host_total_bytes = vhdx_bytes + host_free_bytes
+            host_usage_ratio = None if host_total_bytes <= 0 else vhdx_bytes / host_total_bytes
+            used_label_text = self.tr("dashboard.wsl_storage.label.host_vhdx_size")
+            available_label_text = self.tr("dashboard.wsl_storage.label.host_drive_free")
+            total_label_text = self.tr("dashboard.wsl_storage.label.host_capacity_total")
+            usage_label_text = self.tr("dashboard.wsl_storage.label.host_capacity_usage")
+            used_text = _format_storage_bytes(vhdx_bytes)
+            available_text = _format_storage_bytes(host_free_bytes)
+            total_text = _format_storage_bytes(host_total_bytes)
+            usage_text = _format_storage_ratio(host_usage_ratio)
+            progress_value = None if host_usage_ratio is None else max(0.0, min(1.0, host_usage_ratio))
+
         return WslStorageSnapshot(
             state=badge_state,
             status_text=self.tr(f"dashboard.wsl_storage.badge.{badge_state}"),
             status_color=_resolve_wsl_storage_status_color(badge_state),
-            used_text=_format_storage_bytes(used_bytes),
-            available_text=_format_storage_bytes(available_bytes),
-            total_text=_format_storage_bytes(total_bytes),
-            usage_text="—" if usage_ratio is None else f"{usage_ratio * 100:.0f}%",
+            used_label_text=used_label_text,
+            available_label_text=available_label_text,
+            total_label_text=total_label_text,
+            usage_label_text=usage_label_text,
+            used_text=used_text,
+            available_text=available_text,
+            total_text=total_text,
+            usage_text=usage_text,
             vhdx_text=_format_storage_bytes(vhdx_bytes),
             host_free_text=_format_storage_bytes(host_free_bytes),
             distro_text=distro_name if distro_name != "" else "—",
             source_text=source_text,
             detail_text="\n".join(detail_lines),
             last_updated_text=_format_storage_timestamp(collected_at),
-            progress_value=None if usage_ratio is None else max(0.0, min(1.0, usage_ratio)),
+            progress_value=progress_value,
             is_refreshing=self.is_wsl_storage_refreshing,
             is_partial=is_partial,
             is_available=guest_metrics is not None,
         )
 
     def render_wsl_storage_card(self) -> None:
+        snapshot = self.build_wsl_storage_ui_snapshot()
+        self.wsl_storage_snapshot = snapshot
         if not hasattr(self, "wsl_storage_frame") or not self.wsl_storage_frame.winfo_exists():
-            self.wsl_storage_snapshot = self.build_wsl_storage_ui_snapshot()
+            self.rendered_wsl_storage_snapshot = None
             return
 
-        self.wsl_storage_snapshot = self.build_wsl_storage_ui_snapshot()
-        snapshot = self.wsl_storage_snapshot
+        if self.rendered_wsl_storage_snapshot == snapshot:
+            return
+
         badge_fg_color = snapshot.status_color
         badge_text_color = "#101010" if snapshot.status_color == "#E5C07B" else "white"
         progress_value = snapshot.progress_value
@@ -4046,6 +5504,10 @@ class App(ctk.CTk):
         self.btn_refresh_wsl_storage.configure(
             state="disabled" if self.is_wsl_storage_refreshing else "normal"
         )
+        self.lbl_wsl_storage_used_label.configure(text=snapshot.used_label_text)
+        self.lbl_wsl_storage_available_label.configure(text=snapshot.available_label_text)
+        self.lbl_wsl_storage_total_label.configure(text=snapshot.total_label_text)
+        self.lbl_wsl_storage_usage_label.configure(text=snapshot.usage_label_text)
         self.lbl_wsl_storage_used_value.configure(text=snapshot.used_text)
         self.lbl_wsl_storage_available_value.configure(text=snapshot.available_text)
         self.lbl_wsl_storage_total_value.configure(text=snapshot.total_text)
@@ -4062,6 +5524,7 @@ class App(ctk.CTk):
         self.lbl_wsl_storage_vhdx_value.configure(text=snapshot.vhdx_text)
         self.lbl_wsl_storage_host_free_value.configure(text=snapshot.host_free_text)
         self.lbl_wsl_storage_meta_value.configure(text=snapshot.last_updated_text)
+        self.rendered_wsl_storage_snapshot = snapshot
 
     def request_wsl_storage_refresh(self) -> None:
         if self.is_wsl_storage_refreshing:
@@ -4096,7 +5559,7 @@ class App(ctk.CTk):
                     self.wsl_storage_error_detail = ""
                 self.render_wsl_storage_card()
 
-            self.after(0, _apply)
+            self.schedule_gui_callback(0, _apply)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4375,7 +5838,7 @@ class App(ctk.CTk):
                         self.tr("dashboard.local_supabase.runtime.studio_port_not_open")
                     )
 
-                self.after(
+                self.schedule_gui_callback(
                     0,
                     lambda: self.show_info(
                         "dialog.completed.title",
@@ -4387,7 +5850,7 @@ class App(ctk.CTk):
                     try:
                         self.open_local_supabase_studio(runtime)
                     except Exception as error:
-                        self.after(
+                        self.schedule_gui_callback(
                             0,
                             lambda: self.show_studio_open_error(
                                 runtime,
@@ -4403,12 +5866,12 @@ class App(ctk.CTk):
                     self.resolve_local_supabase_failure_message(str(error)),
                     "#E06C75",
                 )
-                self.after(0, lambda: messagebox.showerror(self.tr("dashboard.local_supabase.dialog.start_failed.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dashboard.local_supabase.dialog.start_failed.title"), str(error)))
             finally:
                 self.is_supabase_starting = False
                 self.pending_open_studio = False
-                self.after(0, self.refresh_local_supabase_button)
-                self.after(0, self.request_wsl_storage_refresh)
+                self.schedule_gui_callback(0, self.refresh_local_supabase_button)
+                self.schedule_gui_callback(0, self.request_wsl_storage_refresh)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4467,7 +5930,7 @@ class App(ctk.CTk):
                 self.set_local_supabase_status_override(self.tr("dashboard.local_supabase.status.stopped"), "gray")
                 self.log_to_local_supabase_outputs(self.tr("dashboard.local_supabase.log.stop_completed"))
                 if not self.pending_close_after_supabase_stop:
-                    self.after(
+                    self.schedule_gui_callback(
                         0,
                         lambda: self.show_info(
                             "dialog.completed.title",
@@ -4479,15 +5942,15 @@ class App(ctk.CTk):
                     self.tr("dashboard.local_supabase.log.stop_failed", error=error)
                 )
                 self.set_local_supabase_status_override(self.tr("dashboard.local_supabase.failure.stop_failed"), "#E06C75")
-                self.after(0, lambda: messagebox.showerror(self.tr("dashboard.local_supabase.dialog.stop_failed.title"), str(error)))
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dashboard.local_supabase.dialog.stop_failed.title"), str(error)))
             finally:
                 should_close_application = stop_succeeded and self.pending_close_after_supabase_stop
                 self.is_supabase_stopping = False
                 self.pending_close_after_supabase_stop = False
-                self.after(0, self.refresh_local_supabase_button)
-                self.after(0, self.request_wsl_storage_refresh)
+                self.schedule_gui_callback(0, self.refresh_local_supabase_button)
+                self.schedule_gui_callback(0, self.request_wsl_storage_refresh)
                 if should_close_application:
-                    self.after(0, self.close_application)
+                    self.schedule_gui_callback(0, self.close_application)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4512,7 +5975,7 @@ class App(ctk.CTk):
             'CUSTOM_DATE_END': self.var_custom_date_end.get(),
             'MTIME_LAG_MIN': self.cfg.get('MTIME_LAG_MIN', '15'),
             'CHECK_LOCK': self.cfg.get('CHECK_LOCK', 'true'),
-            'WSL_VHDX_PATH': self.cfg.get('WSL_VHDX_PATH', ''),
+            'WSL_VHDX_PATH': self.var_wsl_vhdx_path.get(),
         }
         ok_cfg, missing = validate_config(vals)
         if not ok_cfg:
@@ -4566,7 +6029,7 @@ class App(ctk.CTk):
             pass
         finally:
             # Schedule next check
-            self.after(100, self.check_log_queue)
+            self.schedule_gui_callback(100, self.check_log_queue)
 
     def log(self, msg, level="INFO"):
         """Thread-safe log with timestamp/level, shown in GUI and printed to console."""
@@ -4576,64 +6039,80 @@ class App(ctk.CTk):
         self.log_queue.put(full)
         print(full) # Always print to console
 
-    def update_dashboard_loop(self):
+    def update_dashboard_loop(self, dashboard_view_generation: int) -> None:
+        self.dashboard_update_after_id = None
+        if dashboard_view_generation != self.dashboard_view_generation:
+            return
+        if self.current_view != "dashboard":
+            return
         if not hasattr(self, 'hero_frame') or not self.hero_frame.winfo_exists():
             return # Dashboard not active
-            
-        # Update Progress
-        total = self.total_files if self.total_files > 0 else 1
-        pct = self.processed_count / total
-        self.prog_bar.set(pct)
-        self.lbl_prog_text.configure(
-            text=self.format_progress_summary(
-                pct,
-                self.processed_count,
-                self.total_files,
-            )
-        )
-        
-        if self.is_uploading:
-            if not self.pause_event.is_set():
-                self.lbl_big_status.configure(text=self.tr("common.status.paused"), text_color="#E5C07B")
-                self.status_label.configure(text=self.tr("common.status.paused"), text_color="#E5C07B")
-            else:
-                self.lbl_big_status.configure(text=self.tr("common.status.uploading"), text_color="#3B8ED0")
-                self.status_label.configure(text=self.tr("common.status.running"), text_color="#2CC985")
-        else:
-            self.lbl_big_status.configure(
-                text=self.upload_dashboard_status_text,
-                text_color=self.upload_dashboard_status_color,
-            )
-            self.status_label.configure(
-                text=self.upload_dashboard_status_text,
-                text_color=self.upload_dashboard_status_color,
-            )
 
-        # Update Active Tasks List
-        with self.progress_lock:
-            current_files = set(self.active_progress.keys())
-            
-            # Remove old
-            for task_key in list(self.task_labels.keys()):
-                if task_key not in current_files:
-                    self.task_labels[task_key].destroy()
-                    del self.task_labels[task_key]
-            
-            # Add/Update new
-            for task_key, progress_pct in self.active_progress.items():
-                text = self.tr(
-                    "dashboard.active_task.progress",
-                    task_key=task_key,
-                    percent=int(progress_pct),
+        self.is_dashboard_update_loop_running = True
+        try:
+            # Update Progress
+            total = self.total_files if self.total_files > 0 else 1
+            pct = self.processed_count / total
+            self.prog_bar.set(pct)
+            self.lbl_prog_text.configure(
+                text=self.format_progress_summary(
+                    pct,
+                    self.processed_count,
+                    self.total_files,
                 )
-                if task_key not in self.task_labels:
-                    lbl = ctk.CTkLabel(self.tasks_frame, text=text, anchor="w")
-                    lbl.pack(fill="x", padx=5, pady=2)
-                    self.task_labels[task_key] = lbl
-                else:
-                    self.task_labels[task_key].configure(text=text)
+            )
 
-        self.after(200, self.update_dashboard_loop)
+            if self.is_uploading:
+                if not self.pause_event.is_set():
+                    self.lbl_big_status.configure(text=self.tr("common.status.paused"), text_color="#E5C07B")
+                    self.status_label.configure(text=self.tr("common.status.paused"), text_color="#E5C07B")
+                else:
+                    self.lbl_big_status.configure(text=self.tr("common.status.uploading"), text_color="#3B8ED0")
+                    self.status_label.configure(text=self.tr("common.status.running"), text_color="#2CC985")
+            else:
+                self.lbl_big_status.configure(
+                    text=self.upload_dashboard_status_text,
+                    text_color=self.upload_dashboard_status_color,
+                )
+                self.status_label.configure(
+                    text=self.upload_dashboard_status_text,
+                    text_color=self.upload_dashboard_status_color,
+                )
+
+            # Update Active Tasks List
+            with self.progress_lock:
+                current_files = set(self.active_progress.keys())
+                
+                # Remove old
+                for task_key in list(self.task_labels.keys()):
+                    if task_key not in current_files:
+                        self.task_labels[task_key].destroy()
+                        del self.task_labels[task_key]
+                
+                # Add/Update new
+                for task_key, progress_state in self.active_progress.items():
+                    done, total = progress_state
+                    if total > 0:
+                        progress_pct = (done / total) * 100.0
+                        text = self.tr(
+                            "dashboard.active_task.progress",
+                            task_key=task_key,
+                            percent=int(progress_pct),
+                        )
+                    else:
+                        text = f"{task_key} - {done:,}행 처리"
+                    if task_key not in self.task_labels:
+                        lbl = ctk.CTkLabel(self.tasks_frame, text=text, anchor="w")
+                        lbl.pack(fill="x", padx=5, pady=2)
+                        self.task_labels[task_key] = lbl
+                    else:
+                        self.task_labels[task_key].configure(text=text)
+        finally:
+            self.is_dashboard_update_loop_running = False
+
+        if dashboard_view_generation != self.dashboard_view_generation:
+            return
+        self.schedule_dashboard_update_loop(200)
 
     def on_preview(self):
         self.show_logs()
@@ -4696,10 +6175,10 @@ class App(ctk.CTk):
         self.upload_dashboard_status_color = status_color
 
     def _schedule_upload_dashboard_status(self, status_text: str, status_color: str):
-        self.after(0, self._apply_upload_dashboard_status, status_text, status_color)
+        self.schedule_gui_callback(0, self._apply_upload_dashboard_status, status_text, status_color)
 
     def _schedule_upload_button_state(self, is_uploading: bool, pause_enabled: bool, pause_text: str, start_enabled: bool):
-        self.after(0, self._apply_upload_button_state, is_uploading, pause_enabled, pause_text, start_enabled)
+        self.schedule_gui_callback(0, self._apply_upload_button_state, is_uploading, pause_enabled, pause_text, start_enabled)
 
     def on_start(self):
         self.show_dashboard()
@@ -4831,12 +6310,9 @@ class App(ctk.CTk):
             )
 
             def on_file_progress(folder: str, filename: str, done: int, total: int) -> None:
-                if total <= 0:
-                    return
-                progress_pct = (done / total) * 100.0
                 task_key = f"{folder}/{filename}"
                 with self.progress_lock:
-                    self.active_progress[task_key] = progress_pct
+                    self.active_progress[task_key] = (done, total)
 
             def on_file_complete(folder: str, filename: str, ok: bool) -> None:
                 task_key = f"{folder}/{filename}"
@@ -4931,11 +6407,13 @@ def list_candidates(
 
 if __name__ == '__main__':
     import signal
-    
+
+    app = App()
+
     def handle_sigint(signum, frame):
-        print("\nForce exiting...")
-        os._exit(0)
-        
+        print("\nClosing application...")
+        app.close_application()
+
     signal.signal(signal.SIGINT, handle_sigint)
-    App().mainloop()
+    app.mainloop()
 

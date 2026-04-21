@@ -12,7 +12,7 @@ from .state import build_file_state_key, set_resume_offset
 
 import time
 
-DEFAULT_UPLOAD_BATCH_SIZE: int = 500
+DEFAULT_UPLOAD_BATCH_SIZE: int = 2000
 DEFAULT_UPLOAD_CHUNK_SIZE: int = 10000
 DEFAULT_UPLOAD_MAX_WORKERS: int = 4
 DEFAULT_PROGRESS_UPDATE_INTERVAL_SECONDS: float = 0.25
@@ -111,15 +111,6 @@ def _build_upload_headers(anon_key: str) -> dict[str, str]:
     }
 
 
-def _count_data_rows(path: str) -> int:
-    try:
-        with open(path, "rb") as file_handle:
-            row_count = sum(1 for _ in file_handle) - 1
-    except Exception:
-        return 0
-    return max(0, row_count)
-
-
 def _load_chunks(
     builder: Callable[[str, str], pd.DataFrame],
     path: str,
@@ -168,15 +159,17 @@ def _apply_resume_offset(
 
 
 def _should_report_progress(
-    total_rows: int,
+    total_rows: int | None,
     current_global_idx: int,
     last_progress_report_time: float,
     last_progress_reported_rows: int,
     current_time: float,
     progress_update_interval_seconds: float,
 ) -> bool:
-    if total_rows <= 0:
-        return False
+    if current_global_idx <= 0:
+        return True
+    if total_rows is None or total_rows <= 0:
+        return current_time - last_progress_report_time >= progress_update_interval_seconds
 
     progress_rows = min(current_global_idx, total_rows)
     progress_percent_delta = ((progress_rows - last_progress_reported_rows) / total_rows) * 100.0
@@ -223,6 +216,8 @@ def upload_via_edge(
                 pass
 
     total_inserted = 0
+    last_progress_report_time = 0.0
+    last_progress_reported_rows = start
     for i in range(start, total, batch_size):
         if pause_event:
             pause_event.wait()
@@ -241,10 +236,21 @@ def upload_via_edge(
         if resume_key:
             set_resume_offset(resume_key, current_processed)
         if progress_cb:
-            try:
-                progress_cb(current_processed, total)
-            except Exception:
-                pass
+            current_time = time.monotonic()
+            if _should_report_progress(
+                total,
+                current_processed,
+                last_progress_report_time,
+                last_progress_reported_rows,
+                current_time,
+                DEFAULT_PROGRESS_UPDATE_INTERVAL_SECONDS,
+            ):
+                try:
+                    progress_cb(current_processed, total)
+                except Exception:
+                    pass
+                last_progress_report_time = current_time
+                last_progress_reported_rows = current_processed
 
     if not silent:
         log(f"    {total}건 전송 완료(실제 삽입 {total_inserted}건)")
@@ -323,7 +329,6 @@ def upload_item(
     """
     key = build_file_state_key(folder, filename, path)
     start_idx = get_resume_offset(key)
-    total_rows = _count_data_rows(path)
 
     latest_ts = latest_timestamp
     if enable_smart_sync and latest_ts:
@@ -336,6 +341,30 @@ def upload_item(
     uploaded_any = False
     last_progress_report_time = 0.0
     last_progress_reported_rows = 0
+
+    def notify_progress(processed_rows: int, total_rows: int | None) -> None:
+        nonlocal last_progress_report_time, last_progress_reported_rows
+        if progress_cb is None:
+            return
+        current_time = time.monotonic()
+        if not _should_report_progress(
+            total_rows,
+            processed_rows,
+            last_progress_report_time,
+            last_progress_reported_rows,
+            current_time,
+            progress_update_interval_seconds,
+        ):
+            return
+        try:
+            progress_cb(processed_rows, 0 if total_rows is None else total_rows)
+        except Exception:
+            return
+        last_progress_report_time = current_time
+        last_progress_reported_rows = processed_rows
+
+    if start_idx > 0:
+        notify_progress(start_idx, None)
 
     with create_upload_http_client() as http_client:
         for df_chunk in data_source:
@@ -358,6 +387,15 @@ def upload_item(
                 current_global_idx += consumed_rows
                 continue
 
+            chunk_start_idx = current_global_idx
+
+            def report_chunk_progress(done_in_chunk: int, total_in_chunk: int) -> None:
+                _ = total_in_chunk
+                notify_progress(
+                    chunk_start_idx + done_in_chunk,
+                    None,
+                )
+
             ok = upload_via_edge(
                 edge_url,
                 anon_key,
@@ -367,7 +405,7 @@ def upload_item(
                 resume_key=None,
                 start_index=0,
                 batch_size=batch_size,
-                progress_cb=None,
+                progress_cb=report_chunk_progress,
                 pause_event=pause_event,
                 silent=True,
             )
@@ -377,31 +415,18 @@ def upload_item(
 
             uploaded_any = True
             current_global_idx += len(df_chunk)
-
-            current_time = time.monotonic()
-            if _should_report_progress(
-                total_rows,
-                current_global_idx,
-                last_progress_report_time,
-                last_progress_reported_rows,
-                current_time,
-                progress_update_interval_seconds,
-            ):
-                progress_rows = min(current_global_idx, total_rows)
-                if progress_cb is not None:
-                    try:
-                        progress_cb(progress_rows, total_rows)
-                    except Exception:
-                        pass
-                last_progress_report_time = current_time
-                last_progress_reported_rows = progress_rows
-
+            notify_progress(current_global_idx, None)
             set_resume_offset_fn(key, current_global_idx)
 
     if not uploaded_any:
         log(f"- Upload {key}: 데이터 없음 또는 모두 최신 상태")
     else:
         log(f"- Upload {key}: 완료")
+        if progress_cb is not None:
+            try:
+                progress_cb(current_global_idx, current_global_idx)
+            except Exception:
+                pass
 
     log_processed_fn(folder, filename, path)
     set_resume_offset_fn(key, 0)

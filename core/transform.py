@@ -97,29 +97,28 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
                 is_integrated = True
             
             if is_integrated:
-                # Factory Integrated Log: Date + Time columns
+                # 통합 로그는 고정된 Date/Time 열을 그대로 벡터 연산으로 결합한다.
                 try:
-                    # Combine Date and Time
-                    # Date: YYYY-MM-DD, Time: HH:MM:SS.mmm
-                    df["timestamp"] = pd.to_datetime(
-                        df["Date"].astype(str) + " " + df["Time"].astype(str),
+                    date_series = df["Date"].astype(str, copy=False)
+                    time_series = df["Time"].astype(str, copy=False)
+                    timestamp_text = date_series.str.cat(time_series, sep=" ")
+                    timestamp_series = pd.to_datetime(
+                        timestamp_text,
                         errors="coerce",
-                        format="mixed"
                     ).dt.strftime("%Y-%m-%dT%H:%M:%S.%f+09:00")
                 except Exception:
                     return pd.DataFrame(), colmap
             elif "time" in colmap:
-                # Legacy PLC: Filename Date + Time column
-                date_str = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}"
-                df["timestamp"] = df[colmap["time"]].apply(
-                    lambda t: f"{date_str}T{t}+09:00"
-                )
+                # 레거시 PLC는 파일 날짜 접두사를 시간 열에 벡터 방식으로 붙인다.
+                date_prefix = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}T"
+                time_series = df[colmap["time"]].astype(str, copy=False)
+                timestamp_series = date_prefix + time_series + "+09:00"
             else:
                 # No time info found
                 return pd.DataFrame(), colmap
 
             out = pd.DataFrame()
-            out["timestamp"] = df["timestamp"]
+            out["timestamp"] = timestamp_series
             # out["device_id"] = "extruder_integrated" if is_integrated else "extruder_plc" # Removed
             
             # Map standard columns

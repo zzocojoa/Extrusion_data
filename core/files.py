@@ -4,6 +4,8 @@ from datetime import date, datetime, timedelta, timezone
 from os import DirEntry
 from typing import List, Tuple
 
+import pandas as pd
+
 from .state import build_file_state_lookup_keys, load_processed
 
 KST = timezone(timedelta(hours=9))
@@ -147,6 +149,59 @@ def _is_processed_file(processed: set[str], folder: str, filename: str, file_pat
         if lookup_key in processed:
             return True
     return False
+
+
+def _read_preview_sample_dataframe(path: str, sample_rows: int) -> pd.DataFrame:
+    if sample_rows <= 0:
+        raise ValueError("sample_rows must be positive.")
+    try:
+        return pd.read_csv(path, encoding="utf-8-sig", nrows=sample_rows)
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="cp949", nrows=sample_rows)
+
+
+def _sample_has_non_empty_rows(dataframe: pd.DataFrame) -> bool:
+    if dataframe.empty:
+        return False
+    return bool(dataframe.notna().any(axis=1).any())
+
+
+def preview_has_data(kind: str, path: str, sample_rows: int) -> bool:
+    sample = _read_preview_sample_dataframe(path, sample_rows)
+    if not _sample_has_non_empty_rows(sample):
+        return False
+
+    columns = [str(column).strip() for column in sample.columns]
+    if kind == "plc":
+        column_set = set(columns)
+        has_integrated_columns = {"Date", "Time", "Mold1"}.issubset(column_set)
+        has_legacy_time_column = any(column in column_set for column in ("시간", "시각", "Time"))
+        return has_integrated_columns or has_legacy_time_column
+
+    if kind == "temp":
+        normalized_columns = {
+            re.sub(r"\[|\]", "", column).strip().lower()
+            for column in columns
+        }
+        has_datetime_column = any(
+            column in normalized_columns
+            for column in ("datetime", "date_time", "날짜시간", "일시")
+        )
+        has_date_column = any(
+            column in normalized_columns
+            for column in ("date", "날짜", "일자")
+        )
+        has_time_column = any(
+            column in normalized_columns
+            for column in ("time", "시간", "시각")
+        )
+        has_temperature_column = any(
+            column in normalized_columns
+            for column in ("temperature", "온도", "temp")
+        )
+        return has_temperature_column and (has_datetime_column or (has_date_column and has_time_column))
+
+    raise ValueError(f"Unsupported preview validation kind: {kind}")
 
 
 def list_candidates(
