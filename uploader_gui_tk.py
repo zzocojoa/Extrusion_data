@@ -7,12 +7,11 @@ import queue
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping
+from types import ModuleType
+from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 from datetime import datetime, timedelta, timezone
-import pandas as pd
-import numpy as np
 import subprocess
 import time
 import webbrowser
@@ -36,11 +35,8 @@ from core.i18n import (
     normalize_language_code,
     translate,
 )
-from core.transform import build_records_plc
+import core.state as core_state
 from core import files as core_files
-import core.upload as core_upload
-import core.work_log as core_work_log
-import core.cycle_processing as core_cycle
 try:
     from core import wsl_storage as core_wsl_storage
 except Exception:
@@ -68,24 +64,21 @@ from core.cycle_operations import (
     execute_cycle_snapshot_sync,
     resolve_cycle_db_connection_settings,
 )
-from scripts.build_training_base import build_training_base
-from scripts.build_training_dataset_v1 import build_training_dataset_v1
 
 
 # Tkinter UI
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from PIL import Image
 
 KST = timezone(timedelta(hours=9))
 PROJECT_ROOT = Path(__file__).resolve().parent
 PREVIEW_VALIDATION_SAMPLE_ROWS = 32
+STARTUP_PROFILE_ENV_NAME = "EXTRUSION_STARTUP_PROFILE"
 
 # Data directory (AppData) for persistent state
 # Data directory (AppData) for persistent state
 DATA_DIR = get_data_dir()
-LOG_PATH = os.path.join(DATA_DIR, 'processed_files.log')
-RESUME_PATH = os.path.join(DATA_DIR, 'upload_resume.json')
+STATE_DB_PATH = core_state.get_db_path()
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -109,54 +102,145 @@ if os.name == 'nt':
     except Exception:
         pass
 
-
-def _migrate_legacy_state_gui():
-    """GUI-side migration of legacy state files into AppData.
-    Safe union/merge like CLI.
-    """
-    import core.state as core_state
-
-    core_state.migrate_legacy_state(os.path.dirname(os.path.abspath(__file__)))
-
 def kst_now() -> datetime:
     return datetime.now(KST)
 
 
 def load_processed() -> set:
-    import core.state as core_state
-
-    return core_state.load_processed(LOG_PATH)
+    return core_state.load_processed(STATE_DB_PATH)
 
 
 def log_processed(folder: str, filename: str, file_path: str):
-    import core.state as core_state
-
-    core_state.log_processed(folder, filename, file_path, LOG_PATH)
+    core_state.log_processed(folder, filename, file_path, STATE_DB_PATH)
 
 
 # --- Resume state (파일별 마지막 배치 오프셋) ---
 def load_resume() -> dict:
-    import core.state as core_state
-
-    return core_state.load_resume(RESUME_PATH)
+    return core_state.load_resume(STATE_DB_PATH)
 
 
 def save_resume(data: dict):
-    import core.state as core_state
-
-    core_state.save_resume(data, RESUME_PATH)
+    core_state.save_resume(data, STATE_DB_PATH)
 
 
 def set_resume_offset(key: str, offset: int):
-    import core.state as core_state
-
-    core_state.set_resume_offset(key, offset, RESUME_PATH)
+    core_state.set_resume_offset(key, offset, STATE_DB_PATH)
 
 
 def get_resume_offset(key: str) -> int:
-    import core.state as core_state
+    return core_state.get_resume_offset(key, STATE_DB_PATH)
 
-    return core_state.get_resume_offset(key, RESUME_PATH)
+
+def load_recent_successful_upload_profile() -> dict[str, object] | None:
+    return core_state.load_recent_successful_upload_profile(STATE_DB_PATH)
+
+
+def save_recent_successful_upload_profile(profile: dict[str, object] | None) -> None:
+    core_state.save_recent_successful_upload_profile(profile, STATE_DB_PATH)
+
+
+def load_failed_retry_set() -> tuple[core_state.FailedRetryEntry, ...]:
+    return core_state.load_failed_retry_set(STATE_DB_PATH)
+
+
+def load_state_health_snapshot(verify_integrity: bool) -> core_state.StateHealthSnapshot:
+    return core_state.load_state_health(STATE_DB_PATH, verify_integrity)
+
+
+def load_upload_dashboard_state_snapshot() -> core_state.UploadDashboardStateSnapshot:
+    return core_state.load_upload_dashboard_state(STATE_DB_PATH)
+
+
+def start_upload_run(total_count: int, retry_failed_only: bool, config_values: dict[str, str]) -> int:
+    return core_state.start_upload_run(total_count, retry_failed_only, config_values, STATE_DB_PATH)
+
+
+def finish_upload_run(
+    run_id: int,
+    total_count: int,
+    success_count: int,
+    failure_count: int,
+    warning_messages: tuple[str, ...],
+    recent_successful_upload_profile: dict[str, object] | None,
+) -> None:
+    core_state.finish_upload_run(
+        run_id,
+        total_count,
+        success_count,
+        failure_count,
+        warning_messages,
+        recent_successful_upload_profile,
+        STATE_DB_PATH,
+    )
+
+
+def mark_file_completed(folder: str, filename: str, file_path: str, run_id: int | None) -> None:
+    core_state.mark_file_completed(folder, filename, file_path, run_id, STATE_DB_PATH)
+
+
+def record_file_failure(
+    folder: str,
+    filename: str,
+    file_path: str,
+    resume_offset: int,
+    error_message: str,
+    run_id: int | None,
+) -> None:
+    core_state.record_file_failure(
+        folder,
+        filename,
+        file_path,
+        resume_offset,
+        error_message,
+        run_id,
+        STATE_DB_PATH,
+    )
+
+
+def load_pandas_module() -> ModuleType:
+    import pandas as pd
+
+    return pd
+
+
+def load_core_transform_module() -> ModuleType:
+    import core.transform as core_transform
+
+    return core_transform
+
+
+def load_core_upload_module() -> ModuleType:
+    import core.upload as core_upload
+
+    return core_upload
+
+
+def load_core_work_log_module() -> ModuleType:
+    import core.work_log as core_work_log
+
+    return core_work_log
+
+
+def load_core_cycle_module() -> ModuleType:
+    import core.cycle_processing as core_cycle
+
+    return core_cycle
+
+
+def load_build_training_base() -> Callable[[str, str, str, str | None], str]:
+    from scripts.build_training_base import build_training_base
+
+    return build_training_base
+
+
+def load_build_training_dataset_v1() -> Callable[[str, str], str]:
+    from scripts.build_training_dataset_v1 import build_training_dataset_v1
+
+    return build_training_dataset_v1
+
+
+def build_records_plc(file_path: str, filename: str, chunksize: int | None = None) -> Any:
+    return load_core_transform_module().build_records_plc(file_path, filename, chunksize)
 
 
 def is_locked(path: str) -> bool:
@@ -319,7 +403,204 @@ def within_date_window(file_date: datetime, window_start: "date | None", window_
     return core_files.within_date_window(file_date, window_start, window_end)
 
 
-def process_file(kind: str, path: str, filename: str) -> pd.DataFrame:
+def format_optional_timestamp_text(raw_value: object) -> str:
+    if raw_value is None:
+        return ""
+    try:
+        timestamp = float(raw_value)
+    except Exception:
+        return ""
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp, KST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_upload_selection_fingerprint(
+    vals: Mapping[str, str],
+) -> "UploadSelectionFingerprint":
+    return UploadSelectionFingerprint(
+        plc_dir=str(vals.get("PLC_DIR", "")).strip(),
+        range_mode=str(vals.get("RANGE_MODE", "")).strip(),
+        custom_date_start=str(vals.get("CUSTOM_DATE_START", "")).strip(),
+        custom_date_end=str(vals.get("CUSTOM_DATE_END", "")).strip(),
+        custom_date=str(vals.get("CUSTOM_DATE", "")).strip(),
+        mtime_lag_min=str(vals.get("MTIME_LAG_MIN", "")).strip(),
+        check_lock=str(vals.get("CHECK_LOCK", "")).strip().lower(),
+    )
+
+
+def read_directory_mtime_ns(folder: str) -> int | None:
+    try:
+        return int(os.stat(folder).st_mtime_ns)
+    except OSError:
+        return None
+
+
+def build_preview_candidate_snapshots(
+    items: list[tuple[str, str, str, str]],
+) -> tuple["PreviewCandidateSnapshot", ...]:
+    snapshots: list[PreviewCandidateSnapshot] = []
+    for folder, filename, path, kind in items:
+        stat_result = os.stat(path)
+        snapshots.append(
+            PreviewCandidateSnapshot(
+                folder=folder,
+                filename=filename,
+                path=path,
+                kind=kind,
+                size=int(stat_result.st_size),
+                mtime_ns=int(stat_result.st_mtime_ns),
+            )
+        )
+    return tuple(snapshots)
+
+
+def build_preview_preflight_detail_lines(
+    target_count: int,
+    total_count: int,
+    excluded: list[tuple[str, str, str]],
+    translate_fn: Callable[[str, Mapping[str, object]], str],
+) -> tuple[str, ...]:
+    detail_lines = [
+        translate_fn(
+            "dashboard.upload.detail.preflight_summary",
+            {"target_count": target_count, "total_count": total_count},
+        )
+    ]
+    if excluded != []:
+        detail_lines.append(
+            translate_fn(
+                "dashboard.upload.detail.preflight_excluded",
+                {"excluded_count": len(excluded)},
+            )
+        )
+        for _, filename, reason in excluded[:2]:
+            detail_lines.append(f"{filename}: {reason}")
+    return tuple(detail_lines[:4])
+
+
+def build_preview_scan_result(
+    vals: Mapping[str, str],
+    items: list[tuple[str, str, str, str]],
+    excluded: list[tuple[str, str, str]],
+    completed_at: float,
+    translate_fn: Callable[[str, Mapping[str, object]], str],
+) -> "PreviewScanResult":
+    fingerprint = build_upload_selection_fingerprint(vals)
+    total_count = len(items) + len(excluded)
+    detail_lines = build_preview_preflight_detail_lines(
+        len(items),
+        total_count,
+        excluded,
+        translate_fn,
+    )
+    return PreviewScanResult(
+        fingerprint=fingerprint,
+        completed_at=completed_at,
+        directory_mtime_ns=read_directory_mtime_ns(fingerprint.plc_dir),
+        total_count=total_count,
+        target_count=len(items),
+        excluded_count=len(excluded),
+        candidate_items=build_preview_candidate_snapshots(items),
+        detail_lines=detail_lines,
+    )
+
+
+def can_reuse_preview_scan_for_upload(
+    preview_scan_result: "PreviewScanResult | None",
+    fingerprint: "UploadSelectionFingerprint",
+    include_today: bool,
+    retry_failed_only: bool,
+    current_time: float,
+) -> bool:
+    if preview_scan_result is None:
+        return False
+    if retry_failed_only:
+        return False
+    if include_today:
+        return False
+    if preview_scan_result.fingerprint != fingerprint:
+        return False
+    if current_time - preview_scan_result.completed_at > PREVIEW_REUSE_TTL_SECONDS:
+        return False
+    current_directory_mtime_ns = read_directory_mtime_ns(fingerprint.plc_dir)
+    return current_directory_mtime_ns == preview_scan_result.directory_mtime_ns
+
+
+def collect_reusable_preview_candidate_items(
+    preview_scan_result: "PreviewScanResult",
+    processed: set[str],
+    window_start: "date | None",
+    window_end: "date",
+    lag_min: int,
+    include_today: bool,
+    check_lock: bool,
+) -> tuple[tuple[str, str, str, str], ...] | None:
+    reusable_items: list[tuple[str, str, str, str]] = []
+    for candidate_snapshot in preview_scan_result.candidate_items:
+        try:
+            stat_result = os.stat(candidate_snapshot.path)
+        except OSError:
+            return None
+        if int(stat_result.st_size) != candidate_snapshot.size:
+            return None
+        if int(stat_result.st_mtime_ns) != candidate_snapshot.mtime_ns:
+            return None
+        lookup_keys = core_state.build_file_state_lookup_keys(
+            candidate_snapshot.folder,
+            candidate_snapshot.filename,
+            candidate_snapshot.path,
+        )
+        if any(lookup_key in processed for lookup_key in lookup_keys):
+            return None
+        if candidate_snapshot.kind != "plc":
+            return None
+        file_date = parse_plc_date_from_filename(candidate_snapshot.filename)
+        if file_date is None or not within_date_window(file_date, window_start, window_end):
+            return None
+        if file_date.date() == kst_now().date() and include_today:
+            if not stable_enough(candidate_snapshot.path, lag_min):
+                return None
+            if check_lock and is_locked(candidate_snapshot.path):
+                return None
+        reusable_items.append(
+            (
+                candidate_snapshot.folder,
+                candidate_snapshot.filename,
+                candidate_snapshot.path,
+                candidate_snapshot.kind,
+            )
+        )
+    return tuple(reusable_items)
+
+
+def collect_retryable_upload_items_from_state(
+    items: list[tuple[str, str, str, str]],
+    resume_map: dict[str, int],
+    failed_retry_set: tuple[core_state.FailedRetryEntry, ...],
+) -> tuple[tuple[str, str, str, str], ...]:
+    active_retry_keys = {
+        key
+        for key, offset in resume_map.items()
+        if int(offset) > 0
+    }
+    for failed_retry_entry in failed_retry_set:
+        failed_key = str(failed_retry_entry.get("file_key", "")).strip()
+        if failed_key != "":
+            active_retry_keys.add(failed_key)
+            if "|" in failed_key:
+                active_retry_keys.add(failed_key.split("|", 1)[0])
+
+    retryable_items: list[tuple[str, str, str, str]] = []
+    for folder, filename, path, kind in items:
+        lookup_keys = core_state.build_file_state_lookup_keys(folder, filename, path)
+        if any(lookup_key in active_retry_keys for lookup_key in lookup_keys):
+            retryable_items.append((folder, filename, path, kind))
+    return tuple(retryable_items)
+
+
+def process_file(kind: str, path: str, filename: str) -> Any:
+    pd = load_pandas_module()
     try:
         # Single mode: always use build_records_plc (now integrated)
         return build_records_plc(path, filename)
@@ -336,16 +617,17 @@ def preview_diagnostics(
     lag_min: int,
     include_today: bool,
     check_lock: bool,
+    processed: set[str],
     translate_fn: Callable[[str, Mapping[str, object]], str],
 ):
     import core.state as core_state
 
     included = []  # (folder, filename, path, kind)
     excluded = []  # (folder, filename, reason)
-    processed = load_processed()
 
     def has_data(kind: str, path: str, filename: str) -> bool:
         del filename
+        pd = load_pandas_module()
         try:
             return core_files.preview_has_data(kind, path, PREVIEW_VALIDATION_SAMPLE_ROWS)
         except (OSError, UnicodeError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
@@ -402,7 +684,8 @@ def preview_diagnostics(
             if not fdate or not within_date_window(fdate, window_start, window_end):
                 excluded.append((temp_dir, fn, translate_fn("dashboard.preview.excluded.out_of_range", {})))
                 continue
-            if f"{temp_dir}/{fn}" in processed or fn in processed:
+            lookup_keys = core_state.build_file_state_lookup_keys(temp_dir, fn, full)
+            if any(lookup_key in processed for lookup_key in lookup_keys):
                 excluded.append((temp_dir, fn, translate_fn("dashboard.preview.excluded.already_processed", {})))
                 continue
             if fdate.date() == kst_now().date() and include_today:
@@ -506,6 +789,14 @@ class LocalSupabaseStatusOverride:
 
 
 @dataclass(frozen=True)
+class LocalSupabaseStatusSnapshot:
+    supabase_url: str
+    runtime: LocalSupabaseRuntime | None
+    is_ready: bool
+    is_studio_ready: bool
+
+
+@dataclass(frozen=True)
 class LocalDockerCheckResult:
     is_ready: bool
     detail: str
@@ -592,8 +883,71 @@ class WorkLogViewState:
     messages: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class UploadOperationalCardsState:
+    recent_successful_upload_profile: core_state.RecentSuccessfulUploadProfile | None
+    failed_retry_set: tuple[core_state.FailedRetryEntry, ...]
+    state_health_status_text: str
+    state_health_status_color: str
+    state_health_detail_lines: tuple[str, ...]
+    state_health_blocks_upload: bool
+    is_upload_preflight_blocked: bool
+    has_retryable_state: bool
+    retryable_upload_items: tuple[tuple[str, str, str, str], ...]
+    preflight_status_text: str
+    preflight_status_color: str
+    preflight_detail_lines: tuple[str, ...]
+    resume_status_text: str
+    resume_status_color: str
+    resume_detail_lines: tuple[str, ...]
+    recent_success_status_text: str
+    recent_success_status_color: str
+    recent_success_detail_lines: tuple[str, ...]
+    can_rerun_recent_success: bool
+
+
+@dataclass(frozen=True)
+class UploadSelectionFingerprint:
+    plc_dir: str
+    range_mode: str
+    custom_date_start: str
+    custom_date_end: str
+    custom_date: str
+    mtime_lag_min: str
+    check_lock: str
+
+
+@dataclass(frozen=True)
+class PreviewCandidateSnapshot:
+    folder: str
+    filename: str
+    path: str
+    kind: str
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class PreviewScanResult:
+    fingerprint: UploadSelectionFingerprint
+    completed_at: float
+    directory_mtime_ns: int | None
+    total_count: int
+    target_count: int
+    excluded_count: int
+    candidate_items: tuple[PreviewCandidateSnapshot, ...]
+    detail_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StartupTimingEntry:
+    label: str
+    elapsed_seconds: float
+
+
 WSL_STORAGE_WARNING_THRESHOLD = 0.80
 WSL_STORAGE_CRITICAL_THRESHOLD = 0.90
+PREVIEW_REUSE_TTL_SECONDS = 30.0
 
 
 def _extract_source_value(source: object, name: str) -> object | None:
@@ -604,6 +958,25 @@ def _extract_source_value(source: object, name: str) -> object | None:
     if hasattr(source, name):
         return getattr(source, name)
     return None
+
+
+def is_startup_profiling_enabled() -> bool:
+    return os.environ.get(STARTUP_PROFILE_ENV_NAME, "").strip() == "1"
+
+
+def format_startup_timing_report(
+    startup_timing_entries: tuple[StartupTimingEntry, ...],
+    total_seconds: float,
+) -> str:
+    lines = [
+        "[startup] timing report",
+        f"[startup] total={total_seconds:.3f}s",
+    ]
+    for startup_timing_entry in startup_timing_entries:
+        lines.append(
+            f"[startup] {startup_timing_entry.label}={startup_timing_entry.elapsed_seconds:.3f}s"
+        )
+    return "\n".join(lines)
 
 
 def _coerce_optional_int(raw_value: object) -> int | None:
@@ -1093,6 +1466,26 @@ def build_local_supabase_ui_state(
     )
 
 
+def build_local_supabase_checking_ui_state(
+    pending_open_studio: bool,
+    translate_fn: Callable[[str, Mapping[str, object]], str],
+) -> LocalSupabaseUiState:
+    studio_button_key = "dashboard.local_supabase.button.studio"
+    if pending_open_studio:
+        studio_button_key = "dashboard.local_supabase.button.studio.pending"
+    return LocalSupabaseUiState(
+        status_text=translate_fn("dashboard.local_supabase.status.checking", {}),
+        status_color="#3B8ED0",
+        show_progress=True,
+        start_button_text=translate_fn("dashboard.local_supabase.button.start", {}),
+        start_button_enabled=False,
+        studio_button_text=translate_fn(studio_button_key, {}),
+        studio_button_enabled=False,
+        stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
+        stop_button_enabled=False,
+    )
+
+
 def build_archive_job_context(request: ArchiveMetricsRequest) -> ArchiveJobContext:
     environment_values = load_archive_environment(PROJECT_ROOT)
     before_datetime = parse_archive_before_date(request.before_date)
@@ -1238,6 +1631,7 @@ def execute_training_build(
     progress_callback(0.0)
 
     if request.mode == "build-base":
+        build_training_base = load_build_training_base()
         plc_file_path = normalize_required_training_path(
             request.plc_file_path,
             translate_fn("data_mgmt.training.label.raw_csv", {}),
@@ -1265,6 +1659,7 @@ def execute_training_build(
         return (written_path,)
 
     if request.mode == "build-v1":
+        build_training_dataset_v1 = load_build_training_dataset_v1()
         training_base_file_path = normalize_required_training_path(
             request.training_base_file_path,
             translate_fn("data_mgmt.training.label.base_input", {}),
@@ -1283,6 +1678,8 @@ def execute_training_build(
         progress_callback(1.0)
         return (written_path,)
 
+    build_training_base = load_build_training_base()
+    build_training_dataset_v1 = load_build_training_dataset_v1()
     plc_file_path = normalize_required_training_path(
         request.plc_file_path,
         translate_fn("data_mgmt.training.label.raw_csv", {}),
@@ -1385,9 +1782,200 @@ def format_cycle_health_report(
         ),
     ]
 
+
+def format_state_health_view(
+    state_health_snapshot: core_state.StateHealthSnapshot,
+    translate_fn: Callable[[str, Mapping[str, object]], str],
+) -> tuple[str, str, tuple[str, ...]]:
+    summary_code = state_health_snapshot["summary_code"]
+    state = state_health_snapshot["state"]
+    pending_resume_count = state_health_snapshot["pending_resume_count"]
+    failed_retry_count = state_health_snapshot["failed_retry_count"]
+    if summary_code == "legacy_mode":
+        status_text = translate_fn("dashboard.state_store.status.legacy_mode", {})
+    elif state == "blocked":
+        status_text = translate_fn("dashboard.state_store.status.recovery_required", {})
+    elif state == "attention":
+        status_text = translate_fn("dashboard.state_store.status.recovery_available", {})
+    else:
+        status_text = translate_fn("dashboard.state_store.status.ready", {})
+    status_color = "#E06C75" if state == "blocked" else "#E5C07B" if state == "attention" else "#2CC985"
+    detail_lines: list[str] = []
+    for detail_code in state_health_snapshot["detail_codes"]:
+        if detail_code == "legacy_mode":
+            detail_lines.append(translate_fn("dashboard.state_store.detail.legacy_mode", {}))
+        elif detail_code == "restore_sqlite":
+            detail_lines.append(translate_fn("dashboard.state_store.detail.restore_sqlite", {}))
+        elif detail_code == "backup_dir":
+            backup_dir = str(state_health_snapshot.get("backup_dir", "")).strip()
+            if backup_dir != "":
+                detail_lines.append(
+                    translate_fn("dashboard.state_store.detail.backup_dir", {"backup_dir": backup_dir})
+                )
+        elif detail_code == "failed_retry_present":
+            detail_lines.append(
+                translate_fn("dashboard.state_store.detail.failed_retry_present", {"count": failed_retry_count})
+            )
+        elif detail_code == "resume_present":
+            detail_lines.append(
+                translate_fn("dashboard.state_store.detail.resume_present", {"count": pending_resume_count})
+            )
+        elif detail_code == "can_resume":
+            detail_lines.append(translate_fn("dashboard.state_store.detail.can_resume", {}))
+        elif detail_code == "ready":
+            detail_lines.append(translate_fn("dashboard.state_store.detail.ready", {}))
+    error_message = str(state_health_snapshot.get("error_message", "")).strip()
+    if error_message != "":
+        detail_lines.insert(0, error_message)
+    if detail_lines == []:
+        detail_lines.append(translate_fn("dashboard.state_store.detail.ready", {}))
+    return status_text, status_color, tuple(detail_lines[:4])
+
+
+def build_upload_operational_cards_state(
+    vals: dict[str, str],
+    dashboard_state_snapshot: core_state.UploadDashboardStateSnapshot,
+    state_health_snapshot: core_state.StateHealthSnapshot,
+    preview_scan_result: PreviewScanResult | None,
+    local_supabase_status_text: str,
+    translate_fn: Callable[[str, Mapping[str, object]], str],
+) -> UploadOperationalCardsState:
+    recent_successful_upload_profile = dashboard_state_snapshot["recent_successful_upload_profile"]
+    failed_retry_set = dashboard_state_snapshot["failed_retry_set"]
+    resume_map = dashboard_state_snapshot["resume"]
+    state_health_status_text, state_health_status_color, state_health_detail_lines = format_state_health_view(
+        state_health_snapshot,
+        translate_fn,
+    )
+    state_health_blocks_upload = not state_health_snapshot["can_start_upload"]
+
+    ok_cfg, missing = validate_config(vals)
+    preflight_status_text = translate_fn("dashboard.upload.status.preflight_pending", {})
+    preflight_status_color = "gray"
+    preflight_detail_lines: list[str] = []
+    is_upload_preflight_blocked = False
+
+    if not ok_cfg:
+        preflight_status_text = translate_fn("dashboard.upload.status.preflight_blocked", {})
+        preflight_status_color = "#E06C75"
+        preflight_detail_lines.append(", ".join(missing))
+        is_upload_preflight_blocked = True
+    else:
+        if vals.get("PLC_DIR", "").strip() == "" or not os.path.isdir(vals["PLC_DIR"]):
+            preflight_status_text = translate_fn("dashboard.upload.status.preflight_blocked", {})
+            preflight_status_color = "#E06C75"
+            is_upload_preflight_blocked = True
+            preflight_detail_lines.append(
+                translate_fn("settings.validation.required_fields", {"fields": "PLC_DIR"})
+            )
+        if is_edge_url_origin_mismatch(vals.get("EDGE_FUNCTION_URL", ""), vals.get("SUPABASE_URL", "")):
+            preflight_status_text = translate_fn("dashboard.upload.status.preflight_blocked", {})
+            preflight_status_color = "#E06C75"
+            preflight_detail_lines.append(translate_fn("settings.validation.edge_host_mismatch", {}))
+            is_upload_preflight_blocked = True
+        if is_local_supabase_target(vals.get("SUPABASE_URL", "")):
+            try:
+                runtime = resolve_local_supabase_runtime(vals.get("SUPABASE_URL", ""), translate_fn)
+            except Exception as error:
+                preflight_status_text = translate_fn("dashboard.upload.status.preflight_blocked", {})
+                preflight_status_color = "#E06C75"
+                preflight_detail_lines.append(str(error))
+                is_upload_preflight_blocked = True
+            else:
+                if not is_local_supabase_stack_ready(runtime):
+                    preflight_status_text = translate_fn("dashboard.upload.status.preflight_blocked", {})
+                    preflight_status_color = "#E06C75"
+                    preflight_detail_lines.append(local_supabase_status_text)
+                    is_upload_preflight_blocked = True
+    if state_health_blocks_upload:
+        preflight_status_text = translate_fn("dashboard.upload.status.preflight_blocked", {})
+        preflight_status_color = "#E06C75"
+        is_upload_preflight_blocked = True
+        preflight_detail_lines = list(state_health_detail_lines)
+    elif (
+        preview_scan_result is not None
+        and preview_scan_result.fingerprint == build_upload_selection_fingerprint(vals)
+    ):
+        preflight_status_text = translate_fn("dashboard.upload.status.preflight_ready", {})
+        preflight_status_color = "#2CC985"
+        preflight_detail_lines = list(preview_scan_result.detail_lines)
+
+    if preflight_detail_lines == []:
+        preflight_detail_lines.append(translate_fn("dashboard.upload.detail.preflight_pending", {}))
+
+    has_retryable_state = any(int(offset) > 0 for offset in resume_map.values()) or failed_retry_set != ()
+
+    retryable_upload_items: tuple[tuple[str, str, str, str], ...] = ()
+
+    if not has_retryable_state:
+        resume_status_text = translate_fn("dashboard.upload.status.resume_empty", {})
+        resume_status_color = "gray"
+        resume_detail_lines: list[str] = []
+    else:
+        resume_status_text = translate_fn("dashboard.upload.status.resume_available", {})
+        resume_status_color = "#E5C07B"
+        resume_detail_lines = []
+        for failed_retry_entry in failed_retry_set[:3]:
+            filename = str(failed_retry_entry.get("filename", "")).strip()
+            error_message = str(failed_retry_entry.get("error_message", "")).strip()
+            if filename != "":
+                resume_detail_lines.append(filename)
+            if error_message != "":
+                resume_detail_lines.append(error_message)
+        for _, filename, _, _ in retryable_upload_items[:3]:
+            resume_detail_lines.append(filename)
+
+    if recent_successful_upload_profile is None:
+        recent_success_status_text = translate_fn("dashboard.upload.status.recent_success_empty", {})
+        recent_success_status_color = "gray"
+        recent_success_detail_lines: list[str] = []
+        can_rerun_recent_success = False
+    else:
+        profile_name = str(recent_successful_upload_profile.get("profile_name", "")).strip()
+        applied_at_text = format_optional_timestamp_text(
+            recent_successful_upload_profile.get("applied_at")
+        )
+        recent_success_detail_lines = [
+            line for line in [profile_name, applied_at_text] if line != ""
+        ]
+        recent_success_status_text = (
+            profile_name
+            if profile_name != ""
+            else translate_fn("dashboard.upload.recent_success.title", {})
+        )
+        recent_success_status_color = "#2CC985"
+        can_rerun_recent_success = True
+
+    return UploadOperationalCardsState(
+        recent_successful_upload_profile=recent_successful_upload_profile,
+        failed_retry_set=failed_retry_set,
+        state_health_status_text=state_health_status_text,
+        state_health_status_color=state_health_status_color,
+        state_health_detail_lines=state_health_detail_lines,
+        state_health_blocks_upload=state_health_blocks_upload,
+        is_upload_preflight_blocked=is_upload_preflight_blocked,
+        has_retryable_state=has_retryable_state,
+        retryable_upload_items=retryable_upload_items,
+        preflight_status_text=preflight_status_text,
+        preflight_status_color=preflight_status_color,
+        preflight_detail_lines=tuple(preflight_detail_lines[:4]),
+        resume_status_text=resume_status_text,
+        resume_status_color=resume_status_color,
+        resume_detail_lines=tuple(resume_detail_lines[:4]),
+        recent_success_status_text=recent_success_status_text,
+        recent_success_status_color=recent_success_status_color,
+        recent_success_detail_lines=tuple(recent_success_detail_lines[:2]),
+        can_rerun_recent_success=can_rerun_recent_success,
+    )
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
+        self.startup_profiling_enabled = is_startup_profiling_enabled()
+        self.startup_started_at = time.perf_counter()
+        self.startup_last_checkpoint = self.startup_started_at
+        self.startup_timing_entries: list[StartupTimingEntry] = []
+        self.startup_timing_report = ""
         self.title("Extrusion Uploader")
         self.geometry('1240x780')
         self.minsize(1160, 760)
@@ -1396,12 +1984,14 @@ class App(ctk.CTk):
             self.iconbitmap(APP_ICON)
         except Exception:
             pass
-        _migrate_legacy_state_gui()
+        self.record_startup_timing("window_setup")
         self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        self.record_startup_timing("load_config")
         self.ui_language = normalize_language_code(
             self.cfg.get("UI_LANGUAGE", DEFAULT_UI_LANGUAGE)
         )
         self.translation_bundle = load_translation_bundle(PROJECT_ROOT, self.ui_language)
+        self.record_startup_timing("load_translations")
         self.is_shutting_down = False
         self.title(self.tr("app.title"))
         
@@ -1419,6 +2009,17 @@ class App(ctk.CTk):
         self.pending_open_studio = False
         self.pending_close_after_supabase_stop = False
         self.local_supabase_status_override: LocalSupabaseStatusOverride | None = None
+        self.local_supabase_status_snapshot: LocalSupabaseStatusSnapshot | None = None
+        self.is_local_supabase_status_refreshing = False
+        self.local_supabase_status_request_id = 0
+        self.recent_successful_upload_profile = None
+        self.failed_retry_set: list[core_state.FailedRetryEntry] = []
+        self.state_health_blocks_upload = True
+        self.is_upload_preflight_blocked = True
+        self.has_retryable_state = False
+        self.retryable_upload_items: list[tuple[str, str, str, str]] = []
+        self.is_upload_operational_cards_refreshing = False
+        self.upload_operational_cards_request_id = 0
         self.pause_event = threading.Event()
         self.pause_event.set() # Start as running (not paused)
         self.var_training_mode = tk.StringVar(value="build-all")
@@ -1438,6 +2039,9 @@ class App(ctk.CTk):
         self.var_legacy_cycle_custom_date = tk.StringVar(value=kst_now().date().isoformat())
         self.var_local_supabase_status = tk.StringVar(
             value=self.tr("dashboard.local_supabase.status.checking")
+        )
+        self.var_state_store_status = tk.StringVar(
+            value=self.tr("dashboard.state_store.status.checking")
         )
         self.var_settings_dirty = tk.StringVar(value=self.tr("settings.dirty.clean"))
         self.var_settings_validation = tk.StringVar(
@@ -1470,31 +2074,43 @@ class App(ctk.CTk):
         self.wsl_storage_snapshot = self.build_wsl_storage_ui_snapshot()
         self.rendered_wsl_storage_snapshot: WslStorageSnapshot | None = None
         self.dashboard_layout_signature: DashboardLayoutSignature | None = None
+        self.upload_operational_cards_state: UploadOperationalCardsState | None = None
+        self.last_preview_scan_result: PreviewScanResult | None = None
+        self.record_startup_timing("initialize_runtime_state")
         archive_environment = load_archive_environment(PROJECT_ROOT)
         self.var_archive_before_date = tk.StringVar(value=kst_now().date().isoformat())
         self.var_archive_dir = tk.StringVar(value=archive_environment.get("ARCHIVE_DIR", ""))
         self.var_archive_delete = tk.BooleanVar(value=False)
         self.var_archive_status = tk.StringVar(value=self.tr("common.status.idle"))
+        self.record_startup_timing("load_archive_environment")
         
         # Thread-safe logging
         self.log_queue = queue.Queue()
         self.check_log_queue()
+        self.record_startup_timing("initialize_log_queue")
         
         # Grid layout (1x2)
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self.record_startup_timing("initialize_root_layout")
         
         self.create_sidebar()
+        self.record_startup_timing("create_sidebar")
         self.create_main_area()
+        self.record_startup_timing("create_main_area")
         
         # Handle window close
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.record_startup_timing("bind_close_protocol")
         
         # Initial View
         self.show_dashboard()
+        self.record_startup_timing("show_dashboard")
         
         # Close Splash Screen
         self.after(200, self.close_splash)
+        self.record_startup_timing("schedule_close_splash")
+        self.emit_startup_timing_report()
 
     def tr(self, key: str, **params: object) -> str:
         try:
@@ -1509,6 +2125,27 @@ class App(ctk.CTk):
         except Exception as error:
             print(f"[i18n] {key}: {error}")
             raise
+
+    def record_startup_timing(self, label: str) -> None:
+        if not self.startup_profiling_enabled:
+            return
+        now = time.perf_counter()
+        self.startup_timing_entries.append(
+            StartupTimingEntry(
+                label=label,
+                elapsed_seconds=now - self.startup_last_checkpoint,
+            )
+        )
+        self.startup_last_checkpoint = now
+
+    def emit_startup_timing_report(self) -> None:
+        total_seconds = time.perf_counter() - self.startup_started_at
+        self.startup_timing_report = format_startup_timing_report(
+            tuple(self.startup_timing_entries),
+            total_seconds,
+        )
+        if self.startup_profiling_enabled:
+            print(self.startup_timing_report)
 
     def build_responsive_layout_state(self, window_width: int) -> ResponsiveLayoutState:
         is_compact = window_width < 1320
@@ -1998,6 +2635,8 @@ class App(ctk.CTk):
         # Load Logo
         logo_path = resource_path(os.path.join('assets', 'logo.png'))
         try:
+            from PIL import Image
+
             logo_img = ctk.CTkImage(light_image=Image.open(logo_path), dark_image=Image.open(logo_path), size=(80, 80))
             self.logo_label = ctk.CTkLabel(
                 self.sidebar,
@@ -2048,6 +2687,8 @@ class App(ctk.CTk):
     def auto_start_upload(self):
         """Called after delay if AUTO_UPLOAD is true"""
         if not self.is_uploading:
+            if not self._ensure_upload_state_ready():
+                return
             self.log_queue.put(self.tr("dashboard.auto_upload.started"))
             self.on_start()
 
@@ -2156,6 +2797,7 @@ class App(ctk.CTk):
             if hasattr(self, "hero_frame") and self.hero_frame.winfo_exists():
                 self.refresh_local_supabase_button()
                 self.render_wsl_storage_card()
+                self.refresh_upload_operational_cards()
                 self.schedule_dashboard_update_loop(0)
                 self.schedule_dashboard_layout_refresh(None)
                 return
@@ -2165,6 +2807,7 @@ class App(ctk.CTk):
             return
         self.current_view = "dashboard"
         self.clear_main()
+        self.record_startup_timing("dashboard_clear_main")
 
         self.main_frame.grid_rowconfigure(0, weight=0)
         self.main_frame.grid_rowconfigure(1, weight=1)
@@ -2219,11 +2862,53 @@ class App(ctk.CTk):
         )
         self.lbl_local_supabase_status.grid(row=4, column=0, sticky="ew", pady=(0, 6))
         self.bind_label_wrap(self.lbl_local_supabase_status, horizontal_padding=20, min_wraplength=420)
+        self.lbl_state_store_status = ctk.CTkLabel(
+            self.hero_status_frame,
+            textvariable=self.var_state_store_status,
+            justify="left",
+            anchor="w",
+        )
+        self.lbl_state_store_status.grid(row=5, column=0, sticky="ew", pady=(0, 6))
+        self.lbl_state_store_detail = ctk.CTkLabel(
+            self.hero_status_frame,
+            text="",
+            justify="left",
+            anchor="w",
+            text_color="gray",
+        )
+        self.lbl_state_store_detail.grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        self.bind_label_wrap(self.lbl_state_store_detail, horizontal_padding=20, min_wraplength=420)
+        self.upload_precheck_frame = ctk.CTkFrame(self.hero_status_frame)
+        self.upload_precheck_frame.grid(row=7, column=0, sticky="ew", pady=(4, 0))
+        self.upload_precheck_frame.grid_columnconfigure(0, weight=1)
+        self.lbl_upload_precheck_title = ctk.CTkLabel(
+            self.upload_precheck_frame,
+            text=self.tr("dashboard.upload.preflight.title"),
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        )
+        self.lbl_upload_precheck_title.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        self.lbl_upload_precheck_summary = ctk.CTkLabel(
+            self.upload_precheck_frame,
+            text=self.tr("common.status.waiting"),
+            anchor="w",
+        )
+        self.lbl_upload_precheck_summary.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 2))
+        self.lbl_upload_precheck_items = ctk.CTkLabel(
+            self.upload_precheck_frame,
+            text="",
+            justify="left",
+            anchor="w",
+            text_color="gray",
+        )
+        self.lbl_upload_precheck_items.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        self.bind_label_wrap(self.lbl_upload_precheck_items, horizontal_padding=36, min_wraplength=420)
         self.local_supabase_progress = ctk.CTkProgressBar(
             self.hero_status_frame,
             width=320,
             mode="indeterminate",
         )
+        self.record_startup_timing("dashboard_build_hero")
 
         self.dashboard_body_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.dashboard_body_frame.grid(row=1, column=0, sticky="nsew")
@@ -2457,6 +3142,7 @@ class App(ctk.CTk):
             self.wsl_storage_host_free_item,
             self.wsl_storage_meta_item,
         ]
+        self.record_startup_timing("dashboard_build_wsl_card")
 
         self.tasks_frame = ctk.CTkScrollableFrame(
             self.dashboard_body_frame,
@@ -2464,7 +3150,73 @@ class App(ctk.CTk):
         )
         self.tasks_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
 
+        self.upload_resume_card = ctk.CTkFrame(self.tasks_frame)
+        self.upload_resume_card.pack(fill="x", padx=8, pady=(8, 8))
+        self.upload_resume_card.grid_columnconfigure(0, weight=1)
+        self.lbl_upload_resume_title = ctk.CTkLabel(
+            self.upload_resume_card,
+            text=self.tr("dashboard.upload.resume.title"),
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        )
+        self.lbl_upload_resume_title.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        self.lbl_upload_resume_state = ctk.CTkLabel(
+            self.upload_resume_card,
+            text=self.tr("dashboard.upload.status.resume_empty"),
+            anchor="w",
+        )
+        self.lbl_upload_resume_state.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 2))
+        self.lbl_upload_resume_detail = ctk.CTkLabel(
+            self.upload_resume_card,
+            text="",
+            justify="left",
+            anchor="w",
+            text_color="gray",
+        )
+        self.lbl_upload_resume_detail.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
+        self.bind_label_wrap(self.lbl_upload_resume_detail, horizontal_padding=36, min_wraplength=320)
+
+        self.recent_success_card = ctk.CTkFrame(self.tasks_frame)
+        self.recent_success_card.pack(fill="x", padx=8, pady=(0, 8))
+        self.recent_success_card.grid_columnconfigure(0, weight=1)
+        self.lbl_recent_success_title = ctk.CTkLabel(
+            self.recent_success_card,
+            text=self.tr("dashboard.upload.recent_success.title"),
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        )
+        self.lbl_recent_success_title.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        self.lbl_recent_success_state = ctk.CTkLabel(
+            self.recent_success_card,
+            text=self.tr("dashboard.upload.status.recent_success_empty"),
+            anchor="w",
+        )
+        self.lbl_recent_success_state.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 2))
+        self.lbl_recent_success_detail = ctk.CTkLabel(
+            self.recent_success_card,
+            text="",
+            justify="left",
+            anchor="w",
+            text_color="gray",
+        )
+        self.lbl_recent_success_detail.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
+        self.bind_label_wrap(self.lbl_recent_success_detail, horizontal_padding=36, min_wraplength=320)
+        self.btn_rerun_recent_success = ctk.CTkButton(
+            self.recent_success_card,
+            text=self.tr("dashboard.upload.button.rerun_recent"),
+            command=self.on_rerun_recent_success,
+            state="disabled",
+            width=150,
+            fg_color="#3B8ED0",
+            hover_color="#2D6FA6",
+        )
+        self.btn_rerun_recent_success.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
+
+        self.active_tasks_list_frame = ctk.CTkFrame(self.tasks_frame, fg_color="transparent")
+        self.active_tasks_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
         self.task_labels = {}
+        self.record_startup_timing("dashboard_build_task_cards")
 
         self.action_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
@@ -2510,6 +3262,15 @@ class App(ctk.CTk):
             command=self.on_preview,
             width=120,
         )
+        self.btn_retry_failed = ctk.CTkButton(
+            self.upload_action_row,
+            text=self.tr("dashboard.upload.button.retry_failed"),
+            command=self.on_retry_failed,
+            state="disabled",
+            width=140,
+            fg_color="#D97706",
+            hover_color="#B45309",
+        )
         self.btn_start_supabase = ctk.CTkButton(
             self.supabase_action_row,
             text=self.tr("dashboard.local_supabase.button.start"),
@@ -2540,10 +3301,12 @@ class App(ctk.CTk):
             self.btn_stop_supabase,
         ]
         self.upload_action_buttons: list[ctk.CTkButton] = [
+            self.btn_retry_failed,
             self.btn_preview,
             self.btn_pause,
             self.btn_start,
         ]
+        self.record_startup_timing("dashboard_build_action_rows")
 
         self.dashboard_body_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
         self.wsl_storage_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
@@ -2555,7 +3318,9 @@ class App(ctk.CTk):
             self.render_wsl_storage_card()
         else:
             self.request_wsl_storage_refresh()
+        self.refresh_upload_operational_cards()
         self.schedule_dashboard_update_loop(0)
+        self.record_startup_timing("dashboard_schedule_followups")
 
     def schedule_dashboard_update_loop(self, delay_ms: int) -> None:
         if self.current_view != "dashboard":
@@ -3240,6 +4005,8 @@ class App(ctk.CTk):
                 self.tr("work_log.log.analysis_started", path=os.path.basename(path))
             )
             try:
+                core_work_log = load_core_work_log_module()
+                core_upload = load_core_upload_module()
                 df = core_work_log.parse_work_log_excel(path)
                 self.log_to_box(
                     self.tr("work_log.log.analysis_completed", count=len(df))
@@ -4330,6 +5097,7 @@ class App(ctk.CTk):
 
         def _run():
             try:
+                core_cycle = load_core_cycle_module()
                 db_settings = resolve_cycle_db_connection_settings(PROJECT_ROOT)
                 processor = core_cycle.build_legacy_cycle_processor(
                     db_settings,
@@ -4686,6 +5454,8 @@ class App(ctk.CTk):
             self.lbl_runtime_context.configure(text=context_text)
         if hasattr(self, 'lbl_settings_context') and self.lbl_settings_context.winfo_exists():
             self.lbl_settings_context.configure(text=context_text)
+        if self.current_view == "dashboard":
+            self.refresh_upload_operational_cards()
 
     def build_current_settings_values(self) -> dict[str, str]:
         custom_date_start, custom_date_end = resolve_custom_range_texts(
@@ -4708,6 +5478,179 @@ class App(ctk.CTk):
             'CUSTOM_DATE_START': custom_date_start,
             'CUSTOM_DATE_END': custom_date_end,
         }
+
+    def build_upload_profile_values(self, vals: dict[str, str]) -> dict[str, str]:
+        custom_date_start, custom_date_end = resolve_custom_range_texts(
+            vals.get('CUSTOM_DATE_START', ''),
+            vals.get('CUSTOM_DATE_END', ''),
+            vals.get('CUSTOM_DATE', ''),
+        )
+        return {
+            'SUPABASE_URL': vals.get('SUPABASE_URL', ''),
+            'SUPABASE_ANON_KEY': vals.get('SUPABASE_ANON_KEY', ''),
+            'EDGE_FUNCTION_URL': vals.get('EDGE_FUNCTION_URL', ''),
+            'PLC_DIR': vals.get('PLC_DIR', ''),
+            'SMART_SYNC': str(vals.get('SMART_SYNC', 'true')).lower(),
+            'RANGE_MODE': vals.get('RANGE_MODE', 'yesterday'),
+            'CUSTOM_DATE_START': custom_date_start,
+            'CUSTOM_DATE_END': custom_date_end,
+            'MTIME_LAG_MIN': vals.get('MTIME_LAG_MIN', '15'),
+            'CHECK_LOCK': vals.get('CHECK_LOCK', 'true'),
+        }
+
+    def format_optional_timestamp(self, raw_value: object) -> str:
+        return format_optional_timestamp_text(raw_value)
+
+    def collect_retryable_upload_items(
+        self,
+        items: list[tuple[str, str, str, str]],
+        resume_map: dict[str, int],
+        failed_retry_set: tuple[core_state.FailedRetryEntry, ...],
+    ) -> list[tuple[str, str, str, str]]:
+        return list(
+            collect_retryable_upload_items_from_state(
+                items,
+                resume_map,
+                failed_retry_set,
+            )
+        )
+
+    def refresh_upload_action_buttons(self) -> None:
+        if not hasattr(self, "btn_start") or not self.btn_start.winfo_exists():
+            return
+        start_enabled = "normal"
+        if self.is_uploading or self.is_upload_preflight_blocked or self.state_health_blocks_upload:
+            start_enabled = "disabled"
+        retry_enabled = "normal" if (not self.is_uploading and not self.state_health_blocks_upload and self.has_retryable_state) else "disabled"
+        pause_enabled = "normal" if self.is_uploading else "disabled"
+        pause_text = self.btn_pause.cget("text") if hasattr(self, "btn_pause") else self.tr("dashboard.button.pause")
+        self.btn_start.configure(state=start_enabled)
+        self.btn_retry_failed.configure(state=retry_enabled)
+        self.btn_pause.configure(state=pause_enabled, text=pause_text)
+
+    def refresh_upload_operational_cards(self) -> None:
+        if self.current_view != "dashboard":
+            return
+        if not hasattr(self, "lbl_upload_precheck_summary") or not self.lbl_upload_precheck_summary.winfo_exists():
+            return
+
+        self.upload_operational_cards_request_id += 1
+        request_id = self.upload_operational_cards_request_id
+        self.is_upload_preflight_blocked = True
+        self.lbl_upload_precheck_summary.configure(
+            text=self.tr("common.status.waiting"),
+            text_color="gray",
+        )
+        self.lbl_upload_precheck_items.configure(text="")
+        self.refresh_upload_action_buttons()
+
+        if self.is_upload_operational_cards_refreshing:
+            return
+
+        self.is_upload_operational_cards_refreshing = True
+        cfg_snapshot = dict(self.cfg)
+        preview_scan_result = self.last_preview_scan_result
+        local_supabase_status_text = self.var_local_supabase_status.get()
+        dashboard_view_generation = self.dashboard_view_generation
+
+        def _run() -> None:
+            operational_cards_state: UploadOperationalCardsState | None = None
+            try:
+                state_health_snapshot = load_state_health_snapshot(True)
+                if state_health_snapshot["state"] == "blocked":
+                    dashboard_state_snapshot = {
+                        "resume": {},
+                        "recent_successful_upload_profile": None,
+                        "failed_retry_set": (),
+                    }
+                else:
+                    dashboard_state_snapshot = load_upload_dashboard_state_snapshot()
+                operational_cards_state = build_upload_operational_cards_state(
+                    cfg_snapshot,
+                    dashboard_state_snapshot,
+                    state_health_snapshot,
+                    preview_scan_result,
+                    local_supabase_status_text,
+                    self.tr_map,
+                )
+            except Exception as error:
+                operational_cards_state = UploadOperationalCardsState(
+                    recent_successful_upload_profile=None,
+                    failed_retry_set=(),
+                    state_health_status_text=self.tr("dashboard.state_store.status.recovery_required"),
+                    state_health_status_color="#E06C75",
+                    state_health_detail_lines=(str(error),),
+                    state_health_blocks_upload=True,
+                    is_upload_preflight_blocked=True,
+                    has_retryable_state=False,
+                    retryable_upload_items=(),
+                    preflight_status_text=self.tr("dashboard.upload.status.preflight_blocked"),
+                    preflight_status_color="#E06C75",
+                    preflight_detail_lines=(str(error),),
+                    resume_status_text=self.tr("dashboard.upload.status.resume_empty"),
+                    resume_status_color="gray",
+                    resume_detail_lines=(),
+                    recent_success_status_text=self.tr("dashboard.upload.status.recent_success_empty"),
+                    recent_success_status_color="gray",
+                    recent_success_detail_lines=(),
+                    can_rerun_recent_success=False,
+                )
+
+            def _apply() -> None:
+                self.is_upload_operational_cards_refreshing = False
+                if dashboard_view_generation == self.dashboard_view_generation:
+                    self.apply_upload_operational_cards_state(operational_cards_state)
+                if request_id != self.upload_operational_cards_request_id:
+                    self.refresh_upload_operational_cards()
+
+            self.schedule_gui_callback(0, _apply)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def apply_upload_operational_cards_state(
+        self,
+        operational_cards_state: UploadOperationalCardsState | None,
+    ) -> None:
+        if self.current_view != "dashboard":
+            return
+        if not hasattr(self, "lbl_upload_precheck_summary") or not self.lbl_upload_precheck_summary.winfo_exists():
+            return
+        if operational_cards_state is None:
+            return
+
+        self.upload_operational_cards_state = operational_cards_state
+        self.recent_successful_upload_profile = operational_cards_state.recent_successful_upload_profile
+        self.failed_retry_set = list(operational_cards_state.failed_retry_set)
+        self.state_health_blocks_upload = operational_cards_state.state_health_blocks_upload
+        self.is_upload_preflight_blocked = operational_cards_state.is_upload_preflight_blocked
+        self.has_retryable_state = operational_cards_state.has_retryable_state
+        self.retryable_upload_items = list(operational_cards_state.retryable_upload_items)
+        self.var_state_store_status.set(operational_cards_state.state_health_status_text)
+        if hasattr(self, "lbl_state_store_status") and self.lbl_state_store_status.winfo_exists():
+            self.lbl_state_store_status.configure(text_color=operational_cards_state.state_health_status_color)
+        if hasattr(self, "lbl_state_store_detail") and self.lbl_state_store_detail.winfo_exists():
+            self.lbl_state_store_detail.configure(text="\n".join(operational_cards_state.state_health_detail_lines))
+
+        self.lbl_upload_precheck_summary.configure(
+            text=operational_cards_state.preflight_status_text,
+            text_color=operational_cards_state.preflight_status_color,
+        )
+        self.lbl_upload_precheck_items.configure(text="\n".join(operational_cards_state.preflight_detail_lines))
+        self.lbl_upload_resume_state.configure(
+            text=operational_cards_state.resume_status_text,
+            text_color=operational_cards_state.resume_status_color,
+        )
+        self.lbl_upload_resume_detail.configure(text="\n".join(operational_cards_state.resume_detail_lines))
+        self.lbl_recent_success_state.configure(
+            text=operational_cards_state.recent_success_status_text,
+            text_color=operational_cards_state.recent_success_status_color,
+        )
+        self.lbl_recent_success_detail.configure(text="\n".join(operational_cards_state.recent_success_detail_lines))
+        self.btn_rerun_recent_success.configure(
+            state="normal" if operational_cards_state.can_rerun_recent_success else "disabled"
+        )
+
+        self.refresh_upload_action_buttons()
 
     def build_settings_form_values(self) -> dict[str, str]:
         return {
@@ -5188,49 +6131,68 @@ class App(ctk.CTk):
             return
         if not hasattr(self, 'lbl_local_supabase_status') or not self.lbl_local_supabase_status.winfo_exists():
             return
+        ui_state = self.build_local_supabase_ui_state_for_render()
+        self.apply_local_supabase_ui_state(ui_state)
 
+    def build_local_supabase_ui_state_for_render(self) -> LocalSupabaseUiState:
         supabase_url = self.cfg.get('SUPABASE_URL', '')
-        if not is_local_supabase_target(supabase_url):
-            runtime = None
-            is_ready = False
-            is_studio_ready = False
-        else:
-            try:
-                runtime = resolve_local_supabase_runtime(supabase_url, self.tr_map)
-                is_ready = is_local_supabase_stack_ready(runtime)
-                is_studio_ready = is_local_supabase_studio_ready(runtime)
-            except Exception:
-                runtime = None
-                is_ready = False
-                is_studio_ready = False
+        snapshot = self.local_supabase_status_snapshot
+        has_matching_snapshot = (
+            snapshot is not None and snapshot.supabase_url == supabase_url
+        )
 
-        ui_state = build_local_supabase_ui_state(
-            supabase_url,
-            self.is_supabase_starting,
-            self.is_supabase_stopping,
+        if not is_local_supabase_target(supabase_url):
+            self.local_supabase_status_snapshot = None
+            return build_local_supabase_ui_state(
+                supabase_url,
+                self.is_supabase_starting,
+                self.is_supabase_stopping,
+                self.pending_open_studio,
+                None,
+                False,
+                False,
+                self.tr_map,
+            )
+
+        if not has_matching_snapshot and not self.is_local_supabase_status_refreshing:
+            self.request_local_supabase_status_refresh()
+
+        if has_matching_snapshot:
+            runtime = snapshot.runtime
+            is_ready = snapshot.is_ready
+            is_studio_ready = snapshot.is_studio_ready
+            ui_state = build_local_supabase_ui_state(
+                supabase_url,
+                self.is_supabase_starting,
+                self.is_supabase_stopping,
+                self.pending_open_studio,
+                runtime,
+                is_ready,
+                is_studio_ready,
+                self.tr_map,
+            )
+            if is_ready:
+                self.clear_local_supabase_status_override()
+            if self.local_supabase_status_override is not None and not ui_state.show_progress and not is_ready:
+                return LocalSupabaseUiState(
+                    status_text=self.local_supabase_status_override.status_text,
+                    status_color=self.local_supabase_status_override.status_color,
+                    show_progress=False,
+                    start_button_text=ui_state.start_button_text,
+                    start_button_enabled=ui_state.start_button_enabled,
+                    studio_button_text=ui_state.studio_button_text,
+                    studio_button_enabled=ui_state.studio_button_enabled,
+                    stop_button_text=ui_state.stop_button_text,
+                    stop_button_enabled=ui_state.stop_button_enabled,
+                )
+            return ui_state
+
+        return build_local_supabase_checking_ui_state(
             self.pending_open_studio,
-            runtime,
-            is_ready,
-            is_studio_ready,
             self.tr_map,
         )
 
-        if is_ready:
-            self.clear_local_supabase_status_override()
-
-        if self.local_supabase_status_override is not None and not ui_state.show_progress and not is_ready:
-            ui_state = LocalSupabaseUiState(
-                status_text=self.local_supabase_status_override.status_text,
-                status_color=self.local_supabase_status_override.status_color,
-                show_progress=False,
-                start_button_text=ui_state.start_button_text,
-                start_button_enabled=ui_state.start_button_enabled,
-                studio_button_text=ui_state.studio_button_text,
-                studio_button_enabled=ui_state.studio_button_enabled,
-                stop_button_text=ui_state.stop_button_text,
-                stop_button_enabled=ui_state.stop_button_enabled,
-            )
-
+    def apply_local_supabase_ui_state(self, ui_state: LocalSupabaseUiState) -> None:
         self.var_local_supabase_status.set(ui_state.status_text)
         self.lbl_local_supabase_status.configure(text_color=ui_state.status_color)
         self.set_local_supabase_progress_visible(ui_state.show_progress)
@@ -5246,6 +6208,51 @@ class App(ctk.CTk):
             state="normal" if ui_state.stop_button_enabled else "disabled",
             text=ui_state.stop_button_text,
         )
+
+    def request_local_supabase_status_refresh(self) -> None:
+        if self.is_local_supabase_status_refreshing:
+            return
+
+        supabase_url = self.cfg.get('SUPABASE_URL', '')
+        self.local_supabase_status_request_id += 1
+        request_id = self.local_supabase_status_request_id
+
+        if not is_local_supabase_target(supabase_url):
+            self.local_supabase_status_snapshot = None
+            self.is_local_supabase_status_refreshing = False
+            return
+
+        self.is_local_supabase_status_refreshing = True
+
+        def _run() -> None:
+            try:
+                runtime = resolve_local_supabase_runtime(supabase_url, self.tr_map)
+                snapshot = LocalSupabaseStatusSnapshot(
+                    supabase_url=supabase_url,
+                    runtime=runtime,
+                    is_ready=is_local_supabase_stack_ready(runtime),
+                    is_studio_ready=is_local_supabase_studio_ready(runtime),
+                )
+            except Exception:
+                snapshot = LocalSupabaseStatusSnapshot(
+                    supabase_url=supabase_url,
+                    runtime=None,
+                    is_ready=False,
+                    is_studio_ready=False,
+                )
+
+            def _apply() -> None:
+                self.is_local_supabase_status_refreshing = False
+                if request_id != self.local_supabase_status_request_id:
+                    return
+                self.local_supabase_status_snapshot = snapshot
+                self.refresh_local_supabase_button()
+                if self.current_view == "dashboard":
+                    self.refresh_upload_operational_cards()
+
+            self.schedule_gui_callback(0, _apply)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def translate_wsl_storage_issue(self, issue_code: str) -> str:
         normalized_code = issue_code.strip()
@@ -5870,6 +6877,7 @@ class App(ctk.CTk):
             finally:
                 self.is_supabase_starting = False
                 self.pending_open_studio = False
+                self.local_supabase_status_snapshot = None
                 self.schedule_gui_callback(0, self.refresh_local_supabase_button)
                 self.schedule_gui_callback(0, self.request_wsl_storage_refresh)
 
@@ -5947,6 +6955,7 @@ class App(ctk.CTk):
                 should_close_application = stop_succeeded and self.pending_close_after_supabase_stop
                 self.is_supabase_stopping = False
                 self.pending_close_after_supabase_stop = False
+                self.local_supabase_status_snapshot = None
                 self.schedule_gui_callback(0, self.refresh_local_supabase_button)
                 self.schedule_gui_callback(0, self.request_wsl_storage_refresh)
                 if should_close_application:
@@ -5994,6 +7003,7 @@ class App(ctk.CTk):
             )
         saved_path = save_config(vals, None)
         self.cfg, self.config_source, self.config_metadata = load_config_with_sources(saved_path)
+        self.local_supabase_status_snapshot = None
         self.reload_translations()
         self.refresh_runtime_context_labels(self.cfg.get('SUPABASE_URL', ''), self.cfg.get('EDGE_FUNCTION_URL', ''))
         self.refresh_sidebar_texts()
@@ -6102,7 +7112,7 @@ class App(ctk.CTk):
                     else:
                         text = f"{task_key} - {done:,}행 처리"
                     if task_key not in self.task_labels:
-                        lbl = ctk.CTkLabel(self.tasks_frame, text=text, anchor="w")
+                        lbl = ctk.CTkLabel(self.active_tasks_list_frame, text=text, anchor="w")
                         lbl.pack(fill="x", padx=5, pady=2)
                         self.task_labels[task_key] = lbl
                     else:
@@ -6116,39 +7126,75 @@ class App(ctk.CTk):
 
     def on_preview(self):
         self.show_logs()
+        if not self._ensure_preview_state_ready():
+            return
         self.log(self.tr("logs.preview.started"))
         # 기존 미리보기 로직을 그대로 쓰고 로그만 GUI로 보냅니다.
         threading.Thread(target=self._run_preview_logic, daemon=True).start()
 
     def _run_preview_logic(self):
-        # 기존 미리보기 로직을 최소한으로 맞춰 사용합니다.
-        vals = self.cfg
-        custom_date_start, custom_date_end = resolve_custom_range_texts(
-            vals.get('CUSTOM_DATE_START', ''),
-            vals.get('CUSTOM_DATE_END', ''),
-            vals.get('CUSTOM_DATE', ''),
-        )
-        window_start, window_end = compute_date_window(vals['RANGE_MODE'], custom_date_start, custom_date_end)
-        items, excluded = preview_diagnostics(
-            vals['PLC_DIR'],
-            None,
-            window_start,
-            window_end,
-            15,
-            vals['RANGE_MODE']=='today',
-            True,
-            self.tr_map,
-        )
-        self.log(self.tr("dashboard.preview.log.target_count", count=len(items)))
-        for _, fn, _, _ in items[:20]:
-            self.log(f" - {fn}")
-        if len(items) > 20: self.log("...")
-        
-        if excluded:
-            self.log(self.tr("dashboard.preview.log.excluded_count", count=len(excluded)))
-            for _, fn, reason in excluded[:20]:
-                self.log(f" [X] {fn}: {reason}")
-            if len(excluded) > 20: self.log("...")
+        try:
+            vals, config_source, config_metadata = load_config_with_sources(None)
+            self.cfg = dict(vals)
+            self.config_source = config_source
+            self.config_metadata = config_metadata
+
+            plc_dir = str(vals.get('PLC_DIR', '')).strip()
+            range_mode = str(vals.get('RANGE_MODE', '')).strip()
+            if plc_dir == "":
+                raise ValueError("PLC_DIR is required for preview.")
+            if range_mode == "":
+                raise ValueError("RANGE_MODE is required for preview.")
+
+            custom_date_start, custom_date_end = resolve_custom_range_texts(
+                vals.get('CUSTOM_DATE_START', ''),
+                vals.get('CUSTOM_DATE_END', ''),
+                vals.get('CUSTOM_DATE', ''),
+            )
+            window_start, window_end = compute_date_window(range_mode, custom_date_start, custom_date_end)
+            lag_value = str(vals.get('MTIME_LAG_MIN', '15')).strip()
+            try:
+                lag_minutes = int(lag_value)
+            except ValueError as error:
+                raise ValueError(f"MTIME_LAG_MIN must be an integer: {lag_value}") from error
+            check_lock = str(vals.get('CHECK_LOCK', 'true')).strip().lower() == 'true'
+            processed = load_processed()
+            items, excluded = preview_diagnostics(
+                plc_dir,
+                None,
+                window_start,
+                window_end,
+                lag_minutes,
+                range_mode == 'today',
+                check_lock,
+                processed,
+                self.tr_map,
+            )
+            self.log(self.tr("dashboard.preview.log.target_count", count=len(items)))
+            for _, fn, _, _ in items[:20]:
+                self.log(f" - {fn}")
+            if len(items) > 20:
+                self.log("...")
+
+            if excluded:
+                self.log(self.tr("dashboard.preview.log.excluded_count", count=len(excluded)))
+                for _, fn, reason in excluded[:20]:
+                    self.log(f" [X] {fn}: {reason}")
+                if len(excluded) > 20:
+                    self.log("...")
+
+            self.last_preview_scan_result = build_preview_scan_result(
+                vals,
+                items,
+                excluded,
+                time.time(),
+                self.tr_map,
+            )
+            if items == []:
+                self.log(self.tr("dashboard.upload.log.no_targets"))
+            self.log(self.tr("logs.preview.completed"))
+        except Exception as error:
+            self.log(self.tr("logs.preview.failed", error=error), level="ERROR")
 
     def on_pause(self):
         if not self.is_uploading:
@@ -6168,7 +7214,15 @@ class App(ctk.CTk):
     def _apply_upload_button_state(self, is_uploading: bool, pause_enabled: bool, pause_text: str, start_enabled: bool):
         self.is_uploading = is_uploading
         self.btn_pause.configure(state="normal" if pause_enabled else "disabled", text=pause_text)
-        self.btn_start.configure(state="normal" if start_enabled else "disabled")
+        self.btn_preview.configure(
+            state="normal" if (not is_uploading and not self.state_health_blocks_upload) else "disabled"
+        )
+        self.btn_start.configure(
+            state="normal" if (start_enabled and not self.is_upload_preflight_blocked and not self.state_health_blocks_upload) else "disabled"
+        )
+        self.btn_retry_failed.configure(
+            state="normal" if (not is_uploading and not self.state_health_blocks_upload and self.has_retryable_state) else "disabled"
+        )
 
     def _apply_upload_dashboard_status(self, status_text: str, status_color: str):
         self.upload_dashboard_status_text = status_text
@@ -6180,19 +7234,98 @@ class App(ctk.CTk):
     def _schedule_upload_button_state(self, is_uploading: bool, pause_enabled: bool, pause_text: str, start_enabled: bool):
         self.schedule_gui_callback(0, self._apply_upload_button_state, is_uploading, pause_enabled, pause_text, start_enabled)
 
-    def on_start(self):
+    def _show_blocked_upload_state(self, state_health_snapshot: core_state.StateHealthSnapshot) -> None:
+        status_text, status_color, detail_lines = format_state_health_view(
+            state_health_snapshot,
+            lambda key, kwargs: self.tr(key, **kwargs),
+        )
+        self.state_health_blocks_upload = True
+        if hasattr(self, "var_state_store_status"):
+            self.var_state_store_status.set(status_text)
+        if hasattr(self, "lbl_state_store_status") and self.lbl_state_store_status.winfo_exists():
+            self.lbl_state_store_status.configure(text_color=status_color)
+        if hasattr(self, "lbl_state_store_detail") and self.lbl_state_store_detail.winfo_exists():
+            self.lbl_state_store_detail.configure(text="\n".join(detail_lines), text_color=status_color)
+        self.refresh_upload_action_buttons()
+        self.log(status_text, level="WARNING")
+        for detail_line in detail_lines:
+            self.log(detail_line, level="WARNING")
+        messagebox.showwarning(status_text, "\n".join(detail_lines))
+        self.refresh_upload_operational_cards()
+
+    def _ensure_upload_state_ready(self) -> bool:
+        state_health_snapshot = load_state_health_snapshot(False)
+        if state_health_snapshot["can_start_upload"]:
+            return True
+        self._show_blocked_upload_state(state_health_snapshot)
+        return False
+
+    def _ensure_preview_state_ready(self) -> bool:
+        state_health_snapshot = load_state_health_snapshot(False)
+        if state_health_snapshot["can_start_upload"]:
+            return True
+        self._show_blocked_upload_state(state_health_snapshot)
+        return False
+
+    def resolve_upload_candidate_items(
+        self,
+        vals: dict[str, str],
+        window_start: "date | None",
+        window_end: "date",
+        lag: int,
+        include_today: bool,
+        check_lock: bool,
+        retry_failed_only: bool,
+    ) -> tuple[list[tuple[str, str, str, str]], bool]:
+        fingerprint = build_upload_selection_fingerprint(vals)
+        if can_reuse_preview_scan_for_upload(
+            self.last_preview_scan_result,
+            fingerprint,
+            include_today,
+            retry_failed_only,
+            time.time(),
+        ):
+            processed = load_processed()
+            reusable_items = collect_reusable_preview_candidate_items(
+                self.last_preview_scan_result,
+                processed,
+                window_start,
+                window_end,
+                lag,
+                include_today,
+                check_lock,
+            )
+            if reusable_items is not None:
+                return list(reusable_items), True
+
+        items = list_candidates(
+            vals['PLC_DIR'],
+            None,
+            window_start,
+            window_end,
+            lag,
+            include_today,
+            check_lock,
+        )
+        return items, False
+
+    def start_upload_with_values(self, vals: dict[str, str], retry_failed_only: bool) -> None:
         self.show_dashboard()
+        if not self._ensure_upload_state_ready():
+            return
         if self.is_data_task_running:
             self.show_warning(
                 "dialog.data_task_running.title",
                 "dashboard.upload.data_task_blocked",
             )
             return
-        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+
+        self.cfg = dict(vals)
         self.refresh_runtime_context_labels(self.cfg.get('SUPABASE_URL', ''), self.cfg.get('EDGE_FUNCTION_URL', ''))
         self.refresh_local_supabase_button()
         if not self.ensure_local_supabase_ready(self.tr("dashboard.upload.action.start")):
             return
+
         resolved_edge = compute_edge_url(self.cfg)
         if is_edge_url_origin_mismatch(self.cfg.get('EDGE_FUNCTION_URL', ''), self.cfg.get('SUPABASE_URL', '')):
             self.log(
@@ -6205,18 +7338,81 @@ class App(ctk.CTk):
                 resolved_edge=resolved_edge,
             )
             return
+
         self.processed_count = 0
         self.total_files = 0
         with self.progress_lock:
             self.active_progress.clear()
-            
-        self.pause_event.set()
-        self._apply_upload_dashboard_status(self.tr("common.status.uploading"), "#3B8ED0")
-        self._apply_upload_button_state(True, True, self.tr("dashboard.button.pause"), False)
-            
-        threading.Thread(target=self._run_upload, args=(self.cfg,), daemon=True).start()
 
-    def _run_upload(self, vals: dict):
+        self.pause_event.set()
+        dashboard_status_text = self.tr("common.status.uploading")
+        if retry_failed_only:
+            dashboard_status_text = self.tr("dashboard.upload.status.retrying_failed")
+        self._apply_upload_dashboard_status(dashboard_status_text, "#3B8ED0")
+        self._apply_upload_button_state(True, True, self.tr("dashboard.button.pause"), False)
+        threading.Thread(target=self._run_upload, args=(dict(self.cfg), retry_failed_only), daemon=True).start()
+
+    def on_start(self):
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        self.start_upload_with_values(dict(self.cfg), False)
+
+    def on_retry_failed(self):
+        if not self._ensure_upload_state_ready():
+            return
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        custom_date_start, custom_date_end = resolve_custom_range_texts(
+            self.cfg.get('CUSTOM_DATE_START', ''),
+            self.cfg.get('CUSTOM_DATE_END', ''),
+            self.cfg.get('CUSTOM_DATE', ''),
+        )
+        window_start, window_end = compute_date_window(
+            self.cfg['RANGE_MODE'],
+            custom_date_start,
+            custom_date_end,
+        )
+        try:
+            lag = int(self.cfg.get('MTIME_LAG_MIN', '15'))
+        except Exception:
+            lag = 15
+        dashboard_state_snapshot = load_upload_dashboard_state_snapshot()
+        retry_items = self.collect_retryable_upload_items(
+            list_candidates(
+                self.cfg['PLC_DIR'],
+                None,
+                window_start,
+                window_end,
+                lag,
+                self.cfg['RANGE_MODE'] == 'today',
+                self.cfg.get('CHECK_LOCK', 'true') == 'true',
+            ),
+            dashboard_state_snapshot["resume"],
+            dashboard_state_snapshot["failed_retry_set"],
+        )
+        if retry_items == []:
+            self.refresh_upload_operational_cards()
+            return
+        self.start_upload_with_values(dict(self.cfg), True)
+
+    def on_rerun_recent_success(self):
+        if not self._ensure_upload_state_ready():
+            return
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        self.recent_successful_upload_profile = load_recent_successful_upload_profile()
+        if self.recent_successful_upload_profile is None:
+            return
+        profile_values = self.recent_successful_upload_profile.get("values")
+        if not isinstance(profile_values, dict):
+            return
+        rerun_values = dict(self.cfg)
+        rerun_values.update(
+            {
+                str(key): str(value)
+                for key, value in profile_values.items()
+            }
+        )
+        self.start_upload_with_values(rerun_values, False)
+
+    def _run_upload(self, vals: dict[str, str], retry_failed_only: bool):
         final_message = ""
         final_level = "INFO"
         dashboard_status_text = self.tr("common.status.waiting")
@@ -6279,7 +7475,24 @@ class App(ctk.CTk):
             # Start Upload는 현재 데이터 폴더만 사용합니다.
             pdir = vals['PLC_DIR']
             self.log(self.tr("dashboard.upload.log.scan_folder", folder_path=pdir))
-            items = list_candidates(pdir, None, window_start, window_end, lag, include_today, check_lock)
+            items, reused_preview = self.resolve_upload_candidate_items(
+                vals,
+                window_start,
+                window_end,
+                lag,
+                include_today,
+                check_lock,
+                retry_failed_only,
+            )
+            if reused_preview:
+                self.log(self.tr("dashboard.upload.log.reused_preview", file_count=len(items)))
+            if retry_failed_only:
+                dashboard_state_snapshot = load_upload_dashboard_state_snapshot()
+                items = self.collect_retryable_upload_items(
+                    items,
+                    dashboard_state_snapshot["resume"],
+                    dashboard_state_snapshot["failed_retry_set"],
+                )
             self.log(self.tr("dashboard.upload.log.found_files", file_count=len(items)))
             if not items and os.path.exists(pdir):
                 self.log(self.tr("dashboard.upload.log.folder_preview", file_names=os.listdir(pdir)[:5]))
@@ -6293,8 +7506,10 @@ class App(ctk.CTk):
                 dashboard_status_text = self.tr("dashboard.upload.status.no_targets")
                 dashboard_status_color = "#E5C07B"
                 return
+            self.last_preview_scan_result = None
 
             count_lock = threading.Lock()
+            core_upload = load_core_upload_module()
             session_items = [
                 core_upload.build_upload_session_item(folder, fn, path, kind)
                 for folder, fn, path, kind in items
@@ -6329,7 +7544,17 @@ class App(ctk.CTk):
                 build_temp=None,
                 get_resume_offset=get_resume_offset,
                 set_resume_offset_fn=set_resume_offset,
-                log_processed_fn=log_processed,
+                mark_file_completed_fn=mark_file_completed,
+                record_file_failure_fn=record_file_failure,
+                start_upload_run_fn=start_upload_run,
+                finish_upload_run_fn=finish_upload_run,
+                retry_failed_only=retry_failed_only,
+                recent_successful_upload_profile={
+                    "profile_name": kst_now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "applied_at": time.time(),
+                    "values": self.build_upload_profile_values(vals),
+                },
+                runtime_config_values=self.build_upload_profile_values(vals),
                 log=self.log,
                 pause_event=self.pause_event,
                 progress_cb=on_file_progress,
@@ -6359,15 +7584,16 @@ class App(ctk.CTk):
                 final_level = "WARNING"
                 dashboard_status_text = self.tr("dashboard.upload.status.partial_failure")
                 dashboard_status_color = "#E5C07B"
-            elif session_result.warning_messages:
-                final_message = self.tr("dashboard.upload.log.completed_with_warning")
-                final_level = "WARNING"
-                dashboard_status_text = self.tr("dashboard.upload.status.completed_with_warning")
-                dashboard_status_color = "#E5C07B"
             else:
-                final_message = self.tr("dashboard.upload.log.completed")
-                dashboard_status_text = self.tr("dashboard.upload.status.completed")
-                dashboard_status_color = "#2CC985"
+                if session_result.warning_messages:
+                    final_message = self.tr("dashboard.upload.log.completed_with_warning")
+                    final_level = "WARNING"
+                    dashboard_status_text = self.tr("dashboard.upload.status.completed_with_warning")
+                    dashboard_status_color = "#E5C07B"
+                else:
+                    final_message = self.tr("dashboard.upload.log.completed")
+                    dashboard_status_text = self.tr("dashboard.upload.status.completed")
+                    dashboard_status_color = "#2CC985"
         except Exception as error:
             final_message = self.tr("dashboard.upload.log.failed", error=error)
             final_level = "ERROR"
@@ -6380,6 +7606,7 @@ class App(ctk.CTk):
             self.pause_event.set()
             self._schedule_upload_button_state(False, False, self.tr("dashboard.button.pause"), True)
             self._schedule_upload_dashboard_status(dashboard_status_text, dashboard_status_color)
+            self.schedule_gui_callback(0, self.refresh_upload_operational_cards)
             if final_message:
                 self.log(final_message, level=final_level)
 

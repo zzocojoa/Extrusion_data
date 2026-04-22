@@ -34,10 +34,8 @@ Extrusion Uploader는 GUI 중심 앱입니다. 사용자는 `ExtrusionUploader.e
 | 업로드된 측정 데이터 | 로컬 Supabase `public.all_metrics` | 물리적으로는 WSL 쪽 DB에 저장됩니다. |
 | 원본 CSV | `PLC_DIR` | 현재 `Start Upload`는 이 폴더만 읽습니다. |
 | 실제 지속 설정 | `%APPDATA%\ExtrusionUploader\config.ini` | GUI 저장도 이 파일에 반영됩니다. |
-| 상태 스냅샷 | `%APPDATA%\ExtrusionUploader\state_manifest.json` | 처리 완료 목록과 재개 오프셋의 기준 스냅샷입니다. |
-| 업로드 이력 | `%APPDATA%\ExtrusionUploader\processed_files.log` | 이미 처리한 파일 기록입니다. |
-| 업로드 재개 상태 | `%APPDATA%\ExtrusionUploader\upload_resume.json` | 파일별 재개 오프셋입니다. |
-| 상태 잠금 파일 | `%APPDATA%\ExtrusionUploader\state_manifest.json.lock` | 동시 실행 시 상태 파일 쓰기를 직렬화하는 임시 lock 파일입니다. |
+| 업로드 상태 저장소 | `%APPDATA%\ExtrusionUploader\uploader_state.db` | 처리 완료, 재개 오프셋, 실패 재시도 집합, 최근 성공 프로필의 유일한 source of truth 입니다. |
+| 상태 마이그레이션 백업 | `%APPDATA%\ExtrusionUploader\migration_backups\` | legacy 상태 파일이나 이전 DB를 복구용으로 보관하는 스냅샷입니다. |
 | 프로젝트 백업 | `BACKUP_DIR` 또는 기본 `backups/` | 실시간 DB와 별개인 SQL 백업입니다. |
 | 장기 보관 아카이브 | `ARCHIVE_DIR` | `public.all_metrics`를 Parquet로 내보내는 경로입니다. |
 
@@ -66,17 +64,27 @@ NAS를 사용할 경우:
 - `core.upload.upload_item`을 사용하며 `Authorization` + `apikey` 헤더에 `SUPABASE_ANON_KEY`를 사용합니다.
 - 큰 CSV는 기본적으로 `10000`행씩 읽고, 각 청크를 다시 `2000`행씩 잘라 Edge Function으로 순차 전송합니다.
 - 서버측 Edge Function은 받은 레코드를 그대로 한 번에 upsert하지 않고, 최대 `1000`건 또는 대략 `512 KiB` JSON 크기 기준으로 다시 나눠 `all_metrics`에 upsert 합니다.
-- 재시도/재개 상태는 AppData 하위의 `state_manifest.json`, `processed_files.log`, `upload_resume.json`로 함께 관리됩니다.
-- 상태 파일 쓰기는 `state_manifest.json.lock` 기반 프로세스 락으로 보호되며, stale PID lock 정리와 최대 `10초` 대기를 사용합니다.
+- 재시도/재개 상태는 `%APPDATA%\ExtrusionUploader\uploader_state.db` 하나로 관리됩니다.
+- SQLite는 `WAL`, `synchronous=FULL`, `busy_timeout=10000` 설정으로 동작합니다.
+- 완료 커밋은 `completed + resume_offset=0 + failed_retry_set 제거`를 한 트랜잭션으로 기록합니다.
+- 실패 커밋은 `failed + resume_offset + error + failed_retry_set`를 한 트랜잭션으로 기록합니다.
 - `Start Upload`는 현재 `PLC_DIR`만 사용합니다.
 - `EDGE_FUNCTION_URL`이 비어 있으면 `SUPABASE_URL/functions/v1/upload-metrics`로 자동 계산합니다.
 - `RANGE_MODE=custom`이면 `CUSTOM_DATE_START`, `CUSTOM_DATE_END`를 함께 사용하고, 해당 기간의 파일만 포함합니다.
 - Smart Sync는 업로드 세션 중 `edge_url + device_id` 기준 최신 timestamp를 캐시해 재사용합니다. 조회 실패 시에는 경고만 남기고 전체 업로드로 계속 진행합니다.
 - Smart Sync 필터는 청크 단위로 적용되며, 서버 최신 시각 이하 행은 업로드 전에 제외됩니다.
-- 재개 오프셋은 청크 성공 시마다 파일별 처리 위치로 갱신되고, 파일이 끝까지 완료되면 처리 이력을 남긴 뒤 해당 오프셋은 `0`으로 초기화됩니다.
+- 재개 오프셋은 청크 성공 시마다 파일별 처리 위치로 갱신되고, 파일이 끝까지 완료되면 같은 트랜잭션에서 `0`으로 정리됩니다.
 - Dashboard의 전체 진행률은 `완료 파일 수 / 전체 대상 파일 수` 기준이며, 개별 active task는 파일별 `done/total` 세부 진행률을 따로 표시합니다. 총행을 알 수 없는 구간은 처리 행 수 중심으로 표시됩니다.
 - GUI는 수동 `EDGE_FUNCTION_URL`이 `SUPABASE_URL`과 다른 호스트를 가리키면 업로드를 시작하지 않습니다.
 - `UI_LANGUAGE`는 AppData `config.ini`를 기준으로 저장되며, 배포본에서도 동일한 설정 우선순위를 유지합니다.
+
+## 상태 저장소와 복구
+- Dashboard는 시작 직후 상태 저장소를 점검하고 `준비됨`, `이어올 복구 작업 있음`, `복구 필요` 중 하나로 표시합니다.
+- `failed retry` 또는 `resume` 항목이 있으면 업로드는 계속 시작할 수 있지만, 먼저 `Retry Failed` 또는 기존 범위 재실행으로 이어받는 것이 안전합니다.
+- DB 손상이나 integrity 실패가 감지되면 앱은 fail-closed로 업로드를 막습니다. 이때는 `%APPDATA%\ExtrusionUploader\uploader_state.db`를 즉시 수정하지 말고 먼저 별도 이름으로 격리 보관하십시오.
+- 복구는 `%APPDATA%\ExtrusionUploader\migration_backups\`의 가장 최근 스냅샷에서 `uploader_state.db`를 먼저 복원하는 방식이 기본입니다.
+- legacy 파일만 남아 있고 SQLite가 없으면 앱이 자동으로 재생성하지 않습니다. 이런 경우에만 명시적으로 `python -c "from core import state; state.migrate_legacy_state()"`를 실행해 SQLite를 다시 만들어야 합니다.
+- `EXTRUSION_STATE_DB_READ_MODE=legacy`는 비교/점검용 debug 경로로만 남겨둡니다. 정상 업로드 운영에서는 사용하지 않습니다.
 
 ## 주요 운영 기능
 - GUI `Start Upload`는 `PLC_DIR`의 원본 CSV를 읽어 업로드합니다.
@@ -101,7 +109,7 @@ NAS를 사용할 경우:
 - `EDGE_FUNCTION_URL`은 기본적으로 비워 두는 편이 안전합니다. 비워 두면 `SUPABASE_URL` 기준으로 자동 계산됩니다.
 - 커스텀 `EDGE_FUNCTION_URL` override는 가능하지만, 다른 호스트를 가리키면 Settings 저장 시 경고가 뜨고 `Start Upload`는 실제로 차단됩니다.
 - `WSL_VHDX_PATH`를 AppData `config.ini`, `.env`, 또는 `os.environ`에 넣어야 Dashboard가 host 쪽 `ext4.vhdx` 파일 크기와 드라이브 여유 공간을 그 경로 기준으로 표시합니다.
-- 상태 파일 옆의 `.lock` 파일은 동시 실행 보호용 임시 파일입니다. 앱 비정상 종료 뒤 남아 있어도 다음 실행에서 stale PID를 정리하도록 되어 있습니다.
+- 상태 저장소 손상이나 startup 차단이 보이면 먼저 Dashboard의 상태 저장소 문구를 확인하고, 필요 시 `migration_backups` 스냅샷으로 복구하십시오.
 - `apikey` 헤더 제거 금지.
 - 실제 크리덴셜/백업은 커밋 금지; `data/`, `logs/`는 gitignore 대상.
 - 배포본의 UI 문자열은 locale 리소스 파일을 기준으로 표시되므로, exe 배포 시 i18n 자원이 함께 포함되어야 합니다.

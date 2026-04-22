@@ -5,6 +5,8 @@ import pandas as pd
 
 
 KST = timezone(timedelta(hours=9))
+PLC_DEVICE_ID = "extruder_plc"
+INTEGRATED_PLC_DEVICE_ID = "extruder_integrated"
 
 
 def parse_plc_date_from_filename(name: str) -> datetime | None:
@@ -119,7 +121,7 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
 
             out = pd.DataFrame()
             out["timestamp"] = timestamp_series
-            # out["device_id"] = "extruder_integrated" if is_integrated else "extruder_plc" # Removed
+            out["device_id"] = INTEGRATED_PLC_DEVICE_ID if is_integrated else PLC_DEVICE_ID
             
             # Map standard columns
             for key in [

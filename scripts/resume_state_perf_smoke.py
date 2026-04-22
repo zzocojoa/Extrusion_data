@@ -29,9 +29,7 @@ class SmokeMetrics(TypedDict):
     repeat_count: int
     elapsed_ms_total: float
     elapsed_ms_per_write: float
-    manifest_size_bytes: int
-    log_size_bytes: int
-    resume_size_bytes: int
+    db_size_bytes: int
 
 
 class SmokeReport(TypedDict):
@@ -54,12 +52,6 @@ def build_temp_file(workspace: Path) -> Path:
     return target_path
 
 
-def read_text_lines(path: Path) -> list[str]:
-    if not path.exists():
-        return []
-    return path.read_text(encoding="utf-8").splitlines()
-
-
 def run_smoke() -> SmokeReport:
     temp_root = Path(tempfile.mkdtemp(prefix="resume-state-smoke-"))
     original_appdata = os.environ.get("APPDATA")
@@ -69,52 +61,34 @@ def run_smoke() -> SmokeReport:
         sample_path = build_temp_file(temp_root)
         resume_key = core_state.build_file_state_key("folder", "sample.csv", str(sample_path))
 
-        core_state.log_processed("folder", "sample.csv", str(sample_path), None)
         core_state.set_resume_offset(resume_key, FIXED_OFFSET, None)
 
-        manifest_path = Path(core_state.get_manifest_path(None))
-        log_path = Path(core_state.get_log_path(None))
-        resume_path = Path(core_state.get_resume_path(None))
-
-        manifest_size_before = manifest_path.stat().st_size
-        log_size_before = log_path.stat().st_size
-        resume_size_before = resume_path.stat().st_size
+        db_path = Path(core_state.get_db_path(None))
+        db_size_before = db_path.stat().st_size
 
         started_at = time.perf_counter()
         for _ in range(REPEAT_COUNT):
             core_state.set_resume_offset(resume_key, FIXED_OFFSET, None)
         elapsed_ms_total = (time.perf_counter() - started_at) * 1000.0
 
-        manifest_size_after = manifest_path.stat().st_size
-        log_size_after = log_path.stat().st_size
-        resume_size_after = resume_path.stat().st_size
+        db_size_after = db_path.stat().st_size
 
-        processed_keys = core_state.load_processed(None)
         resume_map_before_clear = core_state.load_resume(None)
-        core_state.set_resume_offset(resume_key, 0, None)
+        core_state.mark_file_completed("folder", "sample.csv", str(sample_path), None, None)
+        processed_keys = core_state.load_processed(None)
         resume_map_after_clear = core_state.load_resume(None)
-        log_lines = read_text_lines(log_path)
+        failed_retry_set_after_clear = core_state.load_failed_retry_set(None)
 
         checks = [
             build_check(
                 "processed_marker_stable",
-                resume_key in processed_keys and "folder/sample.csv" in processed_keys and "sample.csv" in processed_keys,
+                processed_keys == {resume_key, "folder/sample.csv"},
                 json.dumps(sorted(processed_keys), ensure_ascii=False),
             ),
             build_check(
-                "manifest_size_stable",
-                manifest_size_before == manifest_size_after,
-                f"before={manifest_size_before}, after={manifest_size_after}",
-            ),
-            build_check(
-                "legacy_log_size_stable",
-                log_size_before == log_size_after,
-                f"before={log_size_before}, after={log_size_after}",
-            ),
-            build_check(
-                "resume_size_stable",
-                resume_size_before == resume_size_after,
-                f"before={resume_size_before}, after={resume_size_after}",
+                "db_size_nonshrinking",
+                db_size_after >= db_size_before,
+                f"before={db_size_before}, after={db_size_after}",
             ),
             build_check(
                 "resume_value_persisted",
@@ -127,9 +101,9 @@ def run_smoke() -> SmokeReport:
                 json.dumps(resume_map_after_clear, ensure_ascii=False, sort_keys=True),
             ),
             build_check(
-                "legacy_log_line_count",
-                len(log_lines) == 1,
-                json.dumps(log_lines, ensure_ascii=False),
+                "failed_retry_set_empty_after_clear",
+                failed_retry_set_after_clear == (),
+                json.dumps(failed_retry_set_after_clear, ensure_ascii=False),
             ),
         ]
 
@@ -137,9 +111,7 @@ def run_smoke() -> SmokeReport:
             "repeat_count": REPEAT_COUNT,
             "elapsed_ms_total": round(elapsed_ms_total, 3),
             "elapsed_ms_per_write": round(elapsed_ms_total / float(REPEAT_COUNT), 6),
-            "manifest_size_bytes": manifest_size_after,
-            "log_size_bytes": log_size_after,
-            "resume_size_bytes": resume_size_after,
+            "db_size_bytes": db_size_after,
         }
         return {
             "checks": checks,

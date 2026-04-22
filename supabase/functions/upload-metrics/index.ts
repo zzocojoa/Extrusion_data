@@ -1,11 +1,8 @@
-// supabase/functions/upload-metrics/index.ts
-
-// Supabase Edge Functions (Deno)용 v2 클라이언트
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 type Metric = {
   timestamp: string;
-  // device_id: string; // Removed
+  device_id: string;
   temperature?: number | null;
   main_pressure?: number | null;
   billet_length?: number | null;
@@ -14,7 +11,6 @@ type Metric = {
   production_counter?: number | null;
   current_speed?: number | null;
   extrusion_end_position?: number | null;
-  // New columns
   mold_1?: number | null;
   mold_2?: number | null;
   mold_3?: number | null;
@@ -28,9 +24,26 @@ type Metric = {
   billet_cycle_id?: number | null;
 };
 
+type JsonMap = {
+  [key: string]: unknown;
+};
+
+type UploadPayload = {
+  records: ReadonlyArray<unknown>;
+};
+
+type LatestTimestampRow = {
+  timestamp: string | null;
+};
+
+type NumericMetricKey = Exclude<
+  keyof Metric,
+  "timestamp" | "device_id" | "die_id"
+>;
+
 const ALLOWED_KEYS = new Set<keyof Metric>([
   "timestamp",
-  // "device_id",
+  "device_id",
   "temperature",
   "main_pressure",
   "billet_length",
@@ -52,15 +65,75 @@ const ALLOWED_KEYS = new Set<keyof Metric>([
   "billet_cycle_id",
 ]);
 
+const NUMERIC_KEYS = new Set<NumericMetricKey>([
+  "temperature",
+  "main_pressure",
+  "billet_length",
+  "container_temp_front",
+  "container_temp_rear",
+  "production_counter",
+  "current_speed",
+  "extrusion_end_position",
+  "mold_1",
+  "mold_2",
+  "mold_3",
+  "mold_4",
+  "mold_5",
+  "mold_6",
+  "billet_temp",
+  "at_pre",
+  "at_temp",
+  "billet_cycle_id",
+]);
+
 const UPSERT_BATCH_MAX_RECORDS = 1000;
 const UPSERT_BATCH_MAX_BYTES = 512 * 1024;
 const JSON_ENCODER = new TextEncoder();
+
+function isJsonMap(value: unknown): value is JsonMap {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasRecordsArray(value: unknown): value is UploadPayload {
+  return isJsonMap(value) && Array.isArray(value.records);
+}
+
+function toNonEmptyString(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const normalized = String(value).trim();
+  if (normalized.length === 0) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function toNumberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim().length > 0) {
+    const normalized = Number(value);
+    if (Number.isFinite(normalized)) {
+      return normalized;
+    }
+  }
+
+  return null;
+}
 
 function getRecordSizeBytes(record: Metric): number {
   return JSON_ENCODER.encode(JSON.stringify(record)).length + 1;
 }
 
-// 업서트 요청을 레코드 수와 대략적인 JSON 크기 기준으로 다시 나눈다.
 function splitIntoUpsertBatches(
   records: ReadonlyArray<Metric>,
   maxRecords: number,
@@ -95,66 +168,61 @@ function splitIntoUpsertBatches(
   return batches;
 }
 
-// 숫자 필드 안전 캐스팅
-function toNumberOrNull(value: unknown): number | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim() !== "") {
-    const n = Number(value);
-    if (Number.isFinite(n)) return n;
-  }
-  return null;
-}
-
-// 레코드 정제: 허용된 키만 남기고, 타입 맞추기
-function cleanRecord(raw: Record<string, unknown>): Metric | null {
+function cleanRecord(raw: JsonMap): Metric | null {
   const cleaned: Partial<Metric> = {};
 
   for (const [key, value] of Object.entries(raw)) {
-    if (!ALLOWED_KEYS.has(key as keyof Metric)) continue;
+    const metricKey = key as keyof Metric;
+    if (!ALLOWED_KEYS.has(metricKey)) {
+      continue;
+    }
 
-    if (key === "timestamp") {
-      if (typeof value !== "string") return null;
-      cleaned[key] = value;
-    } else if (key === "die_id") {
-      // die_id는 문자열 (null 허용)
-      if (value === null || value === undefined) {
-        cleaned[key] = null;
-      } else {
-        cleaned[key] = String(value);
+    if (metricKey === "timestamp" || metricKey === "device_id") {
+      const normalized = toNonEmptyString(value);
+      if (normalized === null) {
+        return null;
       }
-    } else {
-      // 나머지 키는 모두 숫자형(또는 null)
-      (cleaned as any)[key] = toNumberOrNull(value);
+      cleaned[metricKey] = normalized;
+      continue;
+    }
+
+    if (metricKey === "die_id") {
+      cleaned.die_id = toNonEmptyString(value);
+      continue;
+    }
+
+    const numericKey = metricKey as NumericMetricKey;
+    if (NUMERIC_KEYS.has(numericKey)) {
+      cleaned[numericKey] = toNumberOrNull(value);
     }
   }
 
-  if (typeof cleaned.timestamp !== "string") {
+  if (
+    typeof cleaned.timestamp !== "string" ||
+    typeof cleaned.device_id !== "string"
+  ) {
     return null;
   }
 
   return cleaned as Metric;
 }
 
-// 환경변수 헬퍼 (로그만 찍고 undefined 반환)
 function getEnv(name: string): string | undefined {
   const value = Deno.env.get(name);
   if (!value) {
-    console.warn(`Environment variable ${name} is not set`);
+    console.warn("환경 변수가 설정되지 않았습니다", { name });
   }
   return value;
 }
 
-// Supabase 클라이언트 생성
 function createSupabaseClient(req: Request): SupabaseClient {
   const url = getEnv("SUPABASE_URL") ??
-    "http://supabase_kong_Extrusion_data:8000"; // 컨테이너 이름 사용
-
+    "http://supabase_kong_Extrusion_data:8000";
   const anonKey = getEnv("SUPABASE_ANON_KEY");
   const authHeader = req.headers.get("Authorization");
 
   if (!anonKey) {
-    throw new Error("SUPABASE_ANON_KEY is not set");
+    throw new Error("SUPABASE_ANON_KEY가 설정되지 않았습니다");
   }
 
   return createClient(url, anonKey, {
@@ -169,11 +237,7 @@ function createSupabaseClient(req: Request): SupabaseClient {
   });
 }
 
-// 공통 JSON 응답 헬퍼
-function jsonResponse(
-  body: unknown,
-  status: number,
-): Response {
+function jsonResponse(body: unknown, status: number): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
@@ -182,170 +246,247 @@ function jsonResponse(
   });
 }
 
-// 메인 핸들러
-Deno.serve(async (req: Request): Promise<Response> => {
-  // 1) 메서드 체크
-  console.log("Edge Function Filter: Version 2.0 (No Device ID)");
-  if (req.method === "GET") {
-    // GET: 최신 타임스탬프 조회 (Smart Sync)
-    // device_id 파라미터는 무시합니다 (이제 단일 스트림)
+function getDeviceIdFromRequest(req: Request): string | null {
+  const url = new URL(req.url);
+  return toNonEmptyString(url.searchParams.get("device_id"));
+}
 
-    let supabase: SupabaseClient;
-    try {
-      supabase = createSupabaseClient(req);
-    } catch (e) {
-      return jsonResponse(
-        { success: false, error: "Server config error" },
-        500,
-      );
-    }
+function extractRawRecords(body: unknown): ReadonlyArray<unknown> | null {
+  if (Array.isArray(body)) {
+    return body;
+  }
 
-    const { data, error } = await supabase
-      .from("all_metrics")
-      .select("timestamp")
-      // .eq("device_id", deviceId) // Removed filtering
-      .order("timestamp", { ascending: false })
-      .limit(1)
-      .single();
+  if (hasRecordsArray(body)) {
+    return body.records;
+  }
 
-    if (error && error.code !== "PGRST116") { // PGRST116: No rows found
-      return jsonResponse({ success: false, error: error.message }, 500);
-    }
+  return null;
+}
 
+async function readLatestTimestampByDevice(
+  supabase: SupabaseClient,
+  deviceId: string,
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("all_metrics")
+    .select("timestamp")
+    .eq("device_id", deviceId)
+    .order("timestamp", { ascending: false })
+    .limit(1);
+
+  if (error) {
+    throw new Error(
+      `최신 시각 조회 실패(device_id=${deviceId}, message=${error.message}, code=${
+        error.code ?? "unknown"
+      })`,
+    );
+  }
+
+  if (!Array.isArray(data) || data.length === 0) {
+    return null;
+  }
+
+  const row = data[0] as LatestTimestampRow;
+  return row.timestamp ?? null;
+}
+
+async function upsertMetricBatch(
+  supabase: SupabaseClient,
+  batch: ReadonlyArray<Metric>,
+): Promise<number> {
+  const { data, error } = await supabase
+    .from("all_metrics")
+    .upsert(batch, {
+      onConflict: "timestamp,device_id",
+    })
+    .select("timestamp,device_id");
+
+  if (error) {
+    throw new Error(
+      `메트릭 upsert 실패(message=${error.message}, code=${
+        error.code ?? "unknown"
+      }, batch_size=${batch.length})`,
+    );
+  }
+
+  return Array.isArray(data) ? data.length : 0;
+}
+
+async function handleGet(req: Request): Promise<Response> {
+  const deviceId = getDeviceIdFromRequest(req);
+  if (deviceId === null) {
+    return jsonResponse(
+      {
+        success: false,
+        error: "device_id 쿼리 파라미터가 필요합니다",
+      },
+      400,
+    );
+  }
+
+  let supabase: SupabaseClient;
+  try {
+    supabase = createSupabaseClient(req);
+  } catch (error) {
+    console.error("Supabase 클라이언트 생성 실패", { error, deviceId });
+    return jsonResponse(
+      {
+        success: false,
+        error: "서버 설정 오류",
+      },
+      500,
+    );
+  }
+
+  try {
+    const latestTimestamp = await readLatestTimestampByDevice(
+      supabase,
+      deviceId,
+    );
     return jsonResponse(
       {
         success: true,
-        latest_timestamp: data?.timestamp || null,
+        latest_timestamp: latestTimestamp,
       },
       200,
     );
-  }
-
-  if (req.method !== "POST") {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("최신 시각 조회 처리 실패", { error: message, deviceId });
     return jsonResponse(
       {
         success: false,
-        error: "Method not allowed. Use POST or GET.",
+        error: message,
       },
-      405,
+      500,
     );
   }
+}
 
-  // 2) JSON 파싱
+async function handlePost(req: Request): Promise<Response> {
   let body: unknown;
   try {
     body = await req.json();
-  } catch (e) {
-    console.error("Failed to parse JSON body:", e);
+  } catch (error) {
+    console.error("JSON 본문 파싱 실패", { error });
     return jsonResponse(
       {
         success: false,
-        error: "Invalid JSON body",
+        error: "유효한 JSON 본문이 필요합니다",
       },
       400,
     );
   }
 
-  // 3) records 배열 추출
-  let rawRecords: unknown;
-  if (Array.isArray(body)) {
-    rawRecords = body;
-  } else if (
-    body &&
-    typeof body === "object" &&
-    Array.isArray((body as any).records)
-  ) {
-    rawRecords = (body as any).records;
-  } else {
+  const rawRecords = extractRawRecords(body);
+  if (rawRecords === null) {
     return jsonResponse(
       {
         success: false,
-        error: 'Request body must be an array or contain a "records" array',
+        error: '본문은 배열이거나 "records" 배열을 포함해야 합니다',
       },
       400,
     );
   }
 
-  if (!Array.isArray(rawRecords) || rawRecords.length === 0) {
+  if (rawRecords.length === 0) {
     return jsonResponse(
       {
         success: false,
-        error: "No records provided",
+        error: "업로드할 레코드가 없습니다",
       },
       400,
     );
   }
 
-  // 4) 레코드 정제 & 필터
   const cleaned: Metric[] = [];
-  for (const item of rawRecords) {
-    if (!item || typeof item !== "object") continue;
-    const rec = cleanRecord(item as Record<string, unknown>);
-    if (rec) cleaned.push(rec);
+  for (const record of rawRecords) {
+    if (!isJsonMap(record)) {
+      continue;
+    }
+
+    const cleanedRecord = cleanRecord(record);
+    if (cleanedRecord !== null) {
+      cleaned.push(cleanedRecord);
+    }
   }
 
   if (cleaned.length === 0) {
     return jsonResponse(
       {
         success: false,
-        error: "No valid records after cleaning",
+        error: "정제 후 유효한 레코드가 없습니다",
       },
       400,
     );
   }
 
-  // 5) Supabase 클라이언트 준비
   let supabase: SupabaseClient;
   try {
     supabase = createSupabaseClient(req);
-  } catch (e) {
-    console.error("Failed to create Supabase client:", e);
+  } catch (error) {
+    console.error("Supabase 클라이언트 생성 실패", { error });
     return jsonResponse(
       {
         success: false,
-        error: "Server configuration error",
+        error: "서버 설정 오류",
       },
       500,
     );
   }
 
-  // 6) upsert (재분할 후 배치 처리)
   const upsertBatches = splitIntoUpsertBatches(
     cleaned,
     UPSERT_BATCH_MAX_RECORDS,
     UPSERT_BATCH_MAX_BYTES,
   );
+
   let totalInserted = 0;
-
-  for (const batch of upsertBatches) {
-    const { data, error } = await supabase
-      .from("all_metrics")
-      .upsert(batch, {
-        onConflict: "timestamp", // Changed from timestamp,device_id
-        ignoreDuplicates: true,
-      })
-      .select("timestamp");
-
-    if (error) {
-      console.error("Supabase upsert error:", error);
-      return jsonResponse(
-        {
-          success: false,
-          error: error.message,
-        },
-        500,
-      );
+  try {
+    for (const batch of upsertBatches) {
+      totalInserted += await upsertMetricBatch(supabase, batch);
     }
-
-    totalInserted += Array.isArray(data) ? data.length : 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("배치 upsert 처리 실패", {
+      error: message,
+      recordCount: cleaned.length,
+      batchCount: upsertBatches.length,
+    });
+    return jsonResponse(
+      {
+        success: false,
+        error: message,
+      },
+      500,
+    );
   }
 
-  // 7) 성공 응답
   return jsonResponse(
     {
       success: true,
       inserted: totalInserted,
     },
     200,
+  );
+}
+
+Deno.serve(async (req: Request): Promise<Response> => {
+  console.log("upload-metrics 요청 수신", { method: req.method });
+
+  if (req.method === "GET") {
+    return await handleGet(req);
+  }
+
+  if (req.method === "POST") {
+    return await handlePost(req);
+  }
+
+  return jsonResponse(
+    {
+      success: false,
+      error: "허용되지 않은 메서드입니다. GET 또는 POST를 사용하세요",
+    },
+    405,
   );
 });

@@ -43,10 +43,12 @@ class UploadSessionConfig:
 
 @dataclass(frozen=True)
 class UploadSessionResult:
+    run_id: int | None
     total_count: int
     success_count: int
     failure_count: int
     failed_keys: tuple[str, ...]
+    failed_items: tuple["FailedUploadItem", ...]
     warning_messages: tuple[str, ...]
 
 
@@ -54,6 +56,17 @@ class UploadSessionResult:
 class LatestTimestampResolution:
     latest_timestamp: str | None
     warning_message: str | None
+
+
+@dataclass(frozen=True)
+class FailedUploadItem:
+    folder: str
+    filename: str
+    path: str
+    kind: str
+    state_key: str
+    resume_offset: int
+    error_message: str
 
 
 def create_upload_http_client() -> httpx.Client:
@@ -313,15 +326,18 @@ def upload_item(
     build_temp: Callable[[str, str], pd.DataFrame],
     get_resume_offset: Callable[[str], int],
     set_resume_offset_fn: Callable[[str, int], None],
-    log_processed_fn: Callable[[str, str, str], None],
+    mark_file_completed_fn: Callable[[str, str, str, int | None], None],
+    record_file_failure_fn: Callable[[str, str, str, int, str, int | None], None],
     log: Callable[[str], None],
     batch_size: int,
     chunk_size: int,
     progress_cb=None,
     progress_update_interval_seconds: float,
     enable_smart_sync: bool,
+    resolve_latest_timestamp_fn: Callable[[str], str | None] | None,
     pause_event=None,
     latest_timestamp: Optional[str] = None,
+    run_id: int | None = None,
 ) -> bool:
     """
     Upload a single PLC or temperature file with resume support.
@@ -330,97 +346,110 @@ def upload_item(
     key = build_file_state_key(folder, filename, path)
     start_idx = get_resume_offset(key)
 
-    latest_ts = latest_timestamp
-    if enable_smart_sync and latest_ts:
-        log(f"- Upload {key}: Smart Sync 활성화 (서버 최신: {latest_ts})")
+    try:
+        latest_ts = latest_timestamp
+        if enable_smart_sync and latest_ts is None and resolve_latest_timestamp_fn is not None:
+            latest_ts = resolve_latest_timestamp_fn(_device_id_for_kind(kind))
+        if enable_smart_sync and latest_ts:
+            log(f"- Upload {key}: Smart Sync 활성화 (서버 최신: {latest_ts})")
 
-    builder = build_plc if kind == "plc" else build_temp
-    data_source = _load_chunks(builder, path, filename, chunk_size)
+        builder = build_plc if kind == "plc" else build_temp
+        data_source = _load_chunks(builder, path, filename, chunk_size)
 
-    current_global_idx = 0
-    uploaded_any = False
-    last_progress_report_time = 0.0
-    last_progress_reported_rows = 0
+        current_global_idx = 0
+        uploaded_any = False
+        last_progress_report_time = 0.0
+        last_progress_reported_rows = 0
 
-    def notify_progress(processed_rows: int, total_rows: int | None) -> None:
-        nonlocal last_progress_report_time, last_progress_reported_rows
-        if progress_cb is None:
-            return
-        current_time = time.monotonic()
-        if not _should_report_progress(
-            total_rows,
-            processed_rows,
-            last_progress_report_time,
-            last_progress_reported_rows,
-            current_time,
-            progress_update_interval_seconds,
-        ):
-            return
-        try:
-            progress_cb(processed_rows, 0 if total_rows is None else total_rows)
-        except Exception:
-            return
-        last_progress_report_time = current_time
-        last_progress_reported_rows = processed_rows
+        def notify_progress(processed_rows: int, total_rows: int | None) -> None:
+            nonlocal last_progress_report_time, last_progress_reported_rows
+            if progress_cb is None:
+                return
+            current_time = time.monotonic()
+            if not _should_report_progress(
+                total_rows,
+                processed_rows,
+                last_progress_report_time,
+                last_progress_reported_rows,
+                current_time,
+                progress_update_interval_seconds,
+            ):
+                return
+            try:
+                progress_cb(processed_rows, 0 if total_rows is None else total_rows)
+            except Exception:
+                return
+            last_progress_report_time = current_time
+            last_progress_reported_rows = processed_rows
 
-    if start_idx > 0:
-        notify_progress(start_idx, None)
+        if start_idx > 0:
+            notify_progress(start_idx, None)
 
-    with create_upload_http_client() as http_client:
-        for df_chunk in data_source:
-            if df_chunk.empty:
-                continue
-
-            if latest_ts and "timestamp" in df_chunk.columns:
-                df_chunk, source_row_count = _filter_chunk_by_latest_timestamp(df_chunk, latest_ts)
+        with create_upload_http_client() as http_client:
+            for df_chunk in data_source:
                 if df_chunk.empty:
-                    current_global_idx += source_row_count
                     continue
 
-            df_chunk, consumed_rows = _apply_resume_offset(
-                df_chunk,
-                enable_smart_sync,
-                start_idx,
-                current_global_idx,
-            )
-            if df_chunk.empty:
-                current_global_idx += consumed_rows
-                continue
+                if latest_ts and "timestamp" in df_chunk.columns:
+                    df_chunk, source_row_count = _filter_chunk_by_latest_timestamp(df_chunk, latest_ts)
+                    skipped_row_count = source_row_count - len(df_chunk)
+                    if skipped_row_count > 0 and not df_chunk.empty:
+                        current_global_idx += skipped_row_count
+                        notify_progress(current_global_idx, None)
+                        set_resume_offset_fn(key, current_global_idx)
+                    if df_chunk.empty:
+                        current_global_idx += source_row_count
+                        continue
 
-            chunk_start_idx = current_global_idx
-
-            def report_chunk_progress(done_in_chunk: int, total_in_chunk: int) -> None:
-                _ = total_in_chunk
-                notify_progress(
-                    chunk_start_idx + done_in_chunk,
-                    None,
+                df_chunk, consumed_rows = _apply_resume_offset(
+                    df_chunk,
+                    enable_smart_sync,
+                    start_idx,
+                    current_global_idx,
                 )
+                if df_chunk.empty:
+                    current_global_idx += consumed_rows
+                    continue
 
-            ok = upload_via_edge(
-                edge_url,
-                anon_key,
-                df_chunk,
-                http_client,
-                log=log,
-                resume_key=None,
-                start_index=0,
-                batch_size=batch_size,
-                progress_cb=report_chunk_progress,
-                pause_event=pause_event,
-                silent=True,
-            )
-            if not ok:
-                log(f"    - 청크 업로드 실패 (구간: {current_global_idx}~)")
-                return False
+                chunk_start_idx = current_global_idx
 
-            uploaded_any = True
-            current_global_idx += len(df_chunk)
-            notify_progress(current_global_idx, None)
-            set_resume_offset_fn(key, current_global_idx)
+                def report_chunk_progress(done_in_chunk: int, total_in_chunk: int) -> None:
+                    _ = total_in_chunk
+                    notify_progress(
+                        chunk_start_idx + done_in_chunk,
+                        None,
+                    )
 
-    if not uploaded_any:
-        log(f"- Upload {key}: 데이터 없음 또는 모두 최신 상태")
-    else:
+                ok = upload_via_edge(
+                    edge_url,
+                    anon_key,
+                    df_chunk,
+                    http_client,
+                    log=log,
+                    resume_key=None,
+                    start_index=0,
+                    batch_size=batch_size,
+                    progress_cb=report_chunk_progress,
+                    pause_event=pause_event,
+                    silent=True,
+                )
+                if not ok:
+                    log(f"    - 청크 업로드 실패 (구간: {current_global_idx}~)")
+                    failure_offset = max(get_resume_offset(key), 1)
+                    record_file_failure_fn(folder, filename, path, failure_offset, "업로드 실패", run_id)
+                    return False
+
+                uploaded_any = True
+                current_global_idx += len(df_chunk)
+                notify_progress(current_global_idx, None)
+                if not enable_smart_sync:
+                    set_resume_offset_fn(key, current_global_idx)
+
+        if not uploaded_any:
+            log(f"- Upload {key}: 데이터 없음 또는 모두 최신 상태")
+            set_resume_offset_fn(key, 0)
+            return True
+
         log(f"- Upload {key}: 완료")
         if progress_cb is not None:
             try:
@@ -428,9 +457,13 @@ def upload_item(
             except Exception:
                 pass
 
-    log_processed_fn(folder, filename, path)
-    set_resume_offset_fn(key, 0)
-    return True
+        mark_file_completed_fn(folder, filename, path, run_id)
+        return True
+    except Exception as error:
+        failure_offset = max(get_resume_offset(key), 1)
+        record_file_failure_fn(folder, filename, path, failure_offset, str(error), run_id)
+        log(f"    - 업로드 예외로 실패 상태 기록: {error}")
+        return False
 
 
 def build_upload_session_item(folder: str, filename: str, path: str, kind: str) -> UploadSessionItem:
@@ -503,7 +536,13 @@ def run_upload_session(
     build_temp: Callable[[str, str], pd.DataFrame],
     get_resume_offset: Callable[[str], int],
     set_resume_offset_fn: Callable[[str, int], None],
-    log_processed_fn: Callable[[str, str, str], None],
+    mark_file_completed_fn: Callable[[str, str, str, int | None], None],
+    record_file_failure_fn: Callable[[str, str, str, int, str, int | None], None],
+    start_upload_run_fn: Callable[[int, bool, dict[str, str]], int],
+    finish_upload_run_fn: Callable[[int, int, int, int, tuple[str, ...], dict[str, object] | None], None],
+    retry_failed_only: bool,
+    recent_successful_upload_profile: dict[str, object] | None,
+    runtime_config_values: dict[str, str],
     log: Callable[[str], None],
     pause_event,
     progress_cb: Callable[[str, str, int, int], None] | None,
@@ -512,11 +551,13 @@ def run_upload_session(
     latest_timestamp_cache: dict[str, LatestTimestampResolution] = {}
     latest_timestamp_lock = threading.Lock()
     failed_keys: list[str] = []
+    failed_items: list[FailedUploadItem] = []
     smart_sync_warnings: list[str] = []
     smart_sync_warning_keys: set[str] = set()
     smart_sync_warning_lock = threading.Lock()
+    run_id = start_upload_run_fn(len(items), retry_failed_only, runtime_config_values)
 
-    def upload_single(item: UploadSessionItem) -> tuple[bool, str]:
+    def upload_single(item: UploadSessionItem) -> tuple[bool, str, FailedUploadItem | None]:
         log(f"- 업로드 {item.folder}/{item.filename}")
         latest_timestamp_resolution = _resolve_latest_timestamp_cached(
             config,
@@ -550,17 +591,33 @@ def run_upload_session(
                 build_temp=build_temp,
                 get_resume_offset=get_resume_offset,
                 set_resume_offset_fn=set_resume_offset_fn,
-                log_processed_fn=log_processed_fn,
+                mark_file_completed_fn=mark_file_completed_fn,
+                record_file_failure_fn=record_file_failure_fn,
                 log=log,
                 batch_size=config.batch_size,
                 chunk_size=config.chunk_size,
                 progress_cb=per_file_progress,
                 progress_update_interval_seconds=config.progress_update_interval_seconds,
                 enable_smart_sync=config.enable_smart_sync,
+                resolve_latest_timestamp_fn=None,
                 pause_event=pause_event,
                 latest_timestamp=latest_timestamp_resolution.latest_timestamp,
+                run_id=run_id,
             )
-            return ok, f"{item.folder}/{item.filename}"
+            if ok:
+                return True, f"{item.folder}/{item.filename}", None
+
+            state_key = build_file_state_key(item.folder, item.filename, item.path)
+            failed_item = FailedUploadItem(
+                folder=item.folder,
+                filename=item.filename,
+                path=item.path,
+                kind=item.kind,
+                state_key=state_key,
+                resume_offset=get_resume_offset(state_key),
+                error_message="업로드 실패",
+            )
+            return False, f"{item.folder}/{item.filename}", failed_item
         finally:
             _notify_file_complete(file_complete_cb, item.folder, item.filename, ok)
 
@@ -572,25 +629,51 @@ def run_upload_session(
             item = future_to_item[future]
             key = f"{item.folder}/{item.filename}"
             try:
-                ok, result_key = future.result()
+                ok, result_key, failed_item = future.result()
                 if ok:
                     success_count += 1
                 else:
                     failure_count += 1
                     failed_keys.append(result_key)
+                    if failed_item is not None:
+                        failed_items.append(failed_item)
                     log(f"업로드 실패: {result_key}")
             except Exception as error:
                 failure_count += 1
                 failed_keys.append(key)
+                state_key = build_file_state_key(item.folder, item.filename, item.path)
+                failure_offset = max(get_resume_offset(state_key), 1)
+                record_file_failure_fn(item.folder, item.filename, item.path, failure_offset, str(error), run_id)
+                failed_items.append(
+                    FailedUploadItem(
+                        folder=item.folder,
+                        filename=item.filename,
+                        path=item.path,
+                        kind=item.kind,
+                        state_key=state_key,
+                        resume_offset=failure_offset,
+                        error_message=str(error),
+                    )
+                )
                 log(f"업로드 중 예외 발생: {key}: {error}")
-
-    return UploadSessionResult(
+    session_result = UploadSessionResult(
+        run_id=run_id,
         total_count=len(items),
         success_count=success_count,
         failure_count=failure_count,
         failed_keys=tuple(failed_keys),
+        failed_items=tuple(failed_items),
         warning_messages=tuple(smart_sync_warnings),
     )
+    finish_upload_run_fn(
+        run_id,
+        session_result.total_count,
+        session_result.success_count,
+        session_result.failure_count,
+        session_result.warning_messages,
+        recent_successful_upload_profile if session_result.failure_count == 0 else None,
+    )
+    return session_result
 def upload_work_log_data(
     supabase_url: str,
     anon_key: str,
