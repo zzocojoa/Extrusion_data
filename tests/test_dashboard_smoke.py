@@ -295,6 +295,8 @@ class DashboardSmokeTests(TestCase):
 
     def test_run_preview_logic_logs_completion(self) -> None:
         log_entries: list[tuple[str, str]] = []
+        scheduled_callbacks: list[tuple[int, object]] = []
+        refresh_calls: list[str] = []
         fake_app = SimpleNamespace()
         fake_app.cfg = {}
         fake_app.config_source = ""
@@ -302,6 +304,11 @@ class DashboardSmokeTests(TestCase):
         fake_app.tr_map = lambda key, params: key if params == {} else f"{key}:{params}"
         fake_app.tr = lambda key, **params: key if params == {} else f"{key}:{params}"
         fake_app.log = lambda msg, level="INFO": log_entries.append((level, msg))
+        fake_app.refresh_upload_operational_cards = lambda: refresh_calls.append("refresh")
+        fake_app.schedule_gui_callback = lambda delay_ms, callback, *args: (
+            scheduled_callbacks.append((delay_ms, callback)),
+            callback(*args),
+        )[-1]
 
         with patch.object(
             uploader_gui_tk,
@@ -336,6 +343,9 @@ class DashboardSmokeTests(TestCase):
         self.assertIn(("INFO", "dashboard.preview.log.target_count:{'count': 1}"), log_entries)
         self.assertIn(("INFO", " - sample.csv"), log_entries)
         self.assertIn(("INFO", "logs.preview.completed"), log_entries)
+        self.assertEqual(len(scheduled_callbacks), 1)
+        self.assertEqual(scheduled_callbacks[0][0], 0)
+        self.assertEqual(refresh_calls, ["refresh"])
 
     def test_run_preview_logic_logs_failure_instead_of_silently_stopping(self) -> None:
         log_entries: list[tuple[str, str]] = []

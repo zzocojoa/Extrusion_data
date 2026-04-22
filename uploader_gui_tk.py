@@ -7190,6 +7190,7 @@ class App(ctk.CTk):
                 time.time(),
                 self.tr_map,
             )
+            self.schedule_gui_callback(0, self.refresh_upload_operational_cards)
             if items == []:
                 self.log(self.tr("dashboard.upload.log.no_targets"))
             self.log(self.tr("logs.preview.completed"))
