@@ -8,7 +8,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 from urllib.parse import urlparse
 
 from datetime import datetime, timedelta, timezone
@@ -818,12 +818,16 @@ class WslStorageSnapshot:
     vhdx_text: str
     host_free_text: str
     distro_text: str
+    metric_basis_text: str
     source_text: str
+    path_text: str
     detail_text: str
     last_updated_text: str
     progress_value: float | None
+    metric_basis: Literal["none", "guest", "host"]
     is_refreshing: bool
     is_partial: bool
+    is_stale: bool
     is_available: bool
 
 
@@ -904,6 +908,15 @@ class UploadOperationalCardsState:
     recent_success_status_color: str
     recent_success_detail_lines: tuple[str, ...]
     can_rerun_recent_success: bool
+
+
+@dataclass(frozen=True)
+class DashboardHeroViewState:
+    status_kind: Literal["waiting", "blocked", "attention", "ready"]
+    status_text: str
+    status_color: str
+    detail_text: str
+    detail_color: str
 
 
 @dataclass(frozen=True)
@@ -1968,6 +1981,77 @@ def build_upload_operational_cards_state(
         can_rerun_recent_success=can_rerun_recent_success,
     )
 
+
+def summarize_dashboard_hero_detail_text(detail_lines: tuple[str, ...]) -> str:
+    normalized_lines = [
+        str(line).strip()
+        for line in detail_lines
+        if str(line).strip() != ""
+    ]
+    return "\n".join(normalized_lines[:2])
+
+
+def build_dashboard_hero_view_state(
+    operational_cards_state: UploadOperationalCardsState | None,
+    waiting_text: str,
+) -> DashboardHeroViewState:
+    if operational_cards_state is None:
+        return DashboardHeroViewState(
+            status_kind="waiting",
+            status_text=waiting_text,
+            status_color="gray",
+            detail_text="",
+            detail_color="gray",
+        )
+
+    if operational_cards_state.state_health_blocks_upload:
+        return DashboardHeroViewState(
+            status_kind="blocked",
+            status_text=operational_cards_state.state_health_status_text,
+            status_color=operational_cards_state.state_health_status_color,
+            detail_text=summarize_dashboard_hero_detail_text(
+                operational_cards_state.state_health_detail_lines
+            ),
+            detail_color=operational_cards_state.state_health_status_color,
+        )
+
+    if operational_cards_state.is_upload_preflight_blocked:
+        return DashboardHeroViewState(
+            status_kind="blocked",
+            status_text=operational_cards_state.preflight_status_text,
+            status_color=operational_cards_state.preflight_status_color,
+            detail_text=summarize_dashboard_hero_detail_text(
+                operational_cards_state.preflight_detail_lines
+            ),
+            detail_color=operational_cards_state.preflight_status_color,
+        )
+
+    if operational_cards_state.has_retryable_state:
+        return DashboardHeroViewState(
+            status_kind="attention",
+            status_text=operational_cards_state.resume_status_text,
+            status_color=operational_cards_state.resume_status_color,
+            detail_text=summarize_dashboard_hero_detail_text(
+                operational_cards_state.resume_detail_lines
+            ),
+            detail_color=operational_cards_state.resume_status_color,
+        )
+
+    status_kind: Literal["waiting", "blocked", "attention", "ready"] = "waiting"
+    if operational_cards_state.preflight_status_color == "#2CC985":
+        status_kind = "ready"
+
+    return DashboardHeroViewState(
+        status_kind=status_kind,
+        status_text=operational_cards_state.preflight_status_text,
+        status_color=operational_cards_state.preflight_status_color,
+        detail_text=summarize_dashboard_hero_detail_text(
+            operational_cards_state.preflight_detail_lines
+        ),
+        detail_color="gray" if status_kind == "ready" else operational_cards_state.preflight_status_color,
+    )
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -2075,6 +2159,10 @@ class App(ctk.CTk):
         self.rendered_wsl_storage_snapshot: WslStorageSnapshot | None = None
         self.dashboard_layout_signature: DashboardLayoutSignature | None = None
         self.upload_operational_cards_state: UploadOperationalCardsState | None = None
+        self.dashboard_hero_view_state = build_dashboard_hero_view_state(
+            None,
+            self.tr("common.status.waiting"),
+        )
         self.last_preview_scan_result: PreviewScanResult | None = None
         self.record_startup_timing("initialize_runtime_state")
         archive_environment = load_archive_environment(PROJECT_ROOT)
@@ -2148,8 +2236,16 @@ class App(ctk.CTk):
             print(self.startup_timing_report)
 
     def build_responsive_layout_state(self, window_width: int) -> ResponsiveLayoutState:
-        is_compact = window_width < 1320
-        if is_compact:
+        if window_width >= 1360:
+            return ResponsiveLayoutState(
+                window_width=window_width,
+                is_compact=False,
+                sidebar_width=230,
+                main_pad_x=20,
+                main_pad_y=20,
+                logo_wraplength=170,
+            )
+        if window_width >= 1240:
             return ResponsiveLayoutState(
                 window_width=window_width,
                 is_compact=True,
@@ -2160,11 +2256,11 @@ class App(ctk.CTk):
             )
         return ResponsiveLayoutState(
             window_width=window_width,
-            is_compact=False,
-            sidebar_width=230,
-            main_pad_x=20,
-            main_pad_y=20,
-            logo_wraplength=170,
+            is_compact=True,
+            sidebar_width=196,
+            main_pad_x=12,
+            main_pad_y=12,
+            logo_wraplength=136,
         )
 
     def build_responsive_layout_mode_signature(
@@ -2809,11 +2905,21 @@ class App(ctk.CTk):
         self.clear_main()
         self.record_startup_timing("dashboard_clear_main")
 
-        self.main_frame.grid_rowconfigure(0, weight=0)
-        self.main_frame.grid_rowconfigure(1, weight=1)
-        self.main_frame.grid_rowconfigure(2, weight=0)
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
 
-        self.hero_frame = ctk.CTkFrame(self.main_frame)
+        self.dashboard_scroll_frame = ctk.CTkScrollableFrame(
+            self.main_frame,
+            corner_radius=0,
+            fg_color="transparent",
+        )
+        self.dashboard_scroll_frame.grid(row=0, column=0, sticky="nsew")
+        self.dashboard_scroll_frame.grid_columnconfigure(0, weight=1)
+        self.dashboard_scroll_frame.grid_rowconfigure(0, weight=0)
+        self.dashboard_scroll_frame.grid_rowconfigure(1, weight=1)
+        self.dashboard_scroll_frame.grid_rowconfigure(2, weight=0)
+
+        self.hero_frame = ctk.CTkFrame(self.dashboard_scroll_frame)
         self.hero_frame.grid(row=0, column=0, sticky="ew", pady=(0, 16))
         self.hero_frame.grid_columnconfigure(0, weight=1)
 
@@ -2840,6 +2946,16 @@ class App(ctk.CTk):
         )
         self.lbl_prog_text.grid(row=2, column=0, sticky="w", pady=(0, 18))
 
+        self.lbl_hero_status_detail = ctk.CTkLabel(
+            self.hero_status_frame,
+            text=self.dashboard_hero_view_state.detail_text,
+            justify="left",
+            anchor="w",
+            text_color=self.dashboard_hero_view_state.detail_color,
+        )
+        self.lbl_hero_status_detail.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.bind_label_wrap(self.lbl_hero_status_detail, horizontal_padding=20, min_wraplength=420)
+
         self.lbl_runtime_context = ctk.CTkLabel(
             self.hero_status_frame,
             text=build_runtime_context_text(
@@ -2852,7 +2968,7 @@ class App(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.lbl_runtime_context.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.lbl_runtime_context.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         self.bind_label_wrap(self.lbl_runtime_context, horizontal_padding=20, min_wraplength=420)
         self.lbl_local_supabase_status = ctk.CTkLabel(
             self.hero_status_frame,
@@ -2860,7 +2976,7 @@ class App(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.lbl_local_supabase_status.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        self.lbl_local_supabase_status.grid(row=5, column=0, sticky="ew", pady=(0, 6))
         self.bind_label_wrap(self.lbl_local_supabase_status, horizontal_padding=20, min_wraplength=420)
         self.lbl_state_store_status = ctk.CTkLabel(
             self.hero_status_frame,
@@ -2868,7 +2984,7 @@ class App(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.lbl_state_store_status.grid(row=5, column=0, sticky="ew", pady=(0, 6))
+        self.lbl_state_store_status.grid(row=7, column=0, sticky="ew", pady=(0, 6))
         self.lbl_state_store_detail = ctk.CTkLabel(
             self.hero_status_frame,
             text="",
@@ -2876,10 +2992,10 @@ class App(ctk.CTk):
             anchor="w",
             text_color="gray",
         )
-        self.lbl_state_store_detail.grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        self.lbl_state_store_detail.grid(row=8, column=0, sticky="ew", pady=(0, 6))
         self.bind_label_wrap(self.lbl_state_store_detail, horizontal_padding=20, min_wraplength=420)
         self.upload_precheck_frame = ctk.CTkFrame(self.hero_status_frame)
-        self.upload_precheck_frame.grid(row=7, column=0, sticky="ew", pady=(4, 0))
+        self.upload_precheck_frame.grid(row=9, column=0, sticky="ew", pady=(4, 0))
         self.upload_precheck_frame.grid_columnconfigure(0, weight=1)
         self.lbl_upload_precheck_title = ctk.CTkLabel(
             self.upload_precheck_frame,
@@ -2910,7 +3026,7 @@ class App(ctk.CTk):
         )
         self.record_startup_timing("dashboard_build_hero")
 
-        self.dashboard_body_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.dashboard_body_frame = ctk.CTkFrame(self.dashboard_scroll_frame, fg_color="transparent")
         self.dashboard_body_frame.grid(row=1, column=0, sticky="nsew")
 
         self.wsl_storage_frame = ctk.CTkFrame(self.dashboard_body_frame)
@@ -3069,6 +3185,22 @@ class App(ctk.CTk):
         )
         self.lbl_wsl_storage_distro_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
 
+        self.wsl_storage_metric_basis_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_metric_basis_item.grid_columnconfigure(0, weight=1)
+        self.lbl_wsl_storage_metric_basis_label = ctk.CTkLabel(
+            self.wsl_storage_metric_basis_item,
+            text=self.tr("dashboard.wsl_storage.label.metric_basis"),
+            text_color="gray",
+            anchor="w",
+        )
+        self.lbl_wsl_storage_metric_basis_label.grid(row=0, column=0, sticky="w")
+        self.lbl_wsl_storage_metric_basis_value = ctk.CTkLabel(
+            self.wsl_storage_metric_basis_item,
+            text="—",
+            anchor="w",
+        )
+        self.lbl_wsl_storage_metric_basis_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
         self.wsl_storage_source_item = ctk.CTkFrame(self.wsl_storage_info_frame)
         self.wsl_storage_source_item.grid_columnconfigure(0, weight=1)
         self.lbl_wsl_storage_source_label = ctk.CTkLabel(
@@ -3084,6 +3216,22 @@ class App(ctk.CTk):
             anchor="w",
         )
         self.lbl_wsl_storage_source_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        self.wsl_storage_path_item = ctk.CTkFrame(self.wsl_storage_info_frame)
+        self.wsl_storage_path_item.grid_columnconfigure(0, weight=1)
+        self.lbl_wsl_storage_path_label = ctk.CTkLabel(
+            self.wsl_storage_path_item,
+            text=self.tr("dashboard.wsl_storage.label.path"),
+            text_color="gray",
+            anchor="w",
+        )
+        self.lbl_wsl_storage_path_label.grid(row=0, column=0, sticky="w")
+        self.lbl_wsl_storage_path_value = ctk.CTkLabel(
+            self.wsl_storage_path_item,
+            text="—",
+            anchor="w",
+        )
+        self.lbl_wsl_storage_path_value.grid(row=1, column=0, sticky="w", pady=(0, 8))
 
         self.wsl_storage_vhdx_item = ctk.CTkFrame(self.wsl_storage_info_frame)
         self.wsl_storage_vhdx_item.grid_columnconfigure(0, weight=1)
@@ -3137,7 +3285,9 @@ class App(ctk.CTk):
 
         self.wsl_storage_info_items: list[ctk.CTkFrame] = [
             self.wsl_storage_distro_item,
+            self.wsl_storage_metric_basis_item,
             self.wsl_storage_source_item,
+            self.wsl_storage_path_item,
             self.wsl_storage_vhdx_item,
             self.wsl_storage_host_free_item,
             self.wsl_storage_meta_item,
@@ -3212,13 +3362,32 @@ class App(ctk.CTk):
         )
         self.btn_rerun_recent_success.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
 
-        self.active_tasks_list_frame = ctk.CTkFrame(self.tasks_frame, fg_color="transparent")
-        self.active_tasks_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.active_tasks_card = ctk.CTkFrame(self.tasks_frame)
+        self.active_tasks_card.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.active_tasks_card.grid_columnconfigure(0, weight=1)
+        self.lbl_active_tasks_title = ctk.CTkLabel(
+            self.active_tasks_card,
+            text=self.tr("dashboard.active_task.title"),
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+        )
+        self.lbl_active_tasks_title.grid(row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        self.lbl_active_tasks_empty = ctk.CTkLabel(
+            self.active_tasks_card,
+            text=self.tr("dashboard.active_task.empty"),
+            justify="left",
+            anchor="w",
+            text_color="gray",
+        )
+        self.lbl_active_tasks_empty.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        self.active_tasks_list_frame = ctk.CTkFrame(self.active_tasks_card, fg_color="transparent")
+        self.active_tasks_list_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 12))
+        self.active_tasks_card.grid_rowconfigure(2, weight=1)
 
         self.task_labels = {}
         self.record_startup_timing("dashboard_build_task_cards")
 
-        self.action_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.action_frame = ctk.CTkFrame(self.dashboard_scroll_frame, fg_color="transparent")
         self.action_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         self.action_frame.grid_columnconfigure(0, weight=1)
         self.action_frame.grid_columnconfigure(1, weight=1)
@@ -3301,19 +3470,21 @@ class App(ctk.CTk):
             self.btn_stop_supabase,
         ]
         self.upload_action_buttons: list[ctk.CTkButton] = [
-            self.btn_retry_failed,
-            self.btn_preview,
-            self.btn_pause,
             self.btn_start,
+            self.btn_pause,
+            self.btn_preview,
+            self.btn_retry_failed,
         ]
         self.record_startup_timing("dashboard_build_action_rows")
 
+        self.dashboard_scroll_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
         self.dashboard_body_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
         self.wsl_storage_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
         self.action_frame.bind("<Configure>", self.schedule_dashboard_layout_refresh, add="+")
 
         self.schedule_dashboard_layout_refresh(None)
         self.refresh_local_supabase_button()
+        self.refresh_dashboard_idle_status_labels()
         if self.is_wsl_storage_refreshing:
             self.render_wsl_storage_card()
         else:
@@ -3358,28 +3529,41 @@ class App(ctk.CTk):
         if not hasattr(self, "dashboard_body_frame") or not self.dashboard_body_frame.winfo_exists():
             return
 
+        body_split_threshold = 1080
+        footer_split_threshold = 1000
+        button_stack_threshold = 700
+        tasks_column_weight = 5
+        wsl_column_weight = 7
+        split_column_gap = 16
+
         body_width = self.dashboard_body_frame.winfo_width()
         if body_width <= 1:
-            body_width = self.main_frame.winfo_width()
+            body_width = self.dashboard_scroll_frame.winfo_width() if hasattr(self, "dashboard_scroll_frame") else self.main_frame.winfo_width()
 
-        is_split_body = body_width >= 1180
-        self.dashboard_body_frame.grid_columnconfigure(0, weight=1)
-        self.dashboard_body_frame.grid_columnconfigure(1, weight=1 if is_split_body else 0)
+        is_split_body = body_width >= body_split_threshold
+        self.dashboard_body_frame.grid_columnconfigure(0, weight=wsl_column_weight if is_split_body else 1)
+        self.dashboard_body_frame.grid_columnconfigure(1, weight=tasks_column_weight if is_split_body else 0)
         self.dashboard_body_frame.grid_rowconfigure(0, weight=1 if is_split_body else 0)
         self.dashboard_body_frame.grid_rowconfigure(1, weight=1 if not is_split_body else 0)
 
-        wsl_width = self.wsl_storage_frame.winfo_width()
-        if wsl_width <= 1:
+        available_split_width = max(body_width - split_column_gap, 0)
+        if is_split_body:
+            total_column_weight = tasks_column_weight + wsl_column_weight
+            wsl_width = max(
+                (available_split_width * wsl_column_weight) // total_column_weight,
+                1,
+            )
+        else:
             wsl_width = body_width
 
-        metric_column_count = 3 if wsl_width >= 900 else 2 if wsl_width >= 560 else 1
-        info_column_count = 3 if wsl_width >= 900 else 2 if wsl_width >= 620 else 1
+        metric_column_count = 3 if wsl_width >= 780 else 2 if wsl_width >= 520 else 1
+        info_column_count = 3 if wsl_width >= 860 else 2 if wsl_width >= 580 else 1
         footer_width = self.action_frame.winfo_width()
         if footer_width <= 1:
             footer_width = body_width
 
-        is_split_footer = footer_width >= 1040
-        button_stack = footer_width < 760
+        is_split_footer = footer_width >= footer_split_threshold
+        button_stack = footer_width < button_stack_threshold
         layout_signature = DashboardLayoutSignature(
             is_split_body=is_split_body,
             metric_column_count=metric_column_count,
@@ -3397,8 +3581,8 @@ class App(ctk.CTk):
             self.wsl_storage_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 10))
             self.tasks_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 10))
         else:
-            self.wsl_storage_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 10))
-            self.tasks_frame.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 10))
+            self.tasks_frame.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 10))
+            self.wsl_storage_frame.grid(row=1, column=0, sticky="nsew", padx=0, pady=(0, 10))
 
         self.layout_dashboard_collection(
             self.wsl_storage_metrics_frame,
@@ -5528,6 +5712,80 @@ class App(ctk.CTk):
         self.btn_retry_failed.configure(state=retry_enabled)
         self.btn_pause.configure(state=pause_enabled, text=pause_text)
 
+    def resolve_dashboard_idle_primary_status(self) -> tuple[str, str]:
+        waiting_text = self.tr("common.status.waiting")
+        if self.dashboard_hero_view_state.status_kind in {"blocked", "attention"}:
+            return (
+                self.dashboard_hero_view_state.status_text,
+                self.dashboard_hero_view_state.status_color,
+            )
+        if (
+            self.upload_dashboard_status_text != waiting_text
+            or self.upload_dashboard_status_color != "gray"
+        ):
+            return (
+                self.upload_dashboard_status_text,
+                self.upload_dashboard_status_color,
+            )
+        return (
+            self.dashboard_hero_view_state.status_text,
+            self.dashboard_hero_view_state.status_color,
+        )
+
+    def refresh_dashboard_idle_status_labels(self) -> None:
+        if not hasattr(self, "lbl_big_status") or not self.lbl_big_status.winfo_exists():
+            return
+        status_text, status_color = self.resolve_dashboard_idle_primary_status()
+        self.lbl_big_status.configure(text=status_text, text_color=status_color)
+        if hasattr(self, "status_label") and self.status_label.winfo_exists():
+            self.status_label.configure(text=status_text, text_color=status_color)
+        if hasattr(self, "lbl_hero_status_detail") and self.lbl_hero_status_detail.winfo_exists():
+            self.lbl_hero_status_detail.configure(
+                text=self.dashboard_hero_view_state.detail_text,
+                text_color=self.dashboard_hero_view_state.detail_color,
+            )
+
+    def refresh_active_task_labels(self) -> None:
+        if not hasattr(self, "active_tasks_list_frame") or not self.active_tasks_list_frame.winfo_exists():
+            return
+        if not hasattr(self, "lbl_active_tasks_empty") or not self.lbl_active_tasks_empty.winfo_exists():
+            return
+
+        with self.progress_lock:
+            current_progress = dict(self.active_progress)
+
+        current_files = set(current_progress.keys())
+        for task_key in list(self.task_labels.keys()):
+            if task_key not in current_files:
+                self.task_labels[task_key].destroy()
+                del self.task_labels[task_key]
+
+        for task_key, progress_state in current_progress.items():
+            done, total = progress_state
+            if total > 0:
+                progress_pct = (done / total) * 100.0
+                text = self.tr(
+                    "dashboard.active_task.progress",
+                    task_key=task_key,
+                    percent=int(progress_pct),
+                )
+            else:
+                text = f"{task_key} - {done:,}행 처리"
+            if task_key not in self.task_labels:
+                lbl = ctk.CTkLabel(
+                    self.active_tasks_list_frame,
+                    text=text,
+                    anchor="w",
+                    justify="left",
+                )
+                lbl.pack(fill="x", pady=2)
+                self.task_labels[task_key] = lbl
+            else:
+                self.task_labels[task_key].configure(text=text)
+
+        should_show_empty = self.task_labels == {}
+        self.lbl_active_tasks_empty.grid_remove() if not should_show_empty else self.lbl_active_tasks_empty.grid()
+
     def refresh_upload_operational_cards(self) -> None:
         if self.current_view != "dashboard":
             return
@@ -5536,13 +5794,6 @@ class App(ctk.CTk):
 
         self.upload_operational_cards_request_id += 1
         request_id = self.upload_operational_cards_request_id
-        self.is_upload_preflight_blocked = True
-        self.lbl_upload_precheck_summary.configure(
-            text=self.tr("common.status.waiting"),
-            text_color="gray",
-        )
-        self.lbl_upload_precheck_items.configure(text="")
-        self.refresh_upload_action_buttons()
 
         if self.is_upload_operational_cards_refreshing:
             return
@@ -5619,6 +5870,10 @@ class App(ctk.CTk):
             return
 
         self.upload_operational_cards_state = operational_cards_state
+        self.dashboard_hero_view_state = build_dashboard_hero_view_state(
+            operational_cards_state,
+            self.tr("common.status.waiting"),
+        )
         self.recent_successful_upload_profile = operational_cards_state.recent_successful_upload_profile
         self.failed_retry_set = list(operational_cards_state.failed_retry_set)
         self.state_health_blocks_upload = operational_cards_state.state_health_blocks_upload
@@ -5650,6 +5905,8 @@ class App(ctk.CTk):
             state="normal" if operational_cards_state.can_rerun_recent_success else "disabled"
         )
 
+        if not self.is_uploading:
+            self.refresh_dashboard_idle_status_labels()
         self.refresh_upload_action_buttons()
 
     def build_settings_form_values(self) -> dict[str, str]:
@@ -6033,7 +6290,7 @@ class App(ctk.CTk):
 
         is_mapped = self.local_supabase_progress.winfo_manager() != ""
         if is_visible and not is_mapped:
-            self.local_supabase_progress.grid(row=5, column=0, sticky="w", pady=(0, 12))
+            self.local_supabase_progress.grid(row=6, column=0, sticky="w", pady=(0, 12))
             self.local_supabase_progress.start()
             return
 
@@ -6262,6 +6519,14 @@ class App(ctk.CTk):
         except Exception:
             return self.tr("dashboard.wsl_storage.message.error")
 
+    def translate_wsl_storage_metric_basis(self, metric_basis: str) -> str:
+        normalized_basis = metric_basis.strip().lower()
+        if normalized_basis == "guest":
+            return self.tr("dashboard.wsl_storage.metric_basis.guest")
+        if normalized_basis == "host":
+            return self.tr("dashboard.wsl_storage.metric_basis.host")
+        return self.tr("dashboard.wsl_storage.metric_basis.unavailable")
+
     def build_wsl_storage_ui_snapshot(self) -> WslStorageSnapshot:
         supabase_url = self.cfg.get("SUPABASE_URL", "")
         raw_snapshot = self.wsl_storage_raw_snapshot
@@ -6286,12 +6551,16 @@ class App(ctk.CTk):
                 vhdx_text="—",
                 host_free_text="—",
                 distro_text="—",
+                metric_basis_text=self.translate_wsl_storage_metric_basis("none"),
                 source_text=self.tr("dashboard.wsl_storage.source.unavailable"),
+                path_text="—",
                 detail_text=self.tr("dashboard.wsl_storage.message.remote"),
                 last_updated_text="—",
                 progress_value=None,
+                metric_basis="none",
                 is_refreshing=False,
                 is_partial=False,
+                is_stale=False,
                 is_available=False,
             )
 
@@ -6311,7 +6580,9 @@ class App(ctk.CTk):
                 vhdx_text="—",
                 host_free_text="—",
                 distro_text="—",
+                metric_basis_text=self.translate_wsl_storage_metric_basis("none"),
                 source_text=self.tr("dashboard.wsl_storage.source.unavailable"),
+                path_text="—",
                 detail_text="\n".join(
                     [
                         self.tr("dashboard.wsl_storage.message.error"),
@@ -6320,8 +6591,10 @@ class App(ctk.CTk):
                 ),
                 last_updated_text="—",
                 progress_value=None,
+                metric_basis="none",
                 is_refreshing=False,
                 is_partial=False,
+                is_stale=False,
                 is_available=False,
             )
 
@@ -6347,23 +6620,32 @@ class App(ctk.CTk):
                 vhdx_text="—",
                 host_free_text="—",
                 distro_text="—",
+                metric_basis_text=self.translate_wsl_storage_metric_basis("none"),
                 source_text=self.tr("dashboard.wsl_storage.source.unavailable"),
+                path_text="—",
                 detail_text=self.tr(detail_key),
                 last_updated_text="—",
                 progress_value=None,
+                metric_basis="none",
                 is_refreshing=self.is_wsl_storage_refreshing,
                 is_partial=False,
+                is_stale=False,
                 is_available=False,
             )
 
         raw_state = _normalize_wsl_storage_state(_extract_source_value(raw_snapshot, "state"))
-        is_partial = bool(_extract_source_value(raw_snapshot, "is_partial")) or has_refresh_error
+        is_partial = bool(_extract_source_value(raw_snapshot, "is_partial"))
+        is_stale = has_refresh_error
         badge_state = raw_state
-        if raw_state == "safe" and is_partial:
+        if self.is_wsl_storage_refreshing:
+            badge_state = "refreshing"
+        elif is_stale:
+            badge_state = "partial"
+        elif raw_state == "safe" and is_partial:
             badge_state = "partial"
         if badge_state not in {"safe", "warning", "critical", "partial", "error", "unavailable", "refreshing"}:
             badge_state = "error"
-        if raw_state not in {"safe", "warning", "critical", "error", "unavailable", "refreshing"}:
+        if raw_state not in {"safe", "warning", "critical", "partial", "error", "unavailable", "refreshing"}:
             raw_state = "error"
 
         guest_metrics = _extract_source_value(raw_snapshot, "guest_metrics")
@@ -6386,6 +6668,8 @@ class App(ctk.CTk):
                     issue_messages.append(self.translate_wsl_storage_issue(issue_code))
 
         detail_lines: list[str] = []
+        if is_stale:
+            detail_lines.append(self.tr("dashboard.wsl_storage.issue.refresh_failed"))
         if is_partial:
             detail_lines.append(self.tr("dashboard.wsl_storage.message.partial"))
         if raw_state == "error":
@@ -6394,41 +6678,18 @@ class App(ctk.CTk):
             detail_lines.append(self.tr("dashboard.wsl_storage.message.unavailable"))
         elif host_metrics is None and issue_messages == []:
             detail_lines.append(self.tr("dashboard.wsl_storage.message.guest_only"))
-        if has_refresh_error:
-            detail_lines.append(self.tr("dashboard.wsl_storage.issue.refresh_failed"))
         if self.is_wsl_storage_refreshing:
             detail_lines.append(self.tr("dashboard.wsl_storage.message.refreshing"))
-
-        if distro_name != "":
-            detail_lines.append(
-                f"{self.tr('dashboard.wsl_storage.label.distro')}: {distro_name}"
-            )
-        if used_bytes is not None:
-            detail_lines.append(
-                f"{self.tr('dashboard.wsl_storage.label.guest_used')}: {_format_storage_bytes(used_bytes)}"
-            )
-        if available_bytes is not None:
-            detail_lines.append(
-                f"{self.tr('dashboard.wsl_storage.label.guest_available')}: {_format_storage_bytes(available_bytes)}"
-            )
-        if total_bytes is not None:
-            detail_lines.append(
-                f"{self.tr('dashboard.wsl_storage.label.guest_total')}: {_format_storage_bytes(total_bytes)}"
-            )
 
         source_text = self.tr("dashboard.wsl_storage.source.unavailable")
         translated_source_text = source_text
         if source_name in {"config_override", "registry"}:
             translated_source_text = self.tr(f"dashboard.wsl_storage.source.{source_name}")
             source_text = translated_source_text
+        path_text = "—"
         compact_source_path = _format_compact_path(source_path, 52)
         if compact_source_path != "":
-            source_text = compact_source_path
-        detail_lines.append(
-            f"{self.tr('dashboard.wsl_storage.label.source')}: {translated_source_text}"
-        )
-        if source_path != "":
-            detail_lines.append(source_path)
+            path_text = compact_source_path
         if issue_messages != []:
             detail_lines.extend(issue_messages)
 
@@ -6442,19 +6703,9 @@ class App(ctk.CTk):
         total_text = _format_storage_bytes(total_bytes)
         usage_text = _format_storage_ratio(usage_ratio)
         progress_value = None if usage_ratio is None else max(0.0, min(1.0, usage_ratio))
-
-        if vhdx_bytes is not None and host_free_bytes is not None:
-            host_total_bytes = vhdx_bytes + host_free_bytes
-            host_usage_ratio = None if host_total_bytes <= 0 else vhdx_bytes / host_total_bytes
-            used_label_text = self.tr("dashboard.wsl_storage.label.host_vhdx_size")
-            available_label_text = self.tr("dashboard.wsl_storage.label.host_drive_free")
-            total_label_text = self.tr("dashboard.wsl_storage.label.host_capacity_total")
-            usage_label_text = self.tr("dashboard.wsl_storage.label.host_capacity_usage")
-            used_text = _format_storage_bytes(vhdx_bytes)
-            available_text = _format_storage_bytes(host_free_bytes)
-            total_text = _format_storage_bytes(host_total_bytes)
-            usage_text = _format_storage_ratio(host_usage_ratio)
-            progress_value = None if host_usage_ratio is None else max(0.0, min(1.0, host_usage_ratio))
+        last_updated_text = _format_storage_timestamp(collected_at)
+        if is_stale and last_updated_text != "—":
+            last_updated_text = f"{last_updated_text} ({self.tr('dashboard.wsl_storage.meta.cached')})"
 
         return WslStorageSnapshot(
             state=badge_state,
@@ -6471,12 +6722,16 @@ class App(ctk.CTk):
             vhdx_text=_format_storage_bytes(vhdx_bytes),
             host_free_text=_format_storage_bytes(host_free_bytes),
             distro_text=distro_name if distro_name != "" else "—",
+            metric_basis_text=self.translate_wsl_storage_metric_basis("guest"),
             source_text=source_text,
+            path_text=path_text,
             detail_text="\n".join(detail_lines),
-            last_updated_text=_format_storage_timestamp(collected_at),
+            last_updated_text=last_updated_text,
             progress_value=progress_value,
+            metric_basis="guest",
             is_refreshing=self.is_wsl_storage_refreshing,
             is_partial=is_partial,
+            is_stale=is_stale,
             is_available=guest_metrics is not None,
         )
 
@@ -6494,11 +6749,11 @@ class App(ctk.CTk):
         badge_text_color = "#101010" if snapshot.status_color == "#E5C07B" else "white"
         progress_value = snapshot.progress_value
         progress_color = snapshot.status_color
-        if progress_value is None:
+        if progress_value is None or snapshot.is_refreshing or snapshot.is_stale:
             progress_value = 0
             progress_color = "gray"
         detail_frame_color = "#2F3340"
-        if snapshot.state in {"warning", "partial"}:
+        if snapshot.state in {"warning", "partial"} or snapshot.is_stale:
             detail_frame_color = "#4A4030"
         elif snapshot.state in {"critical", "error"}:
             detail_frame_color = "#4A3034"
@@ -6524,10 +6779,12 @@ class App(ctk.CTk):
         self.wsl_storage_detail_frame.configure(fg_color=detail_frame_color)
         self.lbl_wsl_storage_detail.configure(
             text=snapshot.detail_text,
-            text_color=snapshot.status_color if snapshot.state in {"warning", "critical", "partial", "error"} else "gray",
+            text_color=snapshot.status_color if snapshot.state in {"warning", "critical", "partial", "error"} or snapshot.is_stale else "gray",
         )
         self.lbl_wsl_storage_distro_value.configure(text=snapshot.distro_text)
+        self.lbl_wsl_storage_metric_basis_value.configure(text=snapshot.metric_basis_text)
         self.lbl_wsl_storage_source_value.configure(text=snapshot.source_text)
+        self.lbl_wsl_storage_path_value.configure(text=snapshot.path_text)
         self.lbl_wsl_storage_vhdx_value.configure(text=snapshot.vhdx_text)
         self.lbl_wsl_storage_host_free_value.configure(text=snapshot.host_free_text)
         self.lbl_wsl_storage_meta_value.configure(text=snapshot.last_updated_text)
@@ -7080,43 +7337,9 @@ class App(ctk.CTk):
                     self.lbl_big_status.configure(text=self.tr("common.status.uploading"), text_color="#3B8ED0")
                     self.status_label.configure(text=self.tr("common.status.running"), text_color="#2CC985")
             else:
-                self.lbl_big_status.configure(
-                    text=self.upload_dashboard_status_text,
-                    text_color=self.upload_dashboard_status_color,
-                )
-                self.status_label.configure(
-                    text=self.upload_dashboard_status_text,
-                    text_color=self.upload_dashboard_status_color,
-                )
+                self.refresh_dashboard_idle_status_labels()
 
-            # Update Active Tasks List
-            with self.progress_lock:
-                current_files = set(self.active_progress.keys())
-                
-                # Remove old
-                for task_key in list(self.task_labels.keys()):
-                    if task_key not in current_files:
-                        self.task_labels[task_key].destroy()
-                        del self.task_labels[task_key]
-                
-                # Add/Update new
-                for task_key, progress_state in self.active_progress.items():
-                    done, total = progress_state
-                    if total > 0:
-                        progress_pct = (done / total) * 100.0
-                        text = self.tr(
-                            "dashboard.active_task.progress",
-                            task_key=task_key,
-                            percent=int(progress_pct),
-                        )
-                    else:
-                        text = f"{task_key} - {done:,}행 처리"
-                    if task_key not in self.task_labels:
-                        lbl = ctk.CTkLabel(self.active_tasks_list_frame, text=text, anchor="w")
-                        lbl.pack(fill="x", padx=5, pady=2)
-                        self.task_labels[task_key] = lbl
-                    else:
-                        self.task_labels[task_key].configure(text=text)
+            self.refresh_active_task_labels()
         finally:
             self.is_dashboard_update_loop_running = False
 
@@ -7228,6 +7451,8 @@ class App(ctk.CTk):
     def _apply_upload_dashboard_status(self, status_text: str, status_color: str):
         self.upload_dashboard_status_text = status_text
         self.upload_dashboard_status_color = status_color
+        if not self.is_uploading:
+            self.refresh_dashboard_idle_status_labels()
 
     def _schedule_upload_dashboard_status(self, status_text: str, status_color: str):
         self.schedule_gui_callback(0, self._apply_upload_dashboard_status, status_text, status_color)
