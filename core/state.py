@@ -26,6 +26,8 @@ StateDbError = state_db.StateDbError
 StateDbCorruptionError = state_db.StateDbCorruptionError
 StateDbParityError = state_db.StateDbParityError
 StateDbImportError = state_db.StateDbImportError
+FileStateRow = state_db.FileStateRow
+PendingSupabaseReuploadDates = state_db.PendingSupabaseReuploadDates
 
 
 class StateManifest(TypedDict):
@@ -1252,6 +1254,39 @@ def set_upload_maintenance_block(
 def clear_upload_maintenance_block(path: str | None = None) -> None:
     db_path = _ensure_sqlite_state_store(path)
     state_db.clear_upload_maintenance_block(db_path)
+
+
+def save_pending_supabase_reupload_dates(
+    kst_dates: tuple[str, ...],
+    path: str | None,
+) -> None:
+    db_path = _ensure_sqlite_state_store(path)
+    state_db.save_pending_supabase_reupload_dates(db_path, kst_dates)
+
+
+def clear_pending_supabase_reupload_dates(path: str | None) -> None:
+    db_path = _ensure_sqlite_state_store(path)
+    state_db.clear_pending_supabase_reupload_dates(db_path)
+
+
+def load_pending_supabase_reupload_dates(
+    path: str | None,
+) -> PendingSupabaseReuploadDates | None:
+    db_path = _ensure_sqlite_state_store(path)
+    return state_db.load_pending_supabase_reupload_dates(db_path)
+
+
+def load_file_state_rows(path: str | None) -> tuple[FileStateRow, ...]:
+    db_path = _ensure_sqlite_state_store(path)
+    return state_db.load_file_state_rows(db_path)
+
+
+def clear_local_upload_state_by_legacy_keys(
+    legacy_keys: tuple[str, ...],
+    path: str | None,
+) -> int:
+    db_path = _ensure_sqlite_state_store(path)
+    return state_db.clear_file_state_by_legacy_keys(db_path, legacy_keys)
 
 
 def mark_file_completed(

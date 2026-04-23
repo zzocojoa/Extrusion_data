@@ -471,6 +471,59 @@ class SQLiteStatePhase1Tests(TestCase):
         self.assertEqual(snapshot["resume"], {})
         self.assertEqual(snapshot["failed_retry_set"], ())
 
+    def test_clear_local_upload_state_by_legacy_keys_removes_processed_resume_and_failed_rows(self) -> None:
+        workspace = self.create_workspace()
+        appdata_root = self.create_appdata(workspace)
+        _, _, _, db_path, _ = self.create_state_paths(appdata_root)
+        source_file = self.create_csv_file(workspace, "plc/Factory_Integrated_Log_20260421_183823.csv")
+        state_db.ensure_bootstrap_database(str(db_path))
+
+        folder = str(source_file.parent)
+        filename = source_file.name
+        file_key = core_state.build_file_state_key(folder, filename, str(source_file))
+        legacy_key = core_state.build_legacy_file_key(folder, filename)
+
+        state_db.mark_file_completed(str(db_path), folder, filename, str(source_file), None)
+        state_db.set_resume_offset(str(db_path), file_key, 7)
+        state_db.record_file_failure(str(db_path), folder, filename, str(source_file), 7, "boom", None)
+
+        cleared_count = core_state.clear_local_upload_state_by_legacy_keys((legacy_key,), str(db_path))
+
+        self.assertEqual(cleared_count, 1)
+        snapshot = state_db.load_sqlite_snapshot(str(db_path))
+        self.assertEqual(snapshot["processed_keys"], [])
+        self.assertEqual(snapshot["processed_lookup_keys"], [])
+        self.assertEqual(snapshot["resume"], {})
+        self.assertEqual(snapshot["resume_lookup"], {})
+        self.assertEqual(snapshot["failed_retry_set"], ())
+
+    def test_clear_local_upload_state_by_legacy_keys_removes_all_versions_for_same_legacy_key(self) -> None:
+        workspace = self.create_workspace()
+        appdata_root = self.create_appdata(workspace)
+        _, _, _, db_path, _ = self.create_state_paths(appdata_root)
+        source_file = self.create_csv_file(workspace, "plc/Factory_Integrated_Log_20260421_183823.csv")
+        state_db.ensure_bootstrap_database(str(db_path))
+
+        folder = str(source_file.parent)
+        filename = source_file.name
+        legacy_key = core_state.build_legacy_file_key(folder, filename)
+        first_file_key = core_state.build_file_state_key(folder, filename, str(source_file))
+        state_db.mark_file_completed(str(db_path), folder, filename, str(source_file), None)
+
+        source_file.write_text(
+            "timestamp,value\n2026-04-21T00:00:00+09:00,1\n2026-04-21T00:01:00+09:00,2\n",
+            encoding="utf-8",
+        )
+        second_file_key = core_state.build_file_state_key(folder, filename, str(source_file))
+        state_db.mark_file_completed(str(db_path), folder, filename, str(source_file), None)
+
+        self.assertNotEqual(first_file_key, second_file_key)
+        cleared_count = core_state.clear_local_upload_state_by_legacy_keys((legacy_key,), str(db_path))
+
+        self.assertEqual(cleared_count, 2)
+        remaining_rows = state_db.load_file_state_rows(str(db_path))
+        self.assertEqual(remaining_rows, ())
+
     def test_completed_file_does_not_block_same_filename_in_other_folder(self) -> None:
         workspace = self.create_workspace()
         appdata_root = self.create_appdata(workspace)

@@ -1,4 +1,5 @@
 ﻿from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Sequence
 from dataclasses import dataclass
 import threading
 from typing import Callable, Iterable, Optional
@@ -143,6 +144,12 @@ def _load_chunks(
     return data_source
 
 
+def _get_total_row_count(data_source: Iterable[pd.DataFrame]) -> int | None:
+    if isinstance(data_source, Sequence):
+        return sum(len(df_chunk) for df_chunk in data_source)
+    return None
+
+
 def _filter_chunk_by_latest_timestamp(
     df_chunk: pd.DataFrame,
     latest_timestamp: str,
@@ -202,7 +209,7 @@ def upload_via_edge(
     resume_key: Optional[str] = None,
     start_index: int = 0,
     batch_size: int = DEFAULT_UPLOAD_BATCH_SIZE,
-    progress_cb=None,
+    progress_cb: Callable[[int, int], None] | None = None,
     pause_event=None,
     silent: bool = False,
 ) -> bool:
@@ -331,7 +338,7 @@ def upload_item(
     log: Callable[[str], None],
     batch_size: int,
     chunk_size: int,
-    progress_cb=None,
+    progress_cb: Callable[[int, int], None] | None = None,
     progress_update_interval_seconds: float,
     enable_smart_sync: bool,
     resolve_latest_timestamp_fn: Callable[[str], str | None] | None,
@@ -355,8 +362,11 @@ def upload_item(
 
         builder = build_plc if kind == "plc" else build_temp
         data_source = _load_chunks(builder, path, filename, chunk_size)
+        file_total_rows = _get_total_row_count(data_source)
 
         current_global_idx = 0
+        source_rows_seen = 0
+        progress_rows_after_resume = 0
         uploaded_any = False
         last_progress_report_time = 0.0
         last_progress_reported_rows = 0
@@ -383,41 +393,54 @@ def upload_item(
             last_progress_reported_rows = processed_rows
 
         if start_idx > 0:
-            notify_progress(start_idx, None)
+            notify_progress(start_idx, file_total_rows)
 
         with create_upload_http_client() as http_client:
             for df_chunk in data_source:
                 if df_chunk.empty:
                     continue
 
+                chunk_source_row_count = len(df_chunk)
+                chunk_start_source_rows_seen = source_rows_seen
+                resume_rows_remaining = max(0, start_idx - chunk_start_source_rows_seen)
+                smart_sync_rows_after_resume = 0
+
                 if latest_ts and "timestamp" in df_chunk.columns:
                     df_chunk, source_row_count = _filter_chunk_by_latest_timestamp(df_chunk, latest_ts)
                     skipped_row_count = source_row_count - len(df_chunk)
+                    smart_sync_rows_after_resume = max(0, skipped_row_count - resume_rows_remaining)
                     if skipped_row_count > 0 and not df_chunk.empty:
                         current_global_idx += skipped_row_count
-                        notify_progress(current_global_idx, None)
-                        set_resume_offset_fn(key, current_global_idx)
+                        set_resume_offset_fn(
+                            key,
+                            current_global_idx,
+                        )
                     if df_chunk.empty:
                         current_global_idx += source_row_count
+                        source_rows_seen += chunk_source_row_count
+                        progress_rows_after_resume += smart_sync_rows_after_resume
+                        if smart_sync_rows_after_resume > 0:
+                            notify_progress(start_idx + progress_rows_after_resume, file_total_rows)
                         continue
 
-                df_chunk, consumed_rows = _apply_resume_offset(
+                df_chunk, _consumed_rows = _apply_resume_offset(
                     df_chunk,
                     enable_smart_sync,
                     start_idx,
                     current_global_idx,
                 )
                 if df_chunk.empty:
-                    current_global_idx += consumed_rows
+                    current_global_idx += _consumed_rows
+                    source_rows_seen += chunk_source_row_count
                     continue
 
-                chunk_start_idx = current_global_idx
+                chunk_progress_base = progress_rows_after_resume + smart_sync_rows_after_resume
 
                 def report_chunk_progress(done_in_chunk: int, total_in_chunk: int) -> None:
                     _ = total_in_chunk
                     notify_progress(
-                        chunk_start_idx + done_in_chunk,
-                        None,
+                        start_idx + chunk_progress_base + done_in_chunk,
+                        file_total_rows,
                     )
 
                 ok = upload_via_edge(
@@ -440,8 +463,10 @@ def upload_item(
                     return False
 
                 uploaded_any = True
+                progress_rows_after_resume += smart_sync_rows_after_resume + len(df_chunk)
                 current_global_idx += len(df_chunk)
-                notify_progress(current_global_idx, None)
+                source_rows_seen += chunk_source_row_count
+                notify_progress(start_idx + progress_rows_after_resume, file_total_rows)
                 if not enable_smart_sync:
                     set_resume_offset_fn(key, current_global_idx)
 
@@ -453,7 +478,10 @@ def upload_item(
         log(f"- Upload {key}: 완료")
         if progress_cb is not None:
             try:
-                progress_cb(current_global_idx, current_global_idx)
+                progress_cb(
+                    start_idx + progress_rows_after_resume,
+                    start_idx + progress_rows_after_resume if file_total_rows is None else file_total_rows,
+                )
             except Exception:
                 pass
 

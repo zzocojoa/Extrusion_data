@@ -103,7 +103,13 @@ class SupabaseMgmtSmokeTests(TestCase):
         self.assertEqual(len(app.supabase_mgmt_row_widgets), 2)
         self.assertEqual(
             app.var_supabase_mgmt_summary.get(),
-            app.tr("supabase_mgmt.summary.total", date_count=2, row_count="8"),
+            app.tr(
+                "supabase_mgmt.summary.total",
+                date_count=2,
+                row_count="8",
+                total_date_count=2,
+                total_row_count="8",
+            ),
         )
         self.assertEqual(app.btn_supabase_delete_all.cget("state"), "normal")
 
@@ -121,6 +127,51 @@ class SupabaseMgmtSmokeTests(TestCase):
             ),
         )
         self.assertEqual(app.btn_supabase_delete_selected.cget("state"), "normal")
+
+    def test_supabase_mgmt_nested_scroll_uses_nearest_canvas_only(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="supabase-mgmt-scroll-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        sample_rows = self.build_sample_rows()
+        self.show_supabase_mgmt_with_rows(app, sample_rows)
+
+        outer_canvas = getattr(app.supabase_mgmt_overview_shell.master, "_parent_canvas", None)
+        inner_canvas = getattr(app.supabase_mgmt_rows_frame, "_parent_canvas", None)
+        self.assertIsNotNone(outer_canvas)
+        self.assertIsNotNone(inner_canvas)
+        self.assertIsNot(inner_canvas, outer_canvas)
+
+        target_widget = app.supabase_mgmt_row_widgets[0].checkbox
+        self.assertTrue(app.supabase_mgmt_rows_frame.check_if_master_is_canvas(target_widget))
+        self.assertFalse(app.supabase_mgmt_overview_shell.master.check_if_master_is_canvas(target_widget))
+
+    def test_supabase_mgmt_date_lookup_filters_rows_immediately(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="supabase-mgmt-filter-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        sample_rows = self.build_sample_rows()
+        self.show_supabase_mgmt_with_rows(app, sample_rows)
+
+        app.var_supabase_mgmt_filter_query.set("2026-04-22")
+        pump(app)
+
+        self.assertEqual(len(app.supabase_mgmt_rows), 1)
+        self.assertEqual(app.supabase_mgmt_rows[0].kst_date.isoformat(), "2026-04-22")
+        self.assertEqual(
+            app.var_supabase_mgmt_summary.get(),
+            app.tr(
+                "supabase_mgmt.summary.total",
+                date_count=1,
+                row_count="5",
+                total_date_count=2,
+                total_row_count="8",
+            ),
+        )
+        self.assertEqual(
+            app.var_supabase_mgmt_detail.get(),
+            app.tr("supabase_mgmt.filter.active", query="2026-04-22"),
+        )
+        self.assertEqual(app.btn_supabase_delete_all.cget("state"), "normal")
 
     def test_supabase_mgmt_buttons_follow_data_task_busy_state(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="supabase-mgmt-busy-"))
@@ -192,7 +243,13 @@ class SupabaseMgmtSmokeTests(TestCase):
         self.assertEqual(app.var_supabase_mgmt_selection_summary.get(), app.tr("supabase_mgmt.selection.none"))
         self.assertEqual(
             app.var_supabase_mgmt_summary.get(),
-            app.tr("supabase_mgmt.summary.total", date_count=1, row_count="5"),
+            app.tr(
+                "supabase_mgmt.summary.total",
+                date_count=1,
+                row_count="5",
+                total_date_count=1,
+                total_row_count="5",
+            ),
         )
         self.assertEqual(app.btn_supabase_delete_selected.cget("state"), "disabled")
         self.assertEqual(app.btn_supabase_delete_all.cget("state"), "normal")
@@ -279,3 +336,125 @@ class SupabaseMgmtSmokeTests(TestCase):
         self.assertEqual(app.var_supabase_mgmt_detail.get(), expected_error)
         self.assertEqual(app.btn_supabase_delete_all.cget("state"), "disabled")
         showerror_mock.assert_called_once_with(app.tr("dialog.error.title"), expected_error)
+
+    def test_supabase_mgmt_clear_upload_hold_button_unblocks_maintenance_state(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="supabase-mgmt-clear-hold-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        sample_rows = self.build_sample_rows()[:1]
+        uploader_gui_tk.set_upload_maintenance_block(
+            "supabase_mgmt",
+            app.tr("supabase_mgmt.maintenance.reason"),
+        )
+        self.addCleanup(uploader_gui_tk.clear_upload_maintenance_block)
+        self.show_supabase_mgmt_with_rows(app, sample_rows)
+
+        self.assertTrue(app.supabase_mgmt_hold_active)
+        self.assertEqual(
+            app.supabase_mgmt_hold_status_label.cget("text"),
+            app.tr("supabase_mgmt.hold.status.active"),
+        )
+        self.assertEqual(
+            app.supabase_mgmt_hold_detail_label.cget("text"),
+            app.tr("supabase_mgmt.maintenance.reason"),
+        )
+        self.assertEqual(app.btn_supabase_clear_upload_hold.cget("state"), "normal")
+
+        with patch.object(uploader_gui_tk.messagebox, "askyesno", return_value=True):
+            app.on_supabase_mgmt_clear_upload_hold()
+            pump(app)
+
+        state_health_snapshot = uploader_gui_tk.load_state_health_snapshot(False)
+        self.assertTrue(state_health_snapshot["can_start_upload"])
+        self.assertFalse(app.supabase_mgmt_hold_active)
+        self.assertEqual(
+            app.supabase_mgmt_hold_status_label.cget("text"),
+            app.tr("supabase_mgmt.hold.status.inactive"),
+        )
+        self.assertEqual(
+            app.supabase_mgmt_hold_detail_label.cget("text"),
+            app.tr("supabase_mgmt.hold.detail.inactive"),
+        )
+        self.assertEqual(app.btn_supabase_clear_upload_hold.cget("state"), "disabled")
+
+    def test_supabase_mgmt_allow_reupload_clears_local_state_and_restores_preview_candidate(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="supabase-mgmt-reupload-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        sample_rows = self.build_sample_rows()[:1]
+        plc_dir = appdata_root / "plc"
+        plc_dir.mkdir(parents=True, exist_ok=True)
+        source_file = plc_dir / "Factory_Integrated_Log_20260421_183823.csv"
+        source_file.write_text("Date,Time,Mold1\n2026-04-21,00:00:00,1\n", encoding="utf-8")
+        uploader_gui_tk.mark_file_completed(str(plc_dir), source_file.name, str(source_file), None)
+        uploader_gui_tk.save_pending_supabase_reupload_dates(("2026-04-21",))
+        self.addCleanup(uploader_gui_tk.clear_pending_supabase_reupload_dates)
+
+        self.show_supabase_mgmt_with_rows(app, sample_rows)
+
+        self.assertEqual(
+            app.supabase_mgmt_reupload_status_label.cget("text"),
+            app.tr("supabase_mgmt.reupload.status.pending"),
+        )
+        self.assertEqual(app.btn_supabase_allow_reupload_dates.cget("state"), "normal")
+
+        with patch.object(uploader_gui_tk.messagebox, "askyesno", return_value=True):
+            app.on_supabase_mgmt_allow_reupload_dates()
+            pump(app)
+
+        self.assertEqual(uploader_gui_tk.load_processed(), set())
+        self.assertEqual(
+            app.supabase_mgmt_reupload_status_label.cget("text"),
+            app.tr("supabase_mgmt.reupload.status.inactive"),
+        )
+        included, excluded = uploader_gui_tk.preview_diagnostics(
+            str(plc_dir),
+            None,
+            uploader_gui_tk.date(2026, 4, 21),
+            uploader_gui_tk.date(2026, 4, 21),
+            0,
+            False,
+            False,
+            uploader_gui_tk.load_processed(),
+            app.tr_map,
+        )
+        self.assertEqual(len(included), 1)
+        self.assertEqual(included[0][1], source_file.name)
+        self.assertEqual(excluded, [])
+
+    def test_supabase_mgmt_manual_allow_reupload_clears_old_deleted_date_state(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="supabase-mgmt-manual-reupload-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        sample_rows = self.build_sample_rows()[:1]
+        plc_dir = appdata_root / "plc"
+        plc_dir.mkdir(parents=True, exist_ok=True)
+        source_file = plc_dir / "Factory_Integrated_Log_20260421_183823.csv"
+        source_file.write_text("Date,Time,Mold1\n2026-04-21,00:00:00,1\n", encoding="utf-8")
+        uploader_gui_tk.mark_file_completed(str(plc_dir), source_file.name, str(source_file), None)
+        uploader_gui_tk.save_pending_supabase_reupload_dates(("2026-04-21",))
+        self.addCleanup(uploader_gui_tk.clear_pending_supabase_reupload_dates)
+
+        self.show_supabase_mgmt_with_rows(app, sample_rows)
+
+        with patch.object(uploader_gui_tk.simpledialog, "askstring", return_value="2026-04-21"):
+            with patch.object(uploader_gui_tk.messagebox, "askyesno", return_value=True):
+                app.on_supabase_mgmt_allow_reupload_dates_manual()
+                pump(app)
+
+        self.assertEqual(uploader_gui_tk.load_processed(), set())
+        self.assertIsNone(uploader_gui_tk.load_pending_supabase_reupload_dates())
+        included, excluded = uploader_gui_tk.preview_diagnostics(
+            str(plc_dir),
+            None,
+            uploader_gui_tk.date(2026, 4, 21),
+            uploader_gui_tk.date(2026, 4, 21),
+            0,
+            False,
+            False,
+            uploader_gui_tk.load_processed(),
+            app.tr_map,
+        )
+        self.assertEqual(len(included), 1)
+        self.assertEqual(included[0][1], source_file.name)
+        self.assertEqual(excluded, [])
