@@ -604,6 +604,52 @@ class DashboardSmokeTests(TestCase):
         self.assertTrue(app.state_health_blocks_upload)
         showwarning.assert_called_once()
 
+    def test_start_upload_with_values_can_clear_maintenance_hold(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-maintenance-clear-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        maintenance_snapshot: core_state.StateHealthSnapshot = {
+            "state": "blocked",
+            "read_mode": "sqlite",
+            "can_start_upload": False,
+            "pending_resume_count": 0,
+            "failed_retry_count": 0,
+            "recovery_action_required": False,
+            "summary_code": "maintenance_block",
+            "detail_codes": ("maintenance_block",),
+            "error_message": "maintenance-hold",
+            "maintenance_source": "supabase_mgmt",
+            "backup_dir": str(appdata_root / "ExtrusionUploader" / "migration_backups"),
+        }
+        ready_snapshot: core_state.StateHealthSnapshot = {
+            "state": "ready",
+            "read_mode": "sqlite",
+            "can_start_upload": True,
+            "pending_resume_count": 0,
+            "failed_retry_count": 0,
+            "recovery_action_required": False,
+            "summary_code": "ready",
+            "detail_codes": ("ready",),
+            "backup_dir": str(appdata_root / "ExtrusionUploader" / "migration_backups"),
+        }
+        vals = {
+            "SUPABASE_URL": "http://127.0.0.1:54321",
+            "EDGE_FUNCTION_URL": "",
+        }
+
+        with patch.object(
+            uploader_gui_tk,
+            "load_state_health_snapshot",
+            side_effect=[maintenance_snapshot, ready_snapshot],
+        ):
+            with patch.object(uploader_gui_tk, "clear_upload_maintenance_block") as clear_mock:
+                with patch.object(uploader_gui_tk.App, "ask_yes_no", return_value=True):
+                    with patch.object(app, "ensure_local_supabase_ready", return_value=False) as ready_mock:
+                        app.start_upload_with_values(vals, False)
+
+        clear_mock.assert_called_once_with()
+        ready_mock.assert_called_once()
+
     def test_auto_start_upload_does_not_call_on_start_when_state_health_is_blocked(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-blocked-auto-"))
         self.addCleanup(shutil.rmtree, appdata_root, True)

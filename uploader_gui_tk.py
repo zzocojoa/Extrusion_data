@@ -6,12 +6,13 @@ import threading
 import queue
 import shutil
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping, Protocol
 from urllib.parse import urlparse
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import subprocess
 import time
 import webbrowser
@@ -64,8 +65,16 @@ from core.cycle_operations import (
     execute_cycle_snapshot_sync,
     resolve_cycle_db_connection_settings,
 )
-
-
+from core.supabase_mgmt import (
+    SUPABASE_DELETE_MODE_ALL,
+    SUPABASE_DELETE_MODE_SELECTED,
+    SupabaseDeletePreview,
+    SupabaseDeleteRequest,
+    SupabaseMetricDateRow,
+    build_supabase_delete_preview,
+    execute_supabase_delete,
+    load_supabase_mgmt_rows,
+)
 # Tkinter UI
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -104,6 +113,18 @@ if os.name == 'nt':
 
 def kst_now() -> datetime:
     return datetime.now(KST)
+
+
+def format_supabase_metric_row_count(row_count: int) -> str:
+    return f"{row_count:,}"
+
+
+class TranslateFn(Protocol):
+    def __call__(self, key: str, **params: object) -> str: ...
+
+
+class TranslateMapFn(Protocol):
+    def __call__(self, key: str, params: Mapping[str, object]) -> str: ...
 
 
 def load_processed() -> set:
@@ -145,6 +166,14 @@ def load_failed_retry_set() -> tuple[core_state.FailedRetryEntry, ...]:
 
 def load_state_health_snapshot(verify_integrity: bool) -> core_state.StateHealthSnapshot:
     return core_state.load_state_health(STATE_DB_PATH, verify_integrity)
+
+
+def set_upload_maintenance_block(source: str, reason: str) -> None:
+    core_state.set_upload_maintenance_block(source, reason, STATE_DB_PATH)
+
+
+def clear_upload_maintenance_block() -> None:
+    core_state.clear_upload_maintenance_block(STATE_DB_PATH)
 
 
 def load_upload_dashboard_state_snapshot() -> core_state.UploadDashboardStateSnapshot:
@@ -225,6 +254,115 @@ def load_core_cycle_module() -> ModuleType:
     import core.cycle_processing as core_cycle
 
     return core_cycle
+
+
+def _normalize_supabase_mgmt_date_value(value: object) -> date:
+    if type(value) is date:
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError as error:
+            raise ValueError(f"Supabase 날짜 형식이 올바르지 않습니다. value={value}") from error
+    raise TypeError(f"Supabase 날짜 타입이 올바르지 않습니다. value={value!r}")
+
+
+def _normalize_supabase_mgmt_timestamp_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def _read_supabase_mgmt_row_value(row: object, field_names: tuple[str, ...]) -> object:
+    for field_name in field_names:
+        if hasattr(row, field_name):
+            return getattr(row, field_name)
+    raise AttributeError(f"Supabase 행에서 필드를 찾지 못했습니다. fields={field_names}, row={row!r}")
+
+
+def _normalize_supabase_mgmt_date_row(row: object) -> "SupabaseMgmtDateRow":
+    raw_kst_date = _read_supabase_mgmt_row_value(row, ("kst_date", "date"))
+    raw_row_count = _read_supabase_mgmt_row_value(row, ("row_count", "count"))
+    raw_min_timestamp = _read_supabase_mgmt_row_value(row, ("min_timestamp", "min_time", "min"))
+    raw_max_timestamp = _read_supabase_mgmt_row_value(row, ("max_timestamp", "max_time", "max"))
+    kst_date = _normalize_supabase_mgmt_date_value(raw_kst_date)
+    row_count = int(raw_row_count)
+    if row_count < 0:
+        raise ValueError(f"Supabase 행 수는 음수일 수 없습니다. kst_date={kst_date.isoformat()}, row_count={row_count}")
+    min_timestamp = _normalize_supabase_mgmt_timestamp_text(raw_min_timestamp)
+    max_timestamp = _normalize_supabase_mgmt_timestamp_text(raw_max_timestamp)
+    return SupabaseMgmtDateRow(
+        kst_date=kst_date,
+        row_count=row_count,
+        min_timestamp=min_timestamp,
+        max_timestamp=max_timestamp,
+    )
+
+
+def _build_supabase_mgmt_selection_summary(
+    date_rows: tuple["SupabaseMgmtDateRow", ...],
+) -> "SupabaseMgmtSelectionSummary":
+    if len(date_rows) == 0:
+        return SupabaseMgmtSelectionSummary(
+            date_count=0,
+            row_count=0,
+            min_timestamp="",
+            max_timestamp="",
+        )
+
+    row_count = 0
+    min_timestamp = date_rows[0].min_timestamp
+    max_timestamp = date_rows[0].max_timestamp
+    for date_row in date_rows:
+        row_count += date_row.row_count
+        if date_row.min_timestamp < min_timestamp:
+            min_timestamp = date_row.min_timestamp
+        if date_row.max_timestamp > max_timestamp:
+            max_timestamp = date_row.max_timestamp
+
+    return SupabaseMgmtSelectionSummary(
+        date_count=len(date_rows),
+        row_count=row_count,
+        min_timestamp=min_timestamp,
+        max_timestamp=max_timestamp,
+    )
+
+
+def _format_supabase_mgmt_delete_error_message(
+    translate_fn: TranslateFn,
+    error: Exception,
+) -> str:
+    error_text = str(error)
+    normalized_error = error_text.lower()
+    if (
+        "preview does not match" in normalized_error
+        or "found no current rows" in normalized_error
+        or "left rows in the target range" in normalized_error
+    ):
+        return translate_fn("supabase_mgmt.error.retryable_delete", error=error_text)
+    if (
+        "pgcode=55p03" in normalized_error
+        or "pgcode=40p01" in normalized_error
+        or "pgcode=40001" in normalized_error
+        or "lock timeout" in normalized_error
+        or "deadlock" in normalized_error
+        or "serialization" in normalized_error
+    ):
+        return translate_fn("supabase_mgmt.error.locked_delete", error=error_text)
+    return error_text
+
+
+def _format_upload_maintenance_reason(
+    translate_fn: TranslateMapFn,
+    message_key: str,
+) -> str:
+    return translate_fn(message_key, {})
 
 
 def load_build_training_base() -> Callable[[str, str, str, str | None], str]:
@@ -829,6 +967,31 @@ class WslStorageSnapshot:
     is_partial: bool
     is_stale: bool
     is_available: bool
+
+
+@dataclass(frozen=True)
+class SupabaseMgmtDateRow:
+    kst_date: date
+    row_count: int
+    min_timestamp: str
+    max_timestamp: str
+
+
+@dataclass(frozen=True)
+class SupabaseMgmtSelectionSummary:
+    date_count: int
+    row_count: int
+    min_timestamp: str
+    max_timestamp: str
+
+
+@dataclass(frozen=True)
+class SupabaseMgmtRowWidgets:
+    row: SupabaseMgmtDateRow
+    row_frame: ctk.CTkFrame
+    checkbox: ctk.CTkCheckBox
+    delete_button: ctk.CTkButton
+    selected_var: tk.BooleanVar
 
 
 @dataclass(frozen=True)
@@ -1806,6 +1969,8 @@ def format_state_health_view(
     failed_retry_count = state_health_snapshot["failed_retry_count"]
     if summary_code == "legacy_mode":
         status_text = translate_fn("dashboard.state_store.status.legacy_mode", {})
+    elif summary_code == "maintenance_block":
+        status_text = translate_fn("dashboard.state_store.status.maintenance_block", {})
     elif state == "blocked":
         status_text = translate_fn("dashboard.state_store.status.recovery_required", {})
     elif state == "attention":
@@ -1837,6 +2002,8 @@ def format_state_health_view(
             detail_lines.append(translate_fn("dashboard.state_store.detail.can_resume", {}))
         elif detail_code == "ready":
             detail_lines.append(translate_fn("dashboard.state_store.detail.ready", {}))
+        elif detail_code == "maintenance_block":
+            detail_lines.append(translate_fn("dashboard.state_store.detail.maintenance_block", {}))
     error_message = str(state_health_snapshot.get("error_message", "")).strip()
     if error_message != "":
         detail_lines.insert(0, error_message)
@@ -2131,12 +2298,23 @@ class App(ctk.CTk):
         self.var_settings_validation = tk.StringVar(
             value=self.tr("settings.validation.no_action_needed")
         )
+        self.var_supabase_mgmt_status = tk.StringVar(value=self.tr("supabase_mgmt.status.idle"))
+        self.var_supabase_mgmt_summary = tk.StringVar(value=self.tr("supabase_mgmt.summary.empty"))
+        self.var_supabase_mgmt_selection_summary = tk.StringVar(value=self.tr("supabase_mgmt.selection.none"))
+        self.var_supabase_mgmt_detail = tk.StringVar(value=self.tr("supabase_mgmt.summary.last_refresh.empty"))
         self.is_settings_dirty = False
         self.settings_calendar_popup = None
         self.settings_calendar_target = ""
         self.settings_calendar_year = 0
         self.settings_calendar_month = 0
         self.current_view = ""
+        self.supabase_mgmt_rows: tuple[SupabaseMgmtDateRow, ...] = ()
+        self.supabase_mgmt_row_widgets: tuple[SupabaseMgmtRowWidgets, ...] = ()
+        self.supabase_mgmt_has_loaded_once = False
+        self.supabase_mgmt_state = "idle"
+        self.supabase_mgmt_last_loaded_at = ""
+        self.supabase_mgmt_rows_frame: ctk.CTkFrame | None = None
+        self.supabase_mgmt_state_label: ctk.CTkLabel | None = None
         self.dashboard_layout_after_id: str | None = None
         self.dashboard_update_after_id: str | None = None
         self.is_dashboard_update_loop_running = False
@@ -2619,6 +2797,8 @@ class App(ctk.CTk):
             self.btn_cycle_ops.configure(text=self.tr("sidebar.cycle_ops"))
         if hasattr(self, "btn_data") and self.btn_data.winfo_exists():
             self.btn_data.configure(text=self.tr("sidebar.data_mgmt"))
+        if hasattr(self, "btn_supabase_mgmt") and self.btn_supabase_mgmt.winfo_exists():
+            self.btn_supabase_mgmt.configure(text=self.tr("sidebar.supabase_mgmt"))
 
     def refresh_current_view(self) -> None:
         current_view = self.current_view
@@ -2640,6 +2820,9 @@ class App(ctk.CTk):
             return
         if current_view == "data_mgmt":
             self.show_data_mgmt()
+            return
+        if current_view == "supabase_mgmt":
+            self.show_supabase_mgmt()
 
 
     def on_closing(self):
@@ -2726,7 +2909,7 @@ class App(ctk.CTk):
         self.sidebar = ctk.CTkFrame(self, width=230, corner_radius=0)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         self.sidebar.grid_columnconfigure(0, weight=1)
-        self.sidebar.grid_rowconfigure(6, weight=1)
+        self.sidebar.grid_rowconfigure(7, weight=1)
         
         # Load Logo
         logo_path = resource_path(os.path.join('assets', 'logo.png'))
@@ -2771,6 +2954,13 @@ class App(ctk.CTk):
 
         self.btn_data = ctk.CTkButton(self.sidebar, text=self.tr("sidebar.data_mgmt"), command=self.show_data_mgmt)
         self.btn_data.grid(row=6, column=0, sticky="ew", padx=18, pady=10)
+
+        self.btn_supabase_mgmt = ctk.CTkButton(
+            self.sidebar,
+            text=self.tr("sidebar.supabase_mgmt"),
+            command=self.show_supabase_mgmt,
+        )
+        self.btn_supabase_mgmt.grid(row=7, column=0, sticky="ew", padx=18, pady=10)
         
         # Status indicator at bottom
         self.status_label = ctk.CTkLabel(self.sidebar, text=self.tr("common.status.ready"), text_color="gray")
@@ -4817,7 +5007,7 @@ class App(ctk.CTk):
         )
         self.training_plc_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_action_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_action_row(
                 self.training_plc_row,
                 self.training_plc_label,
                 self.training_plc_entry,
@@ -4848,7 +5038,7 @@ class App(ctk.CTk):
         )
         self.training_spot_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_action_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_action_row(
                 self.training_spot_row,
                 self.training_spot_label,
                 self.training_spot_entry,
@@ -4879,7 +5069,7 @@ class App(ctk.CTk):
         )
         self.training_base_input_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_action_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_action_row(
                 self.training_base_input_row,
                 self.training_base_input_label,
                 self.training_base_input_entry,
@@ -4910,7 +5100,7 @@ class App(ctk.CTk):
         )
         self.training_base_output_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_action_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_action_row(
                 self.training_base_output_row,
                 self.training_base_output_label,
                 self.training_base_output_entry,
@@ -4941,7 +5131,7 @@ class App(ctk.CTk):
         )
         self.training_dataset_output_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_action_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_action_row(
                 self.training_dataset_output_row,
                 self.training_dataset_output_label,
                 self.training_dataset_output_entry,
@@ -4966,7 +5156,7 @@ class App(ctk.CTk):
         self.training_filename_entry = ctk.CTkEntry(self.training_filename_row, textvariable=self.var_training_filename_hint)
         self.training_filename_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_row(
                 self.training_filename_row,
                 self.training_filename_label,
                 self.training_filename_entry,
@@ -5048,7 +5238,7 @@ class App(ctk.CTk):
         )
         archive_dir_row.bind(
             "<Configure>",
-            lambda _event: self.layout_responsive_labeled_entry_action_row(
+            lambda _event=None: self.layout_responsive_labeled_entry_action_row(
                 archive_dir_row,
                 archive_dir_label,
                 archive_dir_entry,
@@ -5132,6 +5322,722 @@ class App(ctk.CTk):
         
         self.data_log_box = ctk.CTkTextbox(outputs_frame, width=600, height=300)
         self.data_log_box.pack(fill="both", expand=True, padx=10, pady=10)
+        
+    def show_supabase_mgmt(self):
+        if self.current_view == "supabase_mgmt":
+            if self.supabase_mgmt_rows_frame is not None and self.supabase_mgmt_rows_frame.winfo_exists():
+                self.refresh_supabase_mgmt_selection_summary()
+            return
+        if not self.confirm_leave_data_tasks(self.tr("sidebar.supabase_mgmt")):
+            return
+        if not self.confirm_leave_settings(self.tr("navigation.supabase_mgmt")):
+            return
+        self.current_view = "supabase_mgmt"
+        self.clear_main()
+
+        self.main_frame.grid_rowconfigure(0, weight=1)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+
+        scroll_frame = ctk.CTkScrollableFrame(
+            self.main_frame,
+            label_text=self.tr("supabase_mgmt.title"),
+        )
+        scroll_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        scroll_frame.grid_columnconfigure(0, weight=1)
+
+        summary_frame = ctk.CTkFrame(scroll_frame)
+        summary_frame.pack(fill="x", padx=10, pady=(10, 8))
+
+        help_label = ctk.CTkLabel(
+            summary_frame,
+            text=self.tr("supabase_mgmt.help"),
+            text_color="gray",
+            justify="left",
+            anchor="w",
+        )
+        help_label.pack(fill="x", anchor="w", padx=10, pady=(10, 6))
+        self.bind_label_wrap(help_label, horizontal_padding=30, min_wraplength=420)
+
+        status_row = ctk.CTkFrame(summary_frame, fg_color="transparent")
+        status_row.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkLabel(
+            status_row,
+            text=self.tr("supabase_mgmt.summary.status_label"),
+            text_color="gray",
+        ).pack(side="left")
+        self.supabase_mgmt_status_label = ctk.CTkLabel(
+            status_row,
+            textvariable=self.var_supabase_mgmt_status,
+            font=ctk.CTkFont(weight="bold"),
+            anchor="w",
+        )
+        self.supabase_mgmt_status_label.pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            status_row,
+            text=self.tr("supabase_mgmt.summary.last_refresh_label"),
+            text_color="gray",
+        ).pack(side="left", padx=(18, 8))
+        self.supabase_mgmt_last_refresh_label = ctk.CTkLabel(
+            status_row,
+            text=self.tr("supabase_mgmt.summary.last_refresh.empty"),
+            anchor="w",
+        )
+        self.supabase_mgmt_last_refresh_label.pack(side="left")
+
+        summary_label = ctk.CTkLabel(
+            summary_frame,
+            textvariable=self.var_supabase_mgmt_summary,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            justify="left",
+            anchor="w",
+        )
+        summary_label.pack(fill="x", anchor="w", padx=10, pady=(0, 4))
+        self.bind_label_wrap(summary_label, horizontal_padding=30, min_wraplength=420)
+
+        selection_summary_label = ctk.CTkLabel(
+            summary_frame,
+            textvariable=self.var_supabase_mgmt_selection_summary,
+            justify="left",
+            anchor="w",
+        )
+        selection_summary_label.pack(fill="x", anchor="w", padx=10, pady=(0, 4))
+        self.bind_label_wrap(selection_summary_label, horizontal_padding=30, min_wraplength=420)
+
+        detail_label = ctk.CTkLabel(
+            summary_frame,
+            textvariable=self.var_supabase_mgmt_detail,
+            text_color="gray",
+            justify="left",
+            anchor="w",
+        )
+        detail_label.pack(fill="x", anchor="w", padx=10, pady=(0, 10))
+        self.bind_label_wrap(detail_label, horizontal_padding=30, min_wraplength=420)
+
+        actions_frame = ctk.CTkFrame(scroll_frame)
+        actions_frame.pack(fill="x", padx=10, pady=(0, 8))
+        self.btn_supabase_refresh = ctk.CTkButton(
+            actions_frame,
+            text=self.tr("supabase_mgmt.button.refresh"),
+            command=self.on_supabase_mgmt_refresh,
+        )
+        self.btn_supabase_select_all = ctk.CTkButton(
+            actions_frame,
+            text=self.tr("supabase_mgmt.button.select_all"),
+            command=self.on_supabase_mgmt_select_all,
+        )
+        self.btn_supabase_clear_selection = ctk.CTkButton(
+            actions_frame,
+            text=self.tr("supabase_mgmt.button.clear_selection"),
+            command=self.on_supabase_mgmt_clear_selection,
+        )
+        self.btn_supabase_delete_selected = ctk.CTkButton(
+            actions_frame,
+            text=self.tr("supabase_mgmt.button.delete_selected"),
+            fg_color="#C96A4A",
+            hover_color="#A6553B",
+            command=self.on_supabase_mgmt_delete_selected,
+        )
+        actions_frame.bind(
+            "<Configure>",
+            lambda _event: self.layout_responsive_button_row(
+                actions_frame,
+                [
+                    self.btn_supabase_refresh,
+                    self.btn_supabase_select_all,
+                    self.btn_supabase_clear_selection,
+                    self.btn_supabase_delete_selected,
+                ],
+            ),
+        )
+        self.layout_responsive_button_row(
+            actions_frame,
+            [
+                self.btn_supabase_refresh,
+                self.btn_supabase_select_all,
+                self.btn_supabase_clear_selection,
+                self.btn_supabase_delete_selected,
+            ],
+        )
+
+        danger_frame = ctk.CTkFrame(scroll_frame)
+        danger_frame.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(
+            danger_frame,
+            text=self.tr("supabase_mgmt.danger.title"),
+            font=ctk.CTkFont(weight="bold"),
+            text_color="#B74B4B",
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        danger_help_label = ctk.CTkLabel(
+            danger_frame,
+            text=self.tr("supabase_mgmt.danger.help"),
+            text_color="gray",
+            justify="left",
+            anchor="w",
+        )
+        danger_help_label.pack(fill="x", anchor="w", padx=10, pady=(0, 8))
+        self.bind_label_wrap(danger_help_label, horizontal_padding=30, min_wraplength=420)
+        self.btn_supabase_delete_all = ctk.CTkButton(
+            danger_frame,
+            text=self.tr("supabase_mgmt.button.delete_all"),
+            fg_color="#B74B4B",
+            hover_color="#953D3D",
+            command=self.on_supabase_mgmt_delete_all,
+        )
+        self.btn_supabase_delete_all.pack(anchor="w", padx=10, pady=(0, 10))
+
+        list_frame = ctk.CTkFrame(scroll_frame)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        list_frame.grid_columnconfigure(0, weight=1)
+        self.supabase_mgmt_rows_frame = ctk.CTkScrollableFrame(
+            list_frame,
+            label_text=self.tr("supabase_mgmt.list.title"),
+        )
+        self.supabase_mgmt_rows_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+        outputs_frame = ctk.CTkFrame(scroll_frame)
+        outputs_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        progress_frame = ctk.CTkFrame(outputs_frame, fg_color="transparent")
+        progress_frame.pack(fill="x", padx=10, pady=(10, 0))
+        self.data_progress_bar = ctk.CTkProgressBar(progress_frame, width=400)
+        self.data_progress_bar.pack(fill="x", pady=(0, 8))
+        self.data_progress_bar.set(0)
+        self.data_progress_label = ctk.CTkLabel(
+            progress_frame,
+            text=self.format_percent_text(0.0),
+        )
+        self.data_progress_label.pack(anchor="w")
+        self.data_log_box = ctk.CTkTextbox(outputs_frame, width=600, height=300)
+        self.data_log_box.pack(fill="both", expand=True, padx=10, pady=10)
+
+        if self.supabase_mgmt_has_loaded_once:
+            self._render_supabase_mgmt_rows(self.supabase_mgmt_rows)
+            self._sync_supabase_mgmt_action_state()
+        else:
+            self._render_supabase_mgmt_placeholder(self.tr("supabase_mgmt.loading.body"))
+            self.on_supabase_mgmt_refresh()
+
+    def _build_supabase_mgmt_request(
+        self,
+        selection_mode: str,
+        date_rows: tuple[SupabaseMgmtDateRow, ...],
+    ) -> SupabaseDeleteRequest:
+        request_dates = tuple(date_row.kst_date for date_row in date_rows)
+        if selection_mode == SUPABASE_DELETE_MODE_ALL:
+            request_dates = ()
+        return SupabaseDeleteRequest(
+            selection_mode=selection_mode,
+            dates=request_dates,
+        )
+
+    def _build_supabase_mgmt_core_rows(self) -> tuple[SupabaseMetricDateRow, ...]:
+        return tuple(
+            SupabaseMetricDateRow(
+                kst_date=date_row.kst_date,
+                row_count=date_row.row_count,
+                min_timestamp=date_row.min_timestamp,
+                max_timestamp=date_row.max_timestamp,
+            )
+            for date_row in self.supabase_mgmt_rows
+        )
+
+    def _build_supabase_mgmt_delete_preview(
+        self,
+        selection_mode: str,
+        date_rows: tuple[SupabaseMgmtDateRow, ...],
+    ) -> SupabaseDeletePreview:
+        request = self._build_supabase_mgmt_request(selection_mode, date_rows)
+        return build_supabase_delete_preview(
+            self._build_supabase_mgmt_core_rows(),
+            request,
+        )
+
+    def _load_supabase_mgmt_rows_from_core(self) -> tuple[SupabaseMgmtDateRow, ...]:
+        raw_rows = load_supabase_mgmt_rows(PROJECT_ROOT)
+        return tuple(_normalize_supabase_mgmt_date_row(row) for row in raw_rows)
+
+    def _clear_supabase_mgmt_rows(self) -> None:
+        if self.supabase_mgmt_rows_frame is None or not self.supabase_mgmt_rows_frame.winfo_exists():
+            return
+        for child in self.supabase_mgmt_rows_frame.winfo_children():
+            child.destroy()
+        self.supabase_mgmt_row_widgets = ()
+        self.supabase_mgmt_state_label = None
+
+    def _render_supabase_mgmt_placeholder(self, message: str) -> None:
+        if self.supabase_mgmt_rows_frame is None or not self.supabase_mgmt_rows_frame.winfo_exists():
+            return
+        self._clear_supabase_mgmt_rows()
+        self.supabase_mgmt_state_label = ctk.CTkLabel(
+            self.supabase_mgmt_rows_frame,
+            text=message,
+            text_color="gray",
+            justify="center",
+            anchor="center",
+        )
+        self.supabase_mgmt_state_label.pack(fill="x", expand=True, padx=14, pady=16)
+        self.bind_label_wrap(self.supabase_mgmt_state_label, horizontal_padding=28, min_wraplength=420)
+
+    def _format_supabase_mgmt_last_refresh_text(self) -> str:
+        if self.supabase_mgmt_last_loaded_at == "":
+            return self.tr("supabase_mgmt.summary.last_refresh.empty")
+        return self.tr(
+            "supabase_mgmt.summary.last_refresh.value",
+            timestamp=self.supabase_mgmt_last_loaded_at,
+        )
+
+    def _reset_supabase_mgmt_cached_state(self) -> None:
+        self.supabase_mgmt_rows = ()
+        self.supabase_mgmt_row_widgets = ()
+        self.supabase_mgmt_has_loaded_once = False
+        self.supabase_mgmt_last_loaded_at = ""
+        self.var_supabase_mgmt_summary.set(self.tr("supabase_mgmt.summary.empty"))
+        self.var_supabase_mgmt_selection_summary.set(self.tr("supabase_mgmt.selection.none"))
+        self.var_supabase_mgmt_detail.set(self.tr("supabase_mgmt.summary.last_refresh.empty"))
+        if hasattr(self, "supabase_mgmt_last_refresh_label") and self.supabase_mgmt_last_refresh_label.winfo_exists():
+            self.supabase_mgmt_last_refresh_label.configure(text=self._format_supabase_mgmt_last_refresh_text())
+
+    def _apply_supabase_mgmt_error_state(self, error_message: str) -> None:
+        self._reset_supabase_mgmt_cached_state()
+        self.supabase_mgmt_state = "error"
+        self._set_supabase_mgmt_status_text(
+            "supabase_mgmt.status.error",
+            error_message,
+            "#E06C75",
+        )
+        self._render_supabase_mgmt_placeholder(self.tr("supabase_mgmt.error.body"))
+        self._sync_supabase_mgmt_action_state()
+
+    def _build_supabase_mgmt_delete_confirm_body(
+        self,
+        body_key: str,
+        preview: SupabaseDeletePreview,
+    ) -> str:
+        if len(preview.date_rows) == 0:
+            raise ValueError("Supabase 삭제 확인 대상을 찾지 못했습니다.")
+        return self.tr(
+            body_key,
+            date_count=preview.summary.date_count,
+            row_count=format_supabase_metric_row_count(preview.summary.row_count),
+            first_date=preview.date_rows[0].kst_date.isoformat(),
+            last_date=preview.date_rows[-1].kst_date.isoformat(),
+            min_timestamp=preview.summary.min_timestamp,
+            max_timestamp=preview.summary.max_timestamp,
+        )
+
+    def _sync_supabase_mgmt_action_state(self) -> None:
+        is_busy = self.is_data_task_running or self.supabase_mgmt_state in {"loading", "deleting"}
+        is_ready = self.supabase_mgmt_state == "ready"
+        has_rows = is_ready and len(self.supabase_mgmt_rows) > 0
+        has_selection = is_ready and len(self._get_supabase_mgmt_selected_rows()) > 0
+        if is_busy:
+            if hasattr(self, "btn_supabase_refresh") and self.btn_supabase_refresh.winfo_exists():
+                self.btn_supabase_refresh.configure(state="disabled")
+            if hasattr(self, "btn_supabase_select_all") and self.btn_supabase_select_all.winfo_exists():
+                self.btn_supabase_select_all.configure(state="disabled")
+            if hasattr(self, "btn_supabase_clear_selection") and self.btn_supabase_clear_selection.winfo_exists():
+                self.btn_supabase_clear_selection.configure(state="disabled")
+            if hasattr(self, "btn_supabase_delete_selected") and self.btn_supabase_delete_selected.winfo_exists():
+                self.btn_supabase_delete_selected.configure(state="disabled")
+            if hasattr(self, "btn_supabase_delete_all") and self.btn_supabase_delete_all.winfo_exists():
+                self.btn_supabase_delete_all.configure(state="disabled")
+            for row_widget in self.supabase_mgmt_row_widgets:
+                if row_widget.checkbox.winfo_exists():
+                    row_widget.checkbox.configure(state="disabled")
+                if row_widget.delete_button.winfo_exists():
+                    row_widget.delete_button.configure(state="disabled")
+            return
+
+        if hasattr(self, "btn_supabase_refresh") and self.btn_supabase_refresh.winfo_exists():
+            self.btn_supabase_refresh.configure(state="normal")
+        if hasattr(self, "btn_supabase_select_all") and self.btn_supabase_select_all.winfo_exists():
+            self.btn_supabase_select_all.configure(state="normal" if has_rows else "disabled")
+        if hasattr(self, "btn_supabase_clear_selection") and self.btn_supabase_clear_selection.winfo_exists():
+            self.btn_supabase_clear_selection.configure(state="normal" if has_selection else "disabled")
+        if hasattr(self, "btn_supabase_delete_all") and self.btn_supabase_delete_all.winfo_exists():
+            self.btn_supabase_delete_all.configure(state="normal" if has_rows else "disabled")
+        if hasattr(self, "btn_supabase_delete_selected") and self.btn_supabase_delete_selected.winfo_exists():
+            self.btn_supabase_delete_selected.configure(state="normal" if has_selection else "disabled")
+        for row_widget in self.supabase_mgmt_row_widgets:
+            if row_widget.checkbox.winfo_exists():
+                row_widget.checkbox.configure(state="normal" if has_rows else "disabled")
+            if row_widget.delete_button.winfo_exists():
+                row_widget.delete_button.configure(state="normal" if has_rows else "disabled")
+
+    def _render_supabase_mgmt_rows(self, rows: tuple[SupabaseMgmtDateRow, ...]) -> None:
+        self.supabase_mgmt_rows = rows
+        if self.supabase_mgmt_rows_frame is None or not self.supabase_mgmt_rows_frame.winfo_exists():
+            return
+
+        self._clear_supabase_mgmt_rows()
+        if len(rows) == 0:
+            self.supabase_mgmt_state = "empty"
+            self.var_supabase_mgmt_status.set(self.tr("supabase_mgmt.status.empty"))
+            self.var_supabase_mgmt_summary.set(
+                self.tr("supabase_mgmt.summary.total", date_count=0, row_count=0)
+            )
+            self.var_supabase_mgmt_selection_summary.set(self.tr("supabase_mgmt.selection.none"))
+            self.var_supabase_mgmt_detail.set(self.tr("supabase_mgmt.empty.body"))
+            self._render_supabase_mgmt_placeholder(self.tr("supabase_mgmt.empty.body"))
+            if hasattr(self, "supabase_mgmt_last_refresh_label") and self.supabase_mgmt_last_refresh_label.winfo_exists():
+                self.supabase_mgmt_last_refresh_label.configure(text=self._format_supabase_mgmt_last_refresh_text())
+            self._sync_supabase_mgmt_action_state()
+            return
+
+        self.supabase_mgmt_state = "ready"
+        self.var_supabase_mgmt_status.set(self.tr("supabase_mgmt.status.ready"))
+        row_widgets: list[SupabaseMgmtRowWidgets] = []
+        for date_row in rows:
+            row_frame = ctk.CTkFrame(self.supabase_mgmt_rows_frame)
+            row_frame.pack(fill="x", padx=10, pady=6)
+            row_frame.grid_columnconfigure(0, weight=1)
+
+            selected_var = tk.BooleanVar(value=False)
+            top_row = ctk.CTkFrame(row_frame, fg_color="transparent")
+            top_row.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 2))
+            top_row.grid_columnconfigure(1, weight=1)
+            checkbox = ctk.CTkCheckBox(
+                top_row,
+                text=self.tr("supabase_mgmt.list.date", kst_date=date_row.kst_date.isoformat()),
+                variable=selected_var,
+                command=self.refresh_supabase_mgmt_selection_summary,
+            )
+            checkbox.grid(row=0, column=0, sticky="w")
+            row_count_label = ctk.CTkLabel(
+                top_row,
+                text=self.tr(
+                    "supabase_mgmt.list.row_count",
+                    row_count=format_supabase_metric_row_count(date_row.row_count),
+                ),
+                font=ctk.CTkFont(weight="bold"),
+                anchor="w",
+            )
+            row_count_label.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+            detail_label = ctk.CTkLabel(
+                row_frame,
+                text=self.tr(
+                    "supabase_mgmt.list.timestamp_range",
+                    min_timestamp=date_row.min_timestamp,
+                    max_timestamp=date_row.max_timestamp,
+                ),
+                text_color="gray",
+                anchor="w",
+                justify="left",
+            )
+            detail_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+            self.bind_label_wrap(detail_label, horizontal_padding=40, min_wraplength=420)
+
+            delete_button = ctk.CTkButton(
+                top_row,
+                text=self.tr("supabase_mgmt.button.delete_single"),
+                width=90,
+                fg_color="#C96A4A",
+                hover_color="#A6553B",
+                command=partial(self.on_supabase_mgmt_delete_single, date_row),
+            )
+            delete_button.grid(row=0, column=2, sticky="e", padx=(8, 0))
+
+            row_widgets.append(
+                SupabaseMgmtRowWidgets(
+                    row=date_row,
+                    row_frame=row_frame,
+                    checkbox=checkbox,
+                    delete_button=delete_button,
+                    selected_var=selected_var,
+                )
+            )
+
+        self.supabase_mgmt_row_widgets = tuple(row_widgets)
+        self.refresh_supabase_mgmt_selection_summary()
+        if hasattr(self, "supabase_mgmt_last_refresh_label") and self.supabase_mgmt_last_refresh_label.winfo_exists():
+            self.supabase_mgmt_last_refresh_label.configure(text=self._format_supabase_mgmt_last_refresh_text())
+        self._sync_supabase_mgmt_action_state()
+
+    def _get_supabase_mgmt_selected_rows(self) -> tuple[SupabaseMgmtDateRow, ...]:
+        selected_rows: list[SupabaseMgmtDateRow] = []
+        for row_widget in self.supabase_mgmt_row_widgets:
+            if row_widget.selected_var.get():
+                selected_rows.append(row_widget.row)
+        return tuple(selected_rows)
+
+    def refresh_supabase_mgmt_selection_summary(self) -> None:
+        total_summary = _build_supabase_mgmt_selection_summary(self.supabase_mgmt_rows)
+        selected_rows = self._get_supabase_mgmt_selected_rows()
+        selected_summary = _build_supabase_mgmt_selection_summary(selected_rows)
+        self.var_supabase_mgmt_summary.set(
+            self.tr(
+                "supabase_mgmt.summary.total",
+                date_count=total_summary.date_count,
+                row_count=format_supabase_metric_row_count(total_summary.row_count),
+            )
+        )
+        if selected_summary.date_count == 0:
+            self.var_supabase_mgmt_selection_summary.set(self.tr("supabase_mgmt.selection.none"))
+            if self.supabase_mgmt_state == "ready":
+                self.var_supabase_mgmt_detail.set(self.tr("supabase_mgmt.ready.body"))
+        else:
+            self.var_supabase_mgmt_selection_summary.set(
+                self.tr(
+                    "supabase_mgmt.selection.detail",
+                    date_count=selected_summary.date_count,
+                    row_count=format_supabase_metric_row_count(selected_summary.row_count),
+                    first_date=selected_rows[0].kst_date.isoformat(),
+                    last_date=selected_rows[-1].kst_date.isoformat(),
+                )
+            )
+            if self.supabase_mgmt_state == "ready":
+                self.var_supabase_mgmt_detail.set(
+                    self.tr(
+                        "supabase_mgmt.selection.timestamp_range",
+                        min_timestamp=selected_summary.min_timestamp,
+                        max_timestamp=selected_summary.max_timestamp,
+                    )
+                )
+        self._sync_supabase_mgmt_action_state()
+
+    def _set_supabase_mgmt_status_text(self, status_key: str, detail_text: str, detail_color: str) -> None:
+        self.var_supabase_mgmt_status.set(self.tr(status_key))
+        self.var_supabase_mgmt_detail.set(detail_text)
+        if hasattr(self, "supabase_mgmt_status_label") and self.supabase_mgmt_status_label.winfo_exists():
+            self.supabase_mgmt_status_label.configure(text_color=detail_color)
+        if self.supabase_mgmt_state_label is not None and self.supabase_mgmt_state_label.winfo_exists():
+            self.supabase_mgmt_state_label.configure(text_color=detail_color)
+
+    def on_supabase_mgmt_select_all(self) -> None:
+        for row_widget in self.supabase_mgmt_row_widgets:
+            row_widget.selected_var.set(True)
+        self.refresh_supabase_mgmt_selection_summary()
+
+    def on_supabase_mgmt_clear_selection(self) -> None:
+        for row_widget in self.supabase_mgmt_row_widgets:
+            row_widget.selected_var.set(False)
+        self.refresh_supabase_mgmt_selection_summary()
+
+    def on_supabase_mgmt_refresh(self) -> None:
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        if not self.ensure_local_supabase_ready(self.tr("supabase_mgmt.action.refresh")):
+            return
+        if not self.can_start_data_task():
+            return
+        self.disable_data_mgmt_buttons()
+        self.supabase_mgmt_state = "loading"
+        self._render_supabase_mgmt_placeholder(self.tr("supabase_mgmt.loading.body"))
+        self._set_supabase_mgmt_status_text(
+            "supabase_mgmt.status.loading",
+            self.tr("supabase_mgmt.loading.body"),
+            "gray",
+        )
+        self.var_supabase_mgmt_summary.set(self.tr("supabase_mgmt.summary.loading"))
+        self.var_supabase_mgmt_selection_summary.set(self.tr("supabase_mgmt.selection.none"))
+        self.data_log_box.delete("1.0", "end")
+        self.data_progress_bar.set(0)
+        self.data_progress_label.configure(text=self.format_percent_text(0.0))
+        self.log_to_data_box(self.tr("supabase_mgmt.log.loading_started"))
+
+        def _run() -> None:
+            try:
+                rows = self._load_supabase_mgmt_rows_from_core()
+                loaded_summary = _build_supabase_mgmt_selection_summary(rows)
+
+                def _apply_loaded_rows() -> None:
+                    self.supabase_mgmt_last_loaded_at = kst_now().strftime("%Y-%m-%d %H:%M:%S KST")
+                    self._render_supabase_mgmt_rows(rows)
+                    if len(rows) == 0:
+                        self._set_supabase_mgmt_status_text(
+                            "supabase_mgmt.status.empty",
+                            self.tr("supabase_mgmt.empty.body"),
+                            "gray",
+                        )
+                    else:
+                        self._set_supabase_mgmt_status_text(
+                            "supabase_mgmt.status.ready",
+                            self.tr("supabase_mgmt.ready.body"),
+                            "#2CC985",
+                        )
+                    self.refresh_supabase_mgmt_selection_summary()
+
+                self.schedule_gui_callback(0, _apply_loaded_rows)
+                self.log_to_data_box(
+                    self.tr(
+                        "supabase_mgmt.log.loading_completed",
+                        date_count=loaded_summary.date_count,
+                        row_count=format_supabase_metric_row_count(loaded_summary.row_count),
+                    )
+                )
+                self.update_data_progress(1.0)
+                self.supabase_mgmt_has_loaded_once = True
+            except Exception as error:
+                self.log_to_data_box(self.tr("supabase_mgmt.log.loading_failed", error=error))
+                self.schedule_gui_callback(
+                    0,
+                    self._apply_supabase_mgmt_error_state,
+                    str(error),
+                )
+                self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
+            finally:
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _run_supabase_mgmt_delete_task(
+        self,
+        preview: SupabaseDeletePreview,
+    ) -> None:
+        deleting_message = self.tr(
+            "supabase_mgmt.deleting.body",
+            date_count=preview.summary.date_count,
+            row_count=format_supabase_metric_row_count(preview.summary.row_count),
+        )
+        self.disable_data_mgmt_buttons()
+        self.supabase_mgmt_state = "deleting"
+        self._render_supabase_mgmt_placeholder(deleting_message)
+        self._set_supabase_mgmt_status_text(
+            "supabase_mgmt.status.deleting",
+            deleting_message,
+            "#C96A4A",
+        )
+        self.data_log_box.delete("1.0", "end")
+        self.data_progress_bar.set(0)
+        self.data_progress_label.configure(text=self.format_percent_text(0.0))
+        self.log_to_data_box(
+            self.tr(
+                "supabase_mgmt.log.deleting_started",
+                date_count=preview.summary.date_count,
+                row_count=format_supabase_metric_row_count(preview.summary.row_count),
+            )
+        )
+        set_upload_maintenance_block(
+            "supabase_mgmt",
+            _format_upload_maintenance_reason(
+                self.tr_map,
+                "supabase_mgmt.maintenance.reason",
+            ),
+        )
+
+        def _run() -> None:
+            try:
+                delete_result = execute_supabase_delete(PROJECT_ROOT, preview)
+                deleted_rows = tuple(
+                    _normalize_supabase_mgmt_date_row(row)
+                    for row in delete_result.date_rows
+                )
+                self.update_data_progress(0.6)
+                refreshed_rows = self._load_supabase_mgmt_rows_from_core()
+                deleted_summary = _build_supabase_mgmt_selection_summary(deleted_rows)
+
+                def _apply_deleted_rows() -> None:
+                    self.supabase_mgmt_last_loaded_at = kst_now().strftime("%Y-%m-%d %H:%M:%S KST")
+                    self._render_supabase_mgmt_rows(refreshed_rows)
+                    if len(refreshed_rows) == 0:
+                        self._set_supabase_mgmt_status_text(
+                            "supabase_mgmt.status.empty",
+                            self.tr("supabase_mgmt.empty.body"),
+                            "gray",
+                        )
+                    else:
+                        self._set_supabase_mgmt_status_text(
+                            "supabase_mgmt.status.ready",
+                            self.tr("supabase_mgmt.ready.body"),
+                            "#2CC985",
+                        )
+                    self.refresh_supabase_mgmt_selection_summary()
+
+                self.schedule_gui_callback(0, _apply_deleted_rows)
+                self.log_to_data_box(
+                    self.tr(
+                        "supabase_mgmt.log.deleting_completed",
+                        date_count=deleted_summary.date_count,
+                        row_count=format_supabase_metric_row_count(deleted_summary.row_count),
+                    )
+                )
+                self.log_to_data_box(self.tr("supabase_mgmt.log.upload_hold_enabled"))
+                self.update_data_progress(1.0)
+                self.supabase_mgmt_has_loaded_once = True
+            except Exception as error:
+                clear_upload_maintenance_block()
+                error_message = _format_supabase_mgmt_delete_error_message(self.tr, error)
+                self.log_to_data_box(self.tr("supabase_mgmt.log.deleting_failed", error=error_message))
+                self.schedule_gui_callback(
+                    0,
+                    self._apply_supabase_mgmt_error_state,
+                    error_message,
+                )
+                self.schedule_gui_callback(
+                    0,
+                    lambda: messagebox.showerror(self.tr("dialog.error.title"), error_message),
+                )
+            finally:
+                self.schedule_gui_callback(0, self.enable_data_mgmt_buttons)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def on_supabase_mgmt_delete_selected(self) -> None:
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        if not self.ensure_local_supabase_ready(self.tr("supabase_mgmt.action.delete_selected")):
+            return
+        if not self.can_start_data_task():
+            return
+        selected_rows = self._get_supabase_mgmt_selected_rows()
+        if len(selected_rows) == 0:
+            return
+        preview = self._build_supabase_mgmt_delete_preview(
+            SUPABASE_DELETE_MODE_SELECTED,
+            selected_rows,
+        )
+        should_delete = messagebox.askyesno(
+            self.tr("supabase_mgmt.dialog.delete_selected.title"),
+            self._build_supabase_mgmt_delete_confirm_body(
+                "supabase_mgmt.dialog.delete_selected.body",
+                preview,
+            ),
+        )
+        if not should_delete:
+            return
+        self._run_supabase_mgmt_delete_task(preview)
+
+    def on_supabase_mgmt_delete_all(self) -> None:
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        if not self.ensure_local_supabase_ready(self.tr("supabase_mgmt.action.delete_all")):
+            return
+        if not self.can_start_data_task():
+            return
+        if len(self.supabase_mgmt_rows) == 0:
+            return
+        preview = self._build_supabase_mgmt_delete_preview(
+            SUPABASE_DELETE_MODE_ALL,
+            (),
+        )
+        should_delete = messagebox.askyesno(
+            self.tr("supabase_mgmt.dialog.delete_all.title"),
+            self._build_supabase_mgmt_delete_confirm_body(
+                "supabase_mgmt.dialog.delete_all.body",
+                preview,
+            ),
+        )
+        if not should_delete:
+            return
+        self._run_supabase_mgmt_delete_task(preview)
+
+    def on_supabase_mgmt_delete_single(self, date_row: SupabaseMgmtDateRow) -> None:
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        if not self.ensure_local_supabase_ready(self.tr("supabase_mgmt.action.delete_selected")):
+            return
+        if not self.can_start_data_task():
+            return
+        preview = self._build_supabase_mgmt_delete_preview(
+            SUPABASE_DELETE_MODE_SELECTED,
+            (date_row,),
+        )
+        should_delete = messagebox.askyesno(
+            self.tr("supabase_mgmt.dialog.delete_single.title"),
+            self._build_supabase_mgmt_delete_confirm_body(
+                "supabase_mgmt.dialog.delete_single.body",
+                preview,
+            ),
+        )
+        if not should_delete:
+            return
+        self._run_supabase_mgmt_delete_task(preview)
         
     def on_run_canonical_refresh(self):
         self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
@@ -5482,6 +6388,14 @@ class App(ctk.CTk):
         self.data_progress_label.configure(text=self.format_percent_text(0.0))
         self.var_archive_status.set(self.tr("data_mgmt.archive.status.running"))
         self.log_to_data_box(self.tr("data_mgmt.archive.log.started"))
+        if delete_after_export:
+            set_upload_maintenance_block(
+                "archive_delete",
+                _format_upload_maintenance_reason(
+                    self.tr_map,
+                    "data_mgmt.archive.maintenance.reason",
+                ),
+            )
 
         def _run():
             try:
@@ -5507,7 +6421,11 @@ class App(ctk.CTk):
                         self.tr("data_mgmt.archive.dialog.completed", output_path=output_path),
                     ),
                 )
+                if delete_after_export:
+                    self.log_to_data_box(self.tr("data_mgmt.archive.log.upload_hold_enabled"))
             except Exception as error:
+                if delete_after_export:
+                    clear_upload_maintenance_block()
                 self.log_to_data_box(self.tr("common.log.error", error=error))
                 self.schedule_gui_callback(0, lambda: self.var_archive_status.set(self.tr("data_mgmt.archive.status.failed")))
                 self.schedule_gui_callback(0, lambda: messagebox.showerror(self.tr("dialog.error.title"), str(error)))
@@ -5532,6 +6450,7 @@ class App(ctk.CTk):
             self.btn_archive_preview.configure(state="disabled")
         if hasattr(self, 'btn_archive_export') and self.btn_archive_export.winfo_exists():
             self.btn_archive_export.configure(state="disabled")
+        self._sync_supabase_mgmt_action_state()
 
     def enable_data_mgmt_buttons(self):
         self.is_data_task_running = False
@@ -5549,6 +6468,7 @@ class App(ctk.CTk):
             self.btn_archive_preview.configure(state="normal")
         if hasattr(self, 'btn_archive_export') and self.btn_archive_export.winfo_exists():
             self.btn_archive_export.configure(state="normal")
+        self._sync_supabase_mgmt_action_state()
 
     def pick_training_plc_file(self):
         selected_file = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
@@ -7483,6 +8403,19 @@ class App(ctk.CTk):
         state_health_snapshot = load_state_health_snapshot(False)
         if state_health_snapshot["can_start_upload"]:
             return True
+        if state_health_snapshot["summary_code"] == "maintenance_block":
+            should_clear = self.ask_yes_no(
+                "dashboard.upload.maintenance_clear.title",
+                "dashboard.upload.maintenance_clear.body",
+            )
+            if not should_clear:
+                self._show_blocked_upload_state(state_health_snapshot)
+                return False
+            clear_upload_maintenance_block()
+            self.refresh_upload_operational_cards()
+            state_health_snapshot = load_state_health_snapshot(False)
+            if state_health_snapshot["can_start_upload"]:
+                return True
         self._show_blocked_upload_state(state_health_snapshot)
         return False
 

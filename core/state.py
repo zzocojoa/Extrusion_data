@@ -83,6 +83,7 @@ class StateHealthSnapshot(TypedDict):
     detail_codes: tuple[str, ...]
     error_message: NotRequired[str]
     backup_dir: NotRequired[str]
+    maintenance_source: NotRequired[str]
 
 
 def build_legacy_file_key(folder: str, filename: str) -> str:
@@ -999,6 +1000,21 @@ def load_state_health(path: str | None = None, verify_integrity: bool = False) -
             "error_message": str(error),
             "backup_dir": backup_dir,
         }
+    maintenance_block = state_db.load_upload_maintenance_block(db_path)
+    if maintenance_block is not None:
+        return {
+            "state": "blocked",
+            "read_mode": "sqlite",
+            "can_start_upload": False,
+            "pending_resume_count": 0,
+            "failed_retry_count": 0,
+            "recovery_action_required": False,
+            "summary_code": "maintenance_block",
+            "detail_codes": ("maintenance_block",),
+            "error_message": maintenance_block["reason"],
+            "maintenance_source": maintenance_block["source"],
+            "backup_dir": backup_dir,
+        }
     pending_resume_count = sum(1 for offset in snapshot["resume"].values() if int(offset) > 0)
     failed_retry_count = len(snapshot["failed_retry_set"])
     detail_codes: list[str] = []
@@ -1222,6 +1238,20 @@ def finish_upload_run(
         warning_messages,
         cast(state_db.RecentSuccessfulUploadProfile | None, recent_successful_upload_profile),
     )
+
+
+def set_upload_maintenance_block(
+    source: str,
+    reason: str,
+    path: str | None = None,
+) -> None:
+    db_path = _ensure_sqlite_state_store(path)
+    state_db.set_upload_maintenance_block(db_path, source, reason)
+
+
+def clear_upload_maintenance_block(path: str | None = None) -> None:
+    db_path = _ensure_sqlite_state_store(path)
+    state_db.clear_upload_maintenance_block(db_path)
 
 
 def mark_file_completed(

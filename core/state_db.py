@@ -54,6 +54,12 @@ class FailedRetryEntry(TypedDict):
     error_message: NotRequired[str]
 
 
+class UploadMaintenanceBlock(TypedDict):
+    source: str
+    reason: str
+    activated_at: float
+
+
 class FileStateRow(TypedDict):
     file_key: str
     legacy_key: str
@@ -711,6 +717,92 @@ def _upsert_state_meta(connection: sqlite3.Connection, key: str, value: Any, upd
           updated_at=excluded.updated_at
         """,
         (key, _serialize_json(value), updated_at),
+    )
+
+
+def _load_state_meta_value(connection: sqlite3.Connection, key: str) -> Any | None:
+    row = connection.execute(
+        """
+        SELECT value_json
+        FROM state_meta
+        WHERE key = ?
+        """,
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(str(row["value_json"]))
+    except json.JSONDecodeError as error:
+        raise StateDbCorruptionError(f"Invalid {key} metadata in SQLite state database") from error
+
+
+def set_upload_maintenance_block(
+    db_path: str,
+    source: str,
+    reason: str,
+) -> None:
+    ensure_bootstrap_database(db_path)
+    updated_at = int(time.time())
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            _upsert_state_meta(
+                connection,
+                "upload_maintenance_block",
+                {
+                    "source": source,
+                    "reason": reason,
+                    "activated_at": time.time(),
+                },
+                updated_at,
+            )
+    finally:
+        connection.close()
+
+
+def clear_upload_maintenance_block(db_path: str) -> None:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM state_meta WHERE key = 'upload_maintenance_block'"
+            )
+    finally:
+        connection.close()
+
+
+def load_upload_maintenance_block(db_path: str) -> UploadMaintenanceBlock | None:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        raw_value = _load_state_meta_value(connection, "upload_maintenance_block")
+    finally:
+        connection.close()
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise StateDbCorruptionError(
+            f"Invalid upload_maintenance_block metadata in SQLite state database: {db_path}"
+        )
+    source = str(raw_value.get("source", "")).strip()
+    reason = str(raw_value.get("reason", "")).strip()
+    activated_at_raw = raw_value.get("activated_at")
+    try:
+        activated_at = float(activated_at_raw)
+    except (TypeError, ValueError) as error:
+        raise StateDbCorruptionError(
+            f"Invalid upload_maintenance_block metadata in SQLite state database: {db_path}"
+        ) from error
+    if source == "" or reason == "":
+        raise StateDbCorruptionError(
+            f"Invalid upload_maintenance_block metadata in SQLite state database: {db_path}"
+        )
+    return UploadMaintenanceBlock(
+        source=source,
+        reason=reason,
+        activated_at=activated_at,
     )
 
 

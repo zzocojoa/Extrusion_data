@@ -663,6 +663,31 @@ class SQLiteStatePhase1Tests(TestCase):
         self.assertEqual(health_snapshot["summary_code"], "corruption")
         self.assertIn("Corrupted SQLite state database", health_snapshot["error_message"])
 
+    def test_load_state_health_blocks_when_upload_maintenance_hold_is_active(self) -> None:
+        workspace = self.create_workspace()
+        appdata_root = self.create_appdata(workspace)
+        _, _, _, db_path, _ = self.create_state_paths(appdata_root)
+        state_db.ensure_bootstrap_database(str(db_path))
+        state_db.set_upload_maintenance_block(
+            str(db_path),
+            "supabase_mgmt",
+            "maintenance-hold",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"APPDATA": str(appdata_root)},
+            clear=False,
+        ):
+            health_snapshot = core_state.load_state_health(None, verify_integrity=False)
+
+        self.assertEqual(health_snapshot["state"], "blocked")
+        self.assertFalse(health_snapshot["can_start_upload"])
+        self.assertEqual(health_snapshot["summary_code"], "maintenance_block")
+        self.assertEqual(health_snapshot["detail_codes"], ("maintenance_block",))
+        self.assertEqual(health_snapshot["error_message"], "maintenance-hold")
+        self.assertEqual(health_snapshot["maintenance_source"], "supabase_mgmt")
+
     def test_migrate_legacy_state_rejects_conflicting_sources(self) -> None:
         workspace = self.create_workspace()
         appdata_root = self.create_appdata(workspace)
