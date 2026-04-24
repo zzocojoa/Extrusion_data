@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 from typing import Final
 
 import pandas as pd
+
+from .parquet import resolve_parquet_engine as _resolve_parquet_engine
 
 
 TRAINING_DATASET_V1_SCHEMA: Final[tuple[tuple[str, str], ...]] = (
@@ -259,10 +260,4 @@ def build_idle_series(dataset_frame: pd.DataFrame) -> pd.Series:
 
 
 def resolve_parquet_engine() -> str:
-    if importlib.util.find_spec("pyarrow") is not None:
-        return "pyarrow"
-    if importlib.util.find_spec("fastparquet") is not None:
-        return "fastparquet"
-    raise ModuleNotFoundError(
-        "Parquet 엔진이 없습니다. 프로젝트 환경에 pyarrow 또는 fastparquet를 설치하세요."
-    )
+    return _resolve_parquet_engine()
