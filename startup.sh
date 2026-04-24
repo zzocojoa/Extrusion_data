@@ -14,6 +14,7 @@ GRAFANA_DATA_DIR_PRIMARY="${PROJECT_DIR}/data/grafana_data"
 GRAFANA_DATA_DIR_FALLBACK="${PROJECT_DIR}/grafana_data"
 GRAFANA_PROVISIONING_DIR="${PROJECT_DIR}/grafana/provisioning"
 GRAFANA_DASHBOARDS_DIR="${PROJECT_DIR}/grafana/dashboards"
+GRAFANA_VIEW_MIGRATION_PATH="${PROJECT_DIR}/supabase/migrations/20260424000001_create_view_grafana_all_metrics_long.sql"
 
 print_error() {
     local detail
@@ -133,13 +134,29 @@ does_container_publish_port() {
     printf '%s\n' "${published_ports}" | grep -qx "${host_port}"
 }
 
+does_container_join_network() {
+    local container_name
+    local network_name
+    local joined_networks
+    container_name="$1"
+    network_name="$2"
+    joined_networks="$(docker inspect "${container_name}" --format '{{range $name, $_ := .NetworkSettings.Networks}}{{printf "%s\n" $name}}{{end}}' 2>/dev/null || true)"
+    printf '%s\n' "${joined_networks}" | grep -qx "${network_name}"
+}
+
 ensure_grafana_container_contract() {
+    local grafana_network
+    grafana_network="$(resolve_grafana_network)"
     if ! does_container_publish_port "${GRAFANA_CONTAINER_NAME}" "${GRAFANA_HOST_PORT}" "${GRAFANA_CONTAINER_PORT}"; then
         print_error "grafana_local 컨테이너 포트 설정이 올바르지 않습니다. expected=${GRAFANA_HOST_PORT}:${GRAFANA_CONTAINER_PORT}"
         return 1
     fi
     if ! does_container_mount_destination "${GRAFANA_CONTAINER_NAME}" "/var/lib/grafana"; then
         print_error "grafana_local 컨테이너 데이터 마운트가 없습니다. expected_destination=/var/lib/grafana"
+        return 1
+    fi
+    if ! does_container_join_network "${GRAFANA_CONTAINER_NAME}" "${grafana_network}"; then
+        print_error "grafana_local 컨테이너 네트워크 설정이 올바르지 않습니다. expected_network=${grafana_network}"
         return 1
     fi
 }
@@ -543,11 +560,54 @@ start_grafana_container() {
     cleanup_legacy_grafana_dashboard_storage
 }
 
+apply_supabase_migrations_with_cli() {
+    local migration_output
+    echo "[2-1] Supabase 마이그레이션 적용 중..."
+    if ! migration_output="$(supabase migration up 2>&1)"; then
+        print_error "Supabase 마이그레이션 적용에 실패했습니다. command='supabase migration up' ${migration_output}"
+        return 1
+    fi
+    if [ -n "${migration_output}" ]; then
+        echo "${migration_output}"
+    fi
+}
+
+wait_for_supabase_db_ready() {
+    local attempt
+    attempt=1
+    while [ "${attempt}" -le 30 ]; do
+        if docker exec "${SUPABASE_DB_CONTAINER}" pg_isready -U postgres > /dev/null 2>&1; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    print_error "Supabase DB가 준비되지 않아 Grafana view 마이그레이션을 적용할 수 없습니다. container=${SUPABASE_DB_CONTAINER}"
+    return 1
+}
+
+apply_grafana_view_migration_with_psql() {
+    local migration_output
+    echo "[2-1] Grafana view 마이그레이션 적용 중..."
+    if [ ! -f "${GRAFANA_VIEW_MIGRATION_PATH}" ]; then
+        print_error "Grafana view 마이그레이션 파일이 없습니다. path=${GRAFANA_VIEW_MIGRATION_PATH}"
+        return 1
+    fi
+    if ! migration_output="$(docker exec -i "${SUPABASE_DB_CONTAINER}" psql -v ON_ERROR_STOP=1 -U postgres -d postgres < "${GRAFANA_VIEW_MIGRATION_PATH}" 2>&1)"; then
+        print_error "Grafana view 마이그레이션 적용에 실패했습니다. container=${SUPABASE_DB_CONTAINER} path=${GRAFANA_VIEW_MIGRATION_PATH} ${migration_output}"
+        return 1
+    fi
+    if [ -n "${migration_output}" ]; then
+        echo "${migration_output}"
+    fi
+}
+
 start_supabase_runtime() {
     local supabase_containers
     echo "[2] Supabase 시작 중..."
     if command -v supabase > /dev/null 2>&1; then
         supabase start || echo "⚠️ Supabase 시작 중 경고가 발생했습니다. 이미 실행 중일 수 있습니다."
+        apply_supabase_migrations_with_cli
         return 0
     fi
 
@@ -558,6 +618,8 @@ start_supabase_runtime() {
         return 1
     fi
     echo "${supabase_containers}" | xargs -r docker start
+    wait_for_supabase_db_ready
+    apply_grafana_view_migration_with_psql
 }
 
 start_edge_runtime_container() {
