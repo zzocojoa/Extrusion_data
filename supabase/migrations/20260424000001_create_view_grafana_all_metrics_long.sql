@@ -1,8 +1,6 @@
 -- Grafana에서 재사용하기 쉬운 long format 조회 뷰를 만든다.
 
-DROP VIEW IF EXISTS public.view_grafana_all_metrics_long CASCADE;
-
-CREATE VIEW public.view_grafana_all_metrics_long AS
+CREATE OR REPLACE VIEW public.view_grafana_all_metrics_long AS
 SELECT
     m."timestamp",
     m.device_id,

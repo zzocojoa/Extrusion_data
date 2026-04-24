@@ -560,18 +560,6 @@ start_grafana_container() {
     cleanup_legacy_grafana_dashboard_storage
 }
 
-apply_supabase_migrations_with_cli() {
-    local migration_output
-    echo "[2-1] Supabase 마이그레이션 적용 중..."
-    if ! migration_output="$(supabase migration up 2>&1)"; then
-        print_error "Supabase 마이그레이션 적용에 실패했습니다. command='supabase migration up' ${migration_output}"
-        return 1
-    fi
-    if [ -n "${migration_output}" ]; then
-        echo "${migration_output}"
-    fi
-}
-
 wait_for_supabase_db_ready() {
     local attempt
     attempt=1
@@ -607,7 +595,8 @@ start_supabase_runtime() {
     echo "[2] Supabase 시작 중..."
     if command -v supabase > /dev/null 2>&1; then
         supabase start || echo "⚠️ Supabase 시작 중 경고가 발생했습니다. 이미 실행 중일 수 있습니다."
-        apply_supabase_migrations_with_cli
+        wait_for_supabase_db_ready
+        apply_grafana_view_migration_with_psql
         return 0
     fi
 

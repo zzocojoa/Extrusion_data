@@ -115,6 +115,23 @@ class DashboardSmokeTests(TestCase):
         self.assertEqual(int(app.state_store_summary_card.grid_info()["row"]), 0)
         self.assertEqual(int(app.upload_precheck_frame.grid_info()["row"]), 1)
 
+    def test_startup_applies_bounded_grafana_view_migration(self) -> None:
+        startup_script = Path("startup.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("supabase migration up", startup_script)
+        self.assertIn("wait_for_supabase_db_ready", startup_script)
+        self.assertIn("apply_grafana_view_migration_with_psql", startup_script)
+        self.assertIn("psql -v ON_ERROR_STOP=1", startup_script)
+
+    def test_grafana_view_migration_is_repeatable(self) -> None:
+        migration_sql = Path(
+            "supabase/migrations/20260424000001_create_view_grafana_all_metrics_long.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("CREATE OR REPLACE VIEW public.view_grafana_all_metrics_long AS", migration_sql)
+        self.assertNotIn("DROP VIEW", migration_sql)
+        self.assertNotIn("CASCADE", migration_sql)
+
     def test_dashboard_task_status_nested_scroll_uses_nearest_canvas_only(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-scroll-appdata-"))
         self.addCleanup(shutil.rmtree, appdata_root, True)
