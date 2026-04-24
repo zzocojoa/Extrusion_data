@@ -54,6 +54,17 @@ class FailedRetryEntry(TypedDict):
     error_message: NotRequired[str]
 
 
+class UploadMaintenanceBlock(TypedDict):
+    source: str
+    reason: str
+    activated_at: float
+
+
+class PendingSupabaseReuploadDates(TypedDict):
+    kst_dates: tuple[str, ...]
+    updated_at: float
+
+
 class FileStateRow(TypedDict):
     file_key: str
     legacy_key: str
@@ -714,6 +725,167 @@ def _upsert_state_meta(connection: sqlite3.Connection, key: str, value: Any, upd
     )
 
 
+def _load_state_meta_value(connection: sqlite3.Connection, key: str) -> Any | None:
+    row = connection.execute(
+        """
+        SELECT value_json
+        FROM state_meta
+        WHERE key = ?
+        """,
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(str(row["value_json"]))
+    except json.JSONDecodeError as error:
+        raise StateDbCorruptionError(f"Invalid {key} metadata in SQLite state database") from error
+
+
+def set_upload_maintenance_block(
+    db_path: str,
+    source: str,
+    reason: str,
+) -> None:
+    ensure_bootstrap_database(db_path)
+    updated_at = int(time.time())
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            _upsert_state_meta(
+                connection,
+                "upload_maintenance_block",
+                {
+                    "source": source,
+                    "reason": reason,
+                    "activated_at": time.time(),
+                },
+                updated_at,
+            )
+    finally:
+        connection.close()
+
+
+def clear_upload_maintenance_block(db_path: str) -> None:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM state_meta WHERE key = 'upload_maintenance_block'"
+            )
+    finally:
+        connection.close()
+
+
+def load_upload_maintenance_block(db_path: str) -> UploadMaintenanceBlock | None:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        raw_value = _load_state_meta_value(connection, "upload_maintenance_block")
+    finally:
+        connection.close()
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise StateDbCorruptionError(
+            f"Invalid upload_maintenance_block metadata in SQLite state database: {db_path}"
+        )
+    source = str(raw_value.get("source", "")).strip()
+    reason = str(raw_value.get("reason", "")).strip()
+    activated_at_raw = raw_value.get("activated_at")
+    try:
+        activated_at = float(activated_at_raw)
+    except (TypeError, ValueError) as error:
+        raise StateDbCorruptionError(
+            f"Invalid upload_maintenance_block metadata in SQLite state database: {db_path}"
+        ) from error
+    if source == "" or reason == "":
+        raise StateDbCorruptionError(
+            f"Invalid upload_maintenance_block metadata in SQLite state database: {db_path}"
+        )
+    return UploadMaintenanceBlock(
+        source=source,
+        reason=reason,
+        activated_at=activated_at,
+    )
+
+
+def save_pending_supabase_reupload_dates(
+    db_path: str,
+    kst_dates: tuple[str, ...],
+) -> None:
+    ensure_bootstrap_database(db_path)
+    normalized_dates = tuple(sorted({str(value).strip() for value in kst_dates if str(value).strip() != ""}))
+    updated_at = int(time.time())
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            if normalized_dates == ():
+                connection.execute(
+                    "DELETE FROM state_meta WHERE key = 'pending_supabase_reupload_dates'"
+                )
+                return
+            _upsert_state_meta(
+                connection,
+                "pending_supabase_reupload_dates",
+                {
+                    "kst_dates": list(normalized_dates),
+                    "updated_at": time.time(),
+                },
+                updated_at,
+            )
+    finally:
+        connection.close()
+
+
+def clear_pending_supabase_reupload_dates(db_path: str) -> None:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            connection.execute(
+                "DELETE FROM state_meta WHERE key = 'pending_supabase_reupload_dates'"
+            )
+    finally:
+        connection.close()
+
+
+def load_pending_supabase_reupload_dates(db_path: str) -> PendingSupabaseReuploadDates | None:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        raw_value = _load_state_meta_value(connection, "pending_supabase_reupload_dates")
+    finally:
+        connection.close()
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise StateDbCorruptionError(
+            f"Invalid pending_supabase_reupload_dates metadata in SQLite state database: {db_path}"
+        )
+
+    raw_dates = raw_value.get("kst_dates")
+    if not isinstance(raw_dates, list):
+        raise StateDbCorruptionError(
+            f"Invalid pending_supabase_reupload_dates metadata in SQLite state database: {db_path}"
+        )
+    normalized_dates = tuple(
+        sorted({str(value).strip() for value in raw_dates if str(value).strip() != ""})
+    )
+    updated_at_raw = raw_value.get("updated_at")
+    try:
+        updated_at = float(updated_at_raw)
+    except (TypeError, ValueError) as error:
+        raise StateDbCorruptionError(
+            f"Invalid pending_supabase_reupload_dates metadata in SQLite state database: {db_path}"
+        ) from error
+    return PendingSupabaseReuploadDates(
+        kst_dates=normalized_dates,
+        updated_at=updated_at,
+    )
+
+
 def _build_runtime_legacy_key(folder: str, filename: str) -> str:
     return f"{folder}/{filename}"
 
@@ -1188,6 +1360,95 @@ def save_recent_successful_upload_profile(
 def load_failed_retry_set(db_path: str) -> tuple[FailedRetryEntry, ...]:
     snapshot = load_sqlite_snapshot(db_path)
     return snapshot["failed_retry_set"]
+
+
+def load_file_state_rows(db_path: str) -> tuple[FileStateRow, ...]:
+    ensure_bootstrap_database(db_path)
+    connection = connect_state_db(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+              file_key,
+              legacy_key,
+              folder,
+              filename,
+              state,
+              resume_offset,
+              last_error,
+              retry_count,
+              processed_at,
+              failed_at,
+              updated_at
+            FROM file_state
+            ORDER BY legacy_key, file_key
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    normalized_rows: list[FileStateRow] = []
+    for row in rows:
+        normalized_rows.append(
+            FileStateRow(
+                file_key=str(row["file_key"]),
+                legacy_key=str(row["legacy_key"]),
+                folder=str(row["folder"]),
+                filename=str(row["filename"]),
+                state=str(row["state"]),
+                resume_offset=int(row["resume_offset"]),
+                last_error=None if row["last_error"] is None else str(row["last_error"]),
+                retry_count=int(row["retry_count"]),
+                processed_at=None if row["processed_at"] is None else int(row["processed_at"]),
+                failed_at=None if row["failed_at"] is None else int(row["failed_at"]),
+                updated_at=int(row["updated_at"]),
+            )
+        )
+    return tuple(normalized_rows)
+
+
+def clear_file_state_by_legacy_keys(
+    db_path: str,
+    legacy_keys: tuple[str, ...],
+) -> int:
+    ensure_bootstrap_database(db_path)
+    normalized_legacy_keys = tuple(
+        sorted({str(value).strip() for value in legacy_keys if str(value).strip() != ""})
+    )
+    if normalized_legacy_keys == ():
+        return 0
+
+    placeholders = ", ".join("?" for _ in normalized_legacy_keys)
+    connection = connect_state_db(db_path)
+    try:
+        with connection:
+            removed_file_key_rows = connection.execute(
+                f"""
+                SELECT file_key
+                FROM file_state
+                WHERE legacy_key IN ({placeholders})
+                """,
+                normalized_legacy_keys,
+            ).fetchall()
+            removed_file_keys = tuple(str(row["file_key"]) for row in removed_file_key_rows)
+            delete_cursor = connection.execute(
+                f"""
+                DELETE FROM file_state
+                WHERE legacy_key IN ({placeholders})
+                """,
+                normalized_legacy_keys,
+            )
+            if removed_file_keys != ():
+                failed_placeholders = ", ".join("?" for _ in removed_file_keys)
+                connection.execute(
+                    f"""
+                    DELETE FROM last_failed_retry_state
+                    WHERE file_key IN ({failed_placeholders})
+                    """,
+                    removed_file_keys,
+                )
+            return int(delete_cursor.rowcount)
+    finally:
+        connection.close()
 
 
 def start_upload_run(

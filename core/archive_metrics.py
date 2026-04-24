@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ import psycopg2
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import dotenv_values
+
+from core.config import load_config_with_sources
 
 
 KST = timezone(timedelta(hours=9))
@@ -46,7 +49,8 @@ class ArchiveStats:
 
 
 def load_archive_environment(project_root: Path) -> dict[str, str]:
-    env_path = project_root / ".env"
+    runtime_root = resolve_runtime_project_root(project_root)
+    env_path = runtime_root / ".env"
     loaded_values = dotenv_values(env_path)
     merged_values: dict[str, str] = {}
 
@@ -54,6 +58,18 @@ def load_archive_environment(project_root: Path) -> dict[str, str]:
         if value is None:
             continue
         merged_values[key] = value
+
+    config_values, _config_path, _metadata = load_config_with_sources(None)
+    for key in {
+        "DB_PASSWORD",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_USER",
+        "DB_NAME",
+    }:
+        config_value = config_values.get(key, "").strip()
+        if config_value != "":
+            merged_values[key] = config_value
 
     for key, value in os.environ.items():
         if key in {
@@ -69,10 +85,49 @@ def load_archive_environment(project_root: Path) -> dict[str, str]:
     return merged_values
 
 
+def build_runtime_project_root_candidates(project_root: Path) -> tuple[Path, ...]:
+    candidate_values: list[Path] = [project_root.resolve()]
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        candidate_values.append(executable_dir)
+        candidate_values.append(executable_dir.parent)
+
+    unique_candidates: list[Path] = []
+    seen_candidates: set[str] = set()
+    for candidate in candidate_values:
+        normalized_candidate = str(candidate).lower()
+        if normalized_candidate in seen_candidates:
+            continue
+        seen_candidates.add(normalized_candidate)
+        unique_candidates.append(candidate)
+    return tuple(unique_candidates)
+
+
+def resolve_runtime_project_root(project_root: Path) -> Path:
+    for candidate in build_runtime_project_root_candidates(project_root):
+        if (candidate / ".env").is_file():
+            return candidate
+        if (candidate / "supabase" / "config.toml").is_file():
+            return candidate
+    return project_root.resolve()
+
+
 def read_local_db_port(project_root: Path) -> int:
     import tomllib
 
-    config_path = project_root / "supabase" / "config.toml"
+    config_path: Path | None = None
+    for candidate in build_runtime_project_root_candidates(project_root):
+        candidate_config_path = candidate / "supabase" / "config.toml"
+        if candidate_config_path.is_file():
+            config_path = candidate_config_path
+            break
+
+    if config_path is None:
+        raise ValueError(
+            "supabase/config.toml을 찾을 수 없습니다. "
+            f"project_root={project_root}, candidates={build_runtime_project_root_candidates(project_root)}"
+        )
+
     with config_path.open("rb") as file_handle:
         config_values = tomllib.load(file_handle)
 
@@ -210,6 +265,27 @@ def query_all_metrics_archive_stats(
     return _build_archive_stats_from_row(stats_row)
 
 
+def query_all_metrics_archive_stats_with_delete_lock(
+    connection,
+    before_datetime: datetime,
+) -> ArchiveStats:
+    query = """
+        SELECT
+            COUNT(*) AS row_count,
+            MIN("timestamp") AS min_timestamp,
+            MAX("timestamp") AS max_timestamp
+        FROM public.all_metrics
+        WHERE "timestamp" < %s
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("LOCK TABLE public.all_metrics IN SHARE ROW EXCLUSIVE MODE")
+        cursor.execute(query, (before_datetime,))
+        stats_row = cursor.fetchone()
+    if stats_row is None:
+        raise ValueError("락 획득 후 all_metrics 통계를 읽지 못했습니다.")
+    return _build_archive_stats_from_row(stats_row)
+
+
 def read_all_metrics_archive_stats(
     db_settings: DbConnectionSettings,
     before_datetime: datetime,
@@ -329,10 +405,10 @@ def delete_archived_all_metrics(
     connection = create_connection(db_settings)
     try:
         connection.set_session(
-            isolation_level="REPEATABLE READ",
+            isolation_level="SERIALIZABLE",
             autocommit=False,
         )
-        current_stats = query_all_metrics_archive_stats(connection, before_datetime)
+        current_stats = query_all_metrics_archive_stats_with_delete_lock(connection, before_datetime)
         validate_archive_stats_match(expected_stats, current_stats)
 
         delete_query = """
@@ -355,8 +431,21 @@ def delete_archived_all_metrics(
 
         deleted_stats = _build_archive_stats_from_row(deleted_row)
         validate_archive_stats_match(expected_stats, deleted_stats)
+        remaining_stats = query_all_metrics_archive_stats(connection, before_datetime)
+        if remaining_stats.row_count != 0:
+            raise ValueError(
+                "삭제 이후 cutoff 이전 row가 남아 있습니다. "
+                f"before_datetime={before_datetime.isoformat()}, remaining_row_count={remaining_stats.row_count}"
+            )
         connection.commit()
         return deleted_stats
+    except psycopg2.Error as exc:
+        connection.rollback()
+        raise RuntimeError(
+            "아카이브 삭제가 데이터베이스 오류로 실패했습니다. "
+            f"host={db_settings.host}, port={db_settings.port}, dbname={db_settings.dbname}, "
+            f"before_datetime={before_datetime.isoformat()}, pgcode={exc.pgcode}, pgerror={exc.pgerror}"
+        ) from exc
     except Exception:
         connection.rollback()
         raise

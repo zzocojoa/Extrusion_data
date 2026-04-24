@@ -84,7 +84,7 @@ def run_gui_smoke() -> list[dict[str, Any]]:
                     results.append(
                         build_result(
                             f"{language}:dashboard",
-                            dashboard_tasks.get("row") == 1 and dashboard_tasks.get("column") == 0,
+                            dashboard_tasks.get("row") == 0 and dashboard_tasks.get("column") == 0,
                             str(dashboard_tasks),
                         )
                     )
@@ -207,7 +207,7 @@ def run_gui_smoke() -> list[dict[str, Any]]:
                             f"{language}:dashboard_buttons_wide",
                             app.btn_start,
                             0,
-                            3,
+                            0,
                             1,
                         )
                     )

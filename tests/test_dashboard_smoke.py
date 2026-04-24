@@ -106,8 +106,29 @@ class DashboardSmokeTests(TestCase):
 
         app.set_local_supabase_progress_visible(True)
         pump(app)
-        self.assertEqual(int(app.local_supabase_progress.grid_info()["row"]), 6)
-        self.assertEqual(int(app.lbl_state_store_status.grid_info()["row"]), 7)
+        self.assertEqual(int(app.local_supabase_progress.grid_info()["row"]), 3)
+        self.assertEqual(int(app.lbl_state_store_status.grid_info()["row"]), 1)
+        self.assertEqual(int(app.local_supabase_summary_card.grid_info()["row"]), 0)
+        self.assertEqual(int(app.state_store_summary_card.grid_info()["row"]), 0)
+        self.assertEqual(int(app.upload_precheck_frame.grid_info()["row"]), 1)
+
+    def test_dashboard_task_status_nested_scroll_uses_nearest_canvas_only(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-scroll-appdata-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+
+        app.show_dashboard()
+        pump(app)
+
+        outer_canvas = getattr(app.dashboard_scroll_frame, "_parent_canvas", None)
+        inner_canvas = getattr(app.tasks_frame, "_parent_canvas", None)
+        self.assertIsNotNone(outer_canvas)
+        self.assertIsNotNone(inner_canvas)
+        self.assertIsNot(inner_canvas, outer_canvas)
+
+        target_widget = app.lbl_upload_resume_state
+        self.assertTrue(app.tasks_frame.check_if_master_is_canvas(target_widget))
+        self.assertFalse(app.dashboard_scroll_frame.check_if_master_is_canvas(target_widget))
 
     def test_build_upload_operational_cards_state_uses_failed_retry_set_and_recent_profile(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="dashboard-state-smoke-"))
@@ -429,6 +450,38 @@ class DashboardSmokeTests(TestCase):
         self.assertIn("task-a", app.task_labels)
         self.assertEqual(app.task_labels["task-a"].cget("text"), app.tr("dashboard.active_task.progress", task_key="task-a", percent=50))
 
+        with app.progress_lock:
+            app.active_progress = {"task-b": (7, 0)}
+
+        app.refresh_active_task_labels()
+        pump(app)
+
+        self.assertFalse(app.lbl_active_tasks_empty.winfo_ismapped())
+        self.assertIn("task-b", app.task_labels)
+        self.assertEqual(app.task_labels["task-b"].cget("text"), "task-b - 7행 처리")
+
+    def test_update_dashboard_loop_renders_hero_progress_and_current_file_progress_together(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-hero-progress-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+
+        app.show_dashboard()
+        pump(app)
+        app.is_uploading = True
+        app.pause_event.set()
+        app.total_files = 4
+        app.processed_count = 1
+        with app.progress_lock:
+            app.active_progress = {"task-a": (2, 4)}
+
+        app.update_dashboard_loop(app.dashboard_view_generation)
+        pump(app)
+
+        self.assertEqual(app.lbl_prog_text.cget("text"), app.format_progress_summary(0.25, 1, 4))
+        self.assertIn("task-a", app.task_labels)
+        self.assertEqual(app.task_labels["task-a"].cget("text"), app.tr("dashboard.active_task.progress", task_key="task-a", percent=50))
+        self.assertFalse(app.lbl_active_tasks_empty.winfo_ismapped())
+
     def test_build_wsl_storage_ui_snapshot_keeps_guest_metrics_as_primary_basis(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-wsl-guest-basis-"))
         self.addCleanup(shutil.rmtree, appdata_root, True)
@@ -603,6 +656,52 @@ class DashboardSmokeTests(TestCase):
         self.assertFalse(app.is_uploading)
         self.assertTrue(app.state_health_blocks_upload)
         showwarning.assert_called_once()
+
+    def test_start_upload_with_values_can_clear_maintenance_hold(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-maintenance-clear-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        maintenance_snapshot: core_state.StateHealthSnapshot = {
+            "state": "blocked",
+            "read_mode": "sqlite",
+            "can_start_upload": False,
+            "pending_resume_count": 0,
+            "failed_retry_count": 0,
+            "recovery_action_required": False,
+            "summary_code": "maintenance_block",
+            "detail_codes": ("maintenance_block",),
+            "error_message": "maintenance-hold",
+            "maintenance_source": "supabase_mgmt",
+            "backup_dir": str(appdata_root / "ExtrusionUploader" / "migration_backups"),
+        }
+        ready_snapshot: core_state.StateHealthSnapshot = {
+            "state": "ready",
+            "read_mode": "sqlite",
+            "can_start_upload": True,
+            "pending_resume_count": 0,
+            "failed_retry_count": 0,
+            "recovery_action_required": False,
+            "summary_code": "ready",
+            "detail_codes": ("ready",),
+            "backup_dir": str(appdata_root / "ExtrusionUploader" / "migration_backups"),
+        }
+        vals = {
+            "SUPABASE_URL": "http://127.0.0.1:54321",
+            "EDGE_FUNCTION_URL": "",
+        }
+
+        with patch.object(
+            uploader_gui_tk,
+            "load_state_health_snapshot",
+            side_effect=[maintenance_snapshot, ready_snapshot],
+        ):
+            with patch.object(uploader_gui_tk, "clear_upload_maintenance_block") as clear_mock:
+                with patch.object(uploader_gui_tk.App, "ask_yes_no", return_value=True):
+                    with patch.object(app, "ensure_local_supabase_ready", return_value=False) as ready_mock:
+                        app.start_upload_with_values(vals, False)
+
+        clear_mock.assert_called_once_with()
+        ready_mock.assert_called_once()
 
     def test_auto_start_upload_does_not_call_on_start_when_state_health_is_blocked(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-blocked-auto-"))
