@@ -8,6 +8,15 @@ from typing import Any, Dict, NotRequired, Set, TypedDict, cast
 
 from .config import get_data_dir
 from . import state_db
+from .state_normalization import expand_processed_key as _expand_processed_key
+from .state_normalization import normalize_legacy_key as _normalize_legacy_key
+from .state_normalization import normalize_non_empty_string as _normalize_non_empty_string
+from .state_normalization import normalize_positive_float as _normalize_positive_float
+from .state_normalization import normalize_positive_int as _normalize_positive_int
+from .state_normalization import normalize_processed_set as _normalize_processed_set
+from .state_normalization import normalize_resume_map as _normalize_resume_map
+from .state_normalization import normalize_string_map as _normalize_string_map
+from .state_normalization import split_legacy_key as _split_legacy_key
 
 
 MANIFEST_FILENAME = "state_manifest.json"
@@ -92,14 +101,6 @@ def build_legacy_file_key(folder: str, filename: str) -> str:
     return f"{folder}/{filename}"
 
 
-def _split_legacy_key(legacy_key: str) -> tuple[str, str]:
-    normalized = legacy_key.replace("\\", "/")
-    if "/" not in normalized:
-        return "", normalized
-    folder, filename = normalized.rsplit("/", 1)
-    return folder, filename
-
-
 def build_file_state_key(folder: str, filename: str, file_path: str) -> str:
     legacy_key = build_legacy_file_key(folder, filename)
     if file_path.strip() == "":
@@ -135,97 +136,6 @@ def _manifest_known_keys() -> set[str]:
         "recent_successful_upload_profile",
         "last_failed_retry_state",
     }
-
-
-def _normalize_legacy_key(key: str) -> str:
-    if "|" not in key:
-        return key
-    return key.split("|", 1)[0]
-
-
-def _expand_processed_key(key: str) -> Set[str]:
-    normalized = key.strip()
-    if normalized == "":
-        return set()
-
-    expanded: Set[str] = {normalized}
-    legacy_key = _normalize_legacy_key(normalized)
-    if legacy_key != normalized:
-        expanded.add(legacy_key)
-    return expanded
-
-
-def _normalize_processed_set(values: Any) -> Set[str]:
-    if not isinstance(values, (list, set, tuple)):
-        return set()
-
-    processed: Set[str] = set()
-    for value in values:
-        key = str(value).strip()
-        if key != "":
-            processed.add(key)
-    return processed
-
-
-def _normalize_resume_map(values: Any) -> Dict[str, int]:
-    if not isinstance(values, dict):
-        return {}
-
-    resume: Dict[str, int] = {}
-    for raw_key, raw_value in values.items():
-        key = str(raw_key).strip()
-        if key == "":
-            continue
-        try:
-            offset = int(raw_value)
-        except Exception:
-            continue
-        if offset > 0:
-            resume[key] = offset
-    return resume
-
-
-def _normalize_non_empty_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    if normalized == "":
-        return None
-    return normalized
-
-
-def _normalize_positive_float(value: Any) -> float | None:
-    try:
-        normalized = float(value)
-    except Exception:
-        return None
-    if normalized <= 0:
-        return None
-    return normalized
-
-
-def _normalize_positive_int(value: Any) -> int | None:
-    try:
-        normalized = int(value)
-    except Exception:
-        return None
-    if normalized <= 0:
-        return None
-    return normalized
-
-
-def _normalize_string_map(values: Any) -> dict[str, str] | None:
-    if not isinstance(values, dict):
-        return None
-
-    normalized_values: dict[str, str] = {}
-    for raw_key, raw_value in values.items():
-        key = _normalize_non_empty_string(raw_key)
-        value = _normalize_non_empty_string(raw_value)
-        if key is None or value is None:
-            continue
-        normalized_values[key] = value
-    return normalized_values
 
 
 def _clone_recent_successful_upload_profile(

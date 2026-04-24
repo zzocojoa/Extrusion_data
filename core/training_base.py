@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 from typing import Final
 
 import pandas as pd
+
+from .parquet import resolve_parquet_engine as _resolve_parquet_engine
 
 
 PRESSURE_ACTIVE_THRESHOLD: Final[float] = 30.0
@@ -219,13 +220,3 @@ def _validate_timestamp_series(
     parsed_series = pd.to_datetime(timestamp_series, errors="coerce")
     if bool(parsed_series.isna().any()):
         raise ValueError(error_message)
-
-
-def _resolve_parquet_engine() -> str:
-    if importlib.util.find_spec("pyarrow") is not None:
-        return "pyarrow"
-    if importlib.util.find_spec("fastparquet") is not None:
-        return "fastparquet"
-    raise ModuleNotFoundError(
-        "Parquet 엔진이 없습니다. 프로젝트 환경에 pyarrow 또는 fastparquet를 설치하세요."
-    )
