@@ -74,6 +74,7 @@ from core.supabase_mgmt import (
     build_supabase_delete_preview,
     execute_supabase_delete,
     load_supabase_mgmt_rows,
+    normalize_supabase_metric_timestamp_text,
 )
 # Tkinter UI
 import tkinter as tk
@@ -289,16 +290,6 @@ def _normalize_supabase_mgmt_date_value(value: object) -> date:
     raise TypeError(f"Supabase 날짜 타입이 올바르지 않습니다. value={value!r}")
 
 
-def _normalize_supabase_mgmt_timestamp_text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    return str(value)
-
-
 def _read_supabase_mgmt_row_value(row: object, field_names: tuple[str, ...]) -> object:
     for field_name in field_names:
         if hasattr(row, field_name):
@@ -315,8 +306,8 @@ def _normalize_supabase_mgmt_date_row(row: object) -> "SupabaseMgmtDateRow":
     row_count = int(raw_row_count)
     if row_count < 0:
         raise ValueError(f"Supabase 행 수는 음수일 수 없습니다. kst_date={kst_date.isoformat()}, row_count={row_count}")
-    min_timestamp = _normalize_supabase_mgmt_timestamp_text(raw_min_timestamp)
-    max_timestamp = _normalize_supabase_mgmt_timestamp_text(raw_max_timestamp)
+    min_timestamp = normalize_supabase_metric_timestamp_text(raw_min_timestamp)
+    max_timestamp = normalize_supabase_metric_timestamp_text(raw_max_timestamp)
     return SupabaseMgmtDateRow(
         kst_date=kst_date,
         row_count=row_count,

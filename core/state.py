@@ -8,6 +8,8 @@ from typing import Any, Dict, NotRequired, Set, TypedDict, cast
 
 from .config import get_data_dir
 from . import state_db
+from .state_normalization import build_file_state_key as _build_file_state_key
+from .state_normalization import build_legacy_file_key as _build_legacy_file_key
 from .state_normalization import expand_processed_key as _expand_processed_key
 from .state_normalization import normalize_legacy_key as _normalize_legacy_key
 from .state_normalization import normalize_non_empty_string as _normalize_non_empty_string
@@ -98,18 +100,11 @@ class StateHealthSnapshot(TypedDict):
 
 
 def build_legacy_file_key(folder: str, filename: str) -> str:
-    return f"{folder}/{filename}"
+    return _build_legacy_file_key(folder, filename)
 
 
 def build_file_state_key(folder: str, filename: str, file_path: str) -> str:
-    legacy_key = build_legacy_file_key(folder, filename)
-    if file_path.strip() == "":
-        return legacy_key
-    try:
-        stat_result = os.stat(file_path)
-    except OSError:
-        return legacy_key
-    return f"{legacy_key}|size={stat_result.st_size}|mtime_ns={stat_result.st_mtime_ns}"
+    return _build_file_state_key(folder, filename, file_path)
 
 
 def build_file_state_lookup_keys(folder: str, filename: str, file_path: str) -> tuple[str, ...]:

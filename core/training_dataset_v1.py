@@ -6,6 +6,7 @@ from typing import Final
 import pandas as pd
 
 from .parquet import resolve_parquet_engine as _resolve_parquet_engine
+from .training_base import TRAINING_BASE_COLUMNS
 
 
 TRAINING_DATASET_V1_SCHEMA: Final[tuple[tuple[str, str], ...]] = (
@@ -44,35 +45,7 @@ TRAINING_DATASET_V1_SCHEMA: Final[tuple[tuple[str, str], ...]] = (
 TRAINING_DATASET_V1_COLUMNS: Final[tuple[str, ...]] = tuple(
     column_name for column_name, _ in TRAINING_DATASET_V1_SCHEMA
 )
-REQUIRED_TRAINING_BASE_COLUMNS: Final[tuple[str, ...]] = (
-    "row_timestamp",
-    "main_pressure",
-    "billet_length",
-    "container_temp_front",
-    "container_temp_rear",
-    "production_counter",
-    "current_speed",
-    "extrusion_end_position",
-    "temperature",
-    "mold_1",
-    "mold_2",
-    "mold_3",
-    "mold_4",
-    "mold_5",
-    "mold_6",
-    "billet_temp",
-    "at_pre",
-    "at_temp",
-    "die_id",
-    "billet_cycle_id",
-    "spot_temperature",
-    "spot_temp_missing",
-    "cycle_present_flag",
-    "cycle_missing_flag",
-    "idle_by_pressure_zero",
-    "active_by_pressure_threshold",
-    "label_conflict",
-)
+REQUIRED_TRAINING_BASE_COLUMNS: Final[tuple[str, ...]] = TRAINING_BASE_COLUMNS
 NUMERIC_OUTPUT_COLUMNS: Final[tuple[str, ...]] = (
     "spot_temperature",
     "main_pressure",
