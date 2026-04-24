@@ -14,6 +14,11 @@ dist/
 data/
 logs/
 tools/
+/tmp/
+/tmp_*.txt
+/pr_*_tmp.md
+/tmp_importtime*.log
+/supabase/.temp/
 
 # Legacy paths (keep ignored for safety)
 backups/

@@ -121,6 +121,29 @@ does_container_mount_destination() {
     docker inspect "${container_name}" --format '{{range .Mounts}}{{println .Destination}}{{end}}' 2>/dev/null | grep -q "^${destination_path}$"
 }
 
+does_container_publish_port() {
+    local container_name
+    local host_port
+    local container_port
+    local published_ports
+    container_name="$1"
+    host_port="$2"
+    container_port="$3"
+    published_ports="$(docker inspect "${container_name}" --format "{{with index .HostConfig.PortBindings \"${container_port}/tcp\"}}{{range .}}{{println .HostPort}}{{end}}{{end}}" 2>/dev/null || true)"
+    printf '%s\n' "${published_ports}" | grep -qx "${host_port}"
+}
+
+ensure_grafana_container_contract() {
+    if ! does_container_publish_port "${GRAFANA_CONTAINER_NAME}" "${GRAFANA_HOST_PORT}" "${GRAFANA_CONTAINER_PORT}"; then
+        print_error "grafana_local 컨테이너 포트 설정이 올바르지 않습니다. expected=${GRAFANA_HOST_PORT}:${GRAFANA_CONTAINER_PORT}"
+        return 1
+    fi
+    if ! does_container_mount_destination "${GRAFANA_CONTAINER_NAME}" "/var/lib/grafana"; then
+        print_error "grafana_local 컨테이너 데이터 마운트가 없습니다. expected_destination=/var/lib/grafana"
+        return 1
+    fi
+}
+
 ensure_grafana_image() {
     local attempt
     attempt=1
@@ -499,10 +522,11 @@ start_grafana_container() {
     echo "[3] Grafana 컨테이너 시작 중..."
 
     ensure_grafana_container
-    sync_grafana_provisioning_into_container
+    ensure_grafana_container_contract
 
     if is_container_running "${GRAFANA_CONTAINER_NAME}"; then
         echo " -> Grafana 컨테이너가 이미 실행 중입니다."
+        sync_grafana_provisioning_into_container
         cleanup_legacy_grafana_dashboard_storage
         return 0
     fi
@@ -515,6 +539,7 @@ start_grafana_container() {
     fi
 
     echo " -> ${start_output}"
+    sync_grafana_provisioning_into_container
     cleanup_legacy_grafana_dashboard_storage
 }
 
