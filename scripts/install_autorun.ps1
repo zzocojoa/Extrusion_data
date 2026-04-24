@@ -1,6 +1,10 @@
-# Usage examples:
-#   powershell -ExecutionPolicy Bypass -File scripts\install_autorun.ps1 -Mode Daily -ExePath "C:\Path\ExtrusionUploaderCli.exe" -StartTime "01:00" -TaskName "Extrusion Uploader Daily" -Arguments "--range yesterday --lag 15 --check-lock --quick"
-#   powershell -ExecutionPolicy Bypass -File scripts\install_autorun.ps1 -Mode OnLogon -ExePath "C:\Path\ExtrusionUploaderCli.exe" -DelayMinutes 1 -TaskName "Extrusion Uploader OnLogon" -Arguments "--range today --lag 15 --check-lock --quick"
+# 사용 전제:
+#   예약 실행 시 업로드까지 자동 시작하려면 %APPDATA%\ExtrusionUploader\config.ini
+#   또는 .env / os.environ 에 AUTO_UPLOAD=true 가 설정되어 있어야 합니다.
+#   AUTO_UPLOAD=false 이면 예약 작업은 GUI만 실행하고 업로드는 시작하지 않습니다.
+# 사용 예시:
+#   powershell -ExecutionPolicy Bypass -File scripts\install_autorun.ps1 -Mode Daily -ExePath "C:\Path\ExtrusionUploader.exe" -StartTime "01:00" -TaskName "Extrusion Uploader Daily"
+#   powershell -ExecutionPolicy Bypass -File scripts\install_autorun.ps1 -Mode OnLogon -ExePath "C:\Path\ExtrusionUploader.exe" -DelayMinutes 1 -TaskName "Extrusion Uploader OnLogon"
 
 param(
   [Parameter(Mandatory=$true)][ValidateSet('Daily','OnLogon')] [string]$Mode,
@@ -31,4 +35,3 @@ switch ($Mode) {
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 Write-Host "Registered task '$TaskName' ($Mode) for $ExePath"
-

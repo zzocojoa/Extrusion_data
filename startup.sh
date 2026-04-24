@@ -24,8 +24,17 @@ if ! docker info > /dev/null 2>&1; then
 fi
 
 echo "[2] Supabase 실행 중..."
-# supabase start는 이미 실행 중이면 에러를 낼 수 있으므로 || true 처리하거나 상태 확인
-supabase start || echo "⚠️ Supabase 시작 중 경고 발생 (이미 실행 중일 수 있음)"
+if command -v supabase > /dev/null 2>&1; then
+    supabase start || echo "⚠️ Supabase 시작 중 경고 발생 (이미 실행 중일 수 있음)"
+else
+    echo "⚠️ supabase CLI를 찾지 못했습니다. 기존 로컬 컨테이너를 직접 시작합니다."
+    SUPABASE_CONTAINERS=$(docker ps -a --format '{{.Names}}' | grep -E '^(supabase_.*_Extrusion_data|grafana_local)$' || true)
+    if [ -z "$SUPABASE_CONTAINERS" ]; then
+        echo "❌ supabase CLI가 없고 시작 가능한 로컬 컨테이너도 찾지 못했습니다."
+        exit 1
+    fi
+    echo "$SUPABASE_CONTAINERS" | xargs -r docker start
+fi
 
 echo "[3] Grafana 컨테이너 시작 중..."
 # 컨테이너 존재 여부 확인

@@ -1,7 +1,7 @@
 # 저장소 정리 및 구조 개편 제안
 
 ## 현황 요약
-- 소스: `core/`와 루트의 GUI/CLI 스크립트(`uploader_gui_tk.py`, `uploader_cli.py`), `supabase/` 마이그레이션·엣지 함수, `tools/` 점검 스크립트.
+- 소스: `core/`와 루트의 GUI 스크립트(`uploader_gui_tk.py`), `supabase/` 마이그레이션·엣지 함수, `tools/` 점검 스크립트.
 - 배포 산출물: `build/`, `dist/`에 pyinstaller 결과 존재; `.gitignore`에 포함되지만 과거 커밋에 남아 있을 수 있음.
 - 데이터: `backups/`, `grafana_data/`, `tools/csv/`, `압출일보*.csv/xlsm` 등 대용량 원본. `.gitignore`에 있으나 일부는 Git에 추적된 상태로 보관될 가능성.
 - 로그/임시: `alignment_log.txt`, `error.log`, `__pycache__/` 등 실행 부산물.
@@ -13,7 +13,7 @@
 - 로그: `alignment_log.txt`, `error.log` 등 → `logs/`(gitignore)로 이동, 필요 시 로테이션 스크립트 추가.
 
 ## 권장 폴더 구조(정리 후)
-- `core/` + `uploader_gui_tk.py`/`uploader_cli.py`: 애플리케이션 코드.
+- `core/` + `uploader_gui_tk.py`: 애플리케이션 코드.
 - `supabase/`: `config.toml`, `migrations/`, `functions/` 등 Supabase 자산.
 - `scripts/`: 운영/자동화 스크립트(autorun, 백업 호출 래퍼 등).
 - `tools/`: 데이터 점검 유틸; 출력물은 `data/` 또는 `logs/`로 분리.

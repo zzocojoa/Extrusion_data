@@ -2,15 +2,15 @@
 
 ## 프로젝트 구조 및 모듈 배치
 - `core/`: 업로드/변환/상태/파일 처리 핵심 로직(`upload.py`, `transform.py` 등).
-- `uploader_gui_tk.py` / `uploader_cli.py`: GUI/CLI 진입점, 배포 빌드는 `dist/`에 생성.
+- `uploader_gui_tk.py`: GUI 진입점, 배포 빌드는 `dist/`에 생성.
 - `supabase/`: 로컬 Supabase 스택(`config.toml`, `migrations/`, `functions/upload-metrics/` 엣지 함수).
 - `tools/`: 데이터 점검·정렬 스크립트, 출력은 `data/` 또는 `logs/`로 분리.
 - `assets/`: 아이콘·GUI 리소스, `build/`는 pyinstaller 산출물, `data/backups/`는 DB 덤프.
 
 ## 빌드·테스트·개발 명령어
 - 가상환경: Windows `.\venv\Scripts\Activate.ps1`, WSL `source venv/bin/activate`.
-- 로컬 실행: GUI `python uploader_gui_tk.py`, CLI `python uploader_cli.py --quick`.
-- 빌드: GUI `scripts\build_gui.ps1` 또는 `bash scripts/build_gui.sh`, CLI `scripts\build_cli.ps1` 또는 `bash scripts/build_cli.sh` (산출물은 `dist/`).
+- 로컬 실행: `python uploader_gui_tk.py`.
+- 빌드: `scripts\build_gui.ps1` 또는 `bash scripts/build_gui.sh` (산출물은 `dist/`).
 - 백업/복원: `./supabase/auto/backup_daily.sh`, 복원 `./restore_latest.sh`.
 
 ## 코딩 스타일 및 네이밍

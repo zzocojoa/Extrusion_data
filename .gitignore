@@ -18,3 +18,10 @@ tools/
 # Legacy paths (keep ignored for safety)
 backups/
 grafana_data/
+
+/_MEI*/
+/tmp3vfomg_j/
+/_archive_smoke/
+/Factory_Integrated_Log_20260202_073801.csv
+/nas_supabase/
+/nas_supabase_deploy.zip
