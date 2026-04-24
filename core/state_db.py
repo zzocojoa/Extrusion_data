@@ -6,6 +6,8 @@ import sqlite3
 import time
 from typing import Any, Iterable, NotRequired, TypedDict
 
+from .state_normalization import build_file_state_key as _build_file_state_key
+from .state_normalization import build_legacy_file_key as _build_legacy_file_key
 from .state_normalization import expand_processed_key as _expand_processed_key
 from .state_normalization import normalize_legacy_key as _normalize_legacy_key
 from .state_normalization import normalize_non_empty_string as _normalize_non_empty_string
@@ -798,18 +800,11 @@ def load_pending_supabase_reupload_dates(db_path: str) -> PendingSupabaseReuploa
 
 
 def _build_runtime_legacy_key(folder: str, filename: str) -> str:
-    return f"{folder}/{filename}"
+    return _build_legacy_file_key(folder, filename)
 
 
 def _build_runtime_file_key(folder: str, filename: str, file_path: str) -> str:
-    legacy_key = _build_runtime_legacy_key(folder, filename)
-    if file_path.strip() == "":
-        return legacy_key
-    try:
-        stat_result = os.stat(file_path)
-    except OSError:
-        return legacy_key
-    return f"{legacy_key}|size={stat_result.st_size}|mtime_ns={stat_result.st_mtime_ns}"
+    return _build_file_state_key(folder, filename, file_path)
 
 
 def _build_alias_keys_for_file(file_key: str, legacy_key: str) -> tuple[str, ...]:

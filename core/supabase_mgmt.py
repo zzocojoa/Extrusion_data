@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import psycopg2
 from psycopg2.extensions import connection as PsycopgConnection
@@ -19,6 +19,21 @@ SupabaseDeleteMode = Literal["selected_dates", "all_dates"]
 
 SUPABASE_DELETE_MODE_SELECTED = "selected_dates"
 SUPABASE_DELETE_MODE_ALL = "all_dates"
+SUPABASE_METRIC_DATE_ROWS_QUERY: Final[str] = """
+        SELECT
+            ("timestamp" AT TIME ZONE 'Asia/Seoul')::date AS kst_date,
+            COUNT(*) AS row_count,
+            MIN("timestamp") AS min_timestamp,
+            MAX("timestamp") AS max_timestamp
+        FROM public.all_metrics
+        GROUP BY 1
+        ORDER BY 1 ASC
+    """
+SUPABASE_METRIC_DATE_ROWS_LOCKED_QUERY: Final[str] = f"""
+        LOCK TABLE public.all_metrics IN SHARE ROW EXCLUSIVE MODE;
+
+{SUPABASE_METRIC_DATE_ROWS_QUERY}
+    """
 
 __all__ = [
     "SupabaseDeleteMode",
@@ -77,7 +92,7 @@ def _format_date_tuple(date_values: tuple[date, ...]) -> str:
     return "(" + ", ".join(_format_date_text(date_value) for date_value in date_values) + ")"
 
 
-def _normalize_timestamp_text(value: object) -> str:
+def normalize_supabase_metric_timestamp_text(value: object) -> str:
     if value is None:
         return ""
     if isinstance(value, datetime):
@@ -140,8 +155,8 @@ def _build_supabase_metric_date_row(
             f"kst_date={kst_date_raw.isoformat()}, row_count={row_count}"
         )
 
-    min_timestamp = _normalize_timestamp_text(min_timestamp_raw)
-    max_timestamp = _normalize_timestamp_text(max_timestamp_raw)
+    min_timestamp = normalize_supabase_metric_timestamp_text(min_timestamp_raw)
+    max_timestamp = normalize_supabase_metric_timestamp_text(max_timestamp_raw)
     if row_count > 0 and (min_timestamp == "" or max_timestamp == ""):
         raise ValueError(
             "Supabase metric grouping query returned an empty timestamp range. "
@@ -156,19 +171,10 @@ def _build_supabase_metric_date_row(
     )
 
 
-def _query_supabase_metric_date_rows(
+def _query_supabase_metric_date_rows_by_query(
     connection: PsycopgConnection,
+    query: str,
 ) -> tuple[SupabaseMetricDateRow, ...]:
-    query = """
-        SELECT
-            ("timestamp" AT TIME ZONE 'Asia/Seoul')::date AS kst_date,
-            COUNT(*) AS row_count,
-            MIN("timestamp") AS min_timestamp,
-            MAX("timestamp") AS max_timestamp
-        FROM public.all_metrics
-        GROUP BY 1
-        ORDER BY 1 ASC
-    """
     with connection.cursor() as cursor:
         cursor.execute(query)
         query_rows: list[tuple[object, object, object, object]] = cursor.fetchall()
@@ -176,30 +182,24 @@ def _query_supabase_metric_date_rows(
     if len(query_rows) == 0:
         return ()
     return tuple(_build_supabase_metric_date_row(query_row) for query_row in query_rows)
+
+
+def _query_supabase_metric_date_rows(
+    connection: PsycopgConnection,
+) -> tuple[SupabaseMetricDateRow, ...]:
+    return _query_supabase_metric_date_rows_by_query(
+        connection,
+        SUPABASE_METRIC_DATE_ROWS_QUERY,
+    )
 
 
 def _query_supabase_metric_date_rows_with_delete_lock(
     connection: PsycopgConnection,
 ) -> tuple[SupabaseMetricDateRow, ...]:
-    query = """
-        LOCK TABLE public.all_metrics IN SHARE ROW EXCLUSIVE MODE;
-
-        SELECT
-            ("timestamp" AT TIME ZONE 'Asia/Seoul')::date AS kst_date,
-            COUNT(*) AS row_count,
-            MIN("timestamp") AS min_timestamp,
-            MAX("timestamp") AS max_timestamp
-        FROM public.all_metrics
-        GROUP BY 1
-        ORDER BY 1 ASC
-    """
-    with connection.cursor() as cursor:
-        cursor.execute(query)
-        query_rows: list[tuple[object, object, object, object]] = cursor.fetchall()
-
-    if len(query_rows) == 0:
-        return ()
-    return tuple(_build_supabase_metric_date_row(query_row) for query_row in query_rows)
+    return _query_supabase_metric_date_rows_by_query(
+        connection,
+        SUPABASE_METRIC_DATE_ROWS_LOCKED_QUERY,
+    )
 
 
 def _build_supabase_delete_summary(

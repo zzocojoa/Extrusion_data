@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 
@@ -98,3 +99,18 @@ def split_legacy_key(legacy_key: str) -> tuple[str, str]:
         return "", normalized
     folder, filename = normalized.rsplit("/", 1)
     return folder, filename
+
+
+def build_legacy_file_key(folder: str, filename: str) -> str:
+    return f"{folder}/{filename}"
+
+
+def build_file_state_key(folder: str, filename: str, file_path: str) -> str:
+    legacy_key = build_legacy_file_key(folder, filename)
+    if file_path.strip() == "":
+        return legacy_key
+    try:
+        stat_result = os.stat(file_path)
+    except OSError:
+        return legacy_key
+    return f"{legacy_key}|size={stat_result.st_size}|mtime_ns={stat_result.st_mtime_ns}"
