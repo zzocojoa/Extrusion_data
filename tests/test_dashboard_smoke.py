@@ -26,6 +26,7 @@ class DashboardSmokeTests(TestCase):
         data_dir_patcher = patch.object(uploader_gui_tk, "DATA_DIR", str(data_dir))
         state_db_path_patcher = patch.object(uploader_gui_tk, "STATE_DB_PATH", str(data_dir / "uploader_state.db"))
         tcp_patcher = patch.object(uploader_gui_tk, "can_connect_tcp", return_value=False)
+        grafana_patcher = patch.object(uploader_gui_tk, "does_local_grafana_container_exist", return_value=False)
         wsl_patcher = patch.object(uploader_gui_tk.App, "request_wsl_storage_refresh", new=lambda self: None)
         cards_patcher = patch.object(
             uploader_gui_tk.App,
@@ -37,6 +38,7 @@ class DashboardSmokeTests(TestCase):
             data_dir_patcher,
             state_db_path_patcher,
             tcp_patcher,
+            grafana_patcher,
             wsl_patcher,
             cards_patcher,
         ):
@@ -83,6 +85,7 @@ class DashboardSmokeTests(TestCase):
         self.assertTrue(app.recent_success_card.winfo_exists())
         self.assertTrue(app.btn_retry_failed.winfo_exists())
         self.assertTrue(app.btn_rerun_recent_success.winfo_exists())
+        self.assertTrue(app.btn_open_grafana.winfo_exists())
         self.assertTrue(app.lbl_state_store_status.winfo_exists())
         self.assertTrue(app.lbl_hero_status_detail.winfo_exists())
         self.assertTrue(app.dashboard_scroll_frame.winfo_exists())
@@ -112,6 +115,23 @@ class DashboardSmokeTests(TestCase):
         self.assertEqual(int(app.state_store_summary_card.grid_info()["row"]), 0)
         self.assertEqual(int(app.upload_precheck_frame.grid_info()["row"]), 1)
 
+    def test_startup_applies_bounded_grafana_view_migration(self) -> None:
+        startup_script = Path("startup.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("supabase migration up", startup_script)
+        self.assertIn("wait_for_supabase_db_ready", startup_script)
+        self.assertIn("apply_grafana_view_migration_with_psql", startup_script)
+        self.assertIn("psql -v ON_ERROR_STOP=1", startup_script)
+
+    def test_grafana_view_migration_is_repeatable(self) -> None:
+        migration_sql = Path(
+            "supabase/migrations/20260424000001_create_view_grafana_all_metrics_long.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("CREATE OR REPLACE VIEW public.view_grafana_all_metrics_long AS", migration_sql)
+        self.assertNotIn("DROP VIEW", migration_sql)
+        self.assertNotIn("CASCADE", migration_sql)
+
     def test_dashboard_task_status_nested_scroll_uses_nearest_canvas_only(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-scroll-appdata-"))
         self.addCleanup(shutil.rmtree, appdata_root, True)
@@ -129,6 +149,41 @@ class DashboardSmokeTests(TestCase):
         target_widget = app.lbl_upload_resume_state
         self.assertTrue(app.tasks_frame.check_if_master_is_canvas(target_widget))
         self.assertFalse(app.dashboard_scroll_frame.check_if_master_is_canvas(target_widget))
+
+    def test_dashboard_enables_grafana_button_when_container_is_missing(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-grafana-missing-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        runtime = uploader_gui_tk.LocalSupabaseRuntime(
+            project_root=Path("C:/tmp"),
+            startup_script_path=Path("C:/tmp/startup.sh"),
+            api_host="127.0.0.1",
+            api_port=54321,
+            db_host="127.0.0.1",
+            db_port=54322,
+            studio_host="127.0.0.1",
+            studio_port=54323,
+        )
+
+        app.show_dashboard()
+        pump(app)
+        app.cfg["SUPABASE_URL"] = "http://127.0.0.1:54321"
+        app.local_supabase_status_snapshot = uploader_gui_tk.LocalSupabaseStatusSnapshot(
+            supabase_url="http://127.0.0.1:54321",
+            runtime=runtime,
+            is_ready=False,
+            is_studio_ready=False,
+            is_grafana_ready=False,
+            has_grafana_container=False,
+        )
+        app.refresh_local_supabase_button()
+        pump(app)
+
+        self.assertEqual(app.btn_open_grafana.cget("state"), "normal")
+        self.assertEqual(
+            app.btn_open_grafana.cget("text"),
+            app.tr("dashboard.local_supabase.button.grafana.create"),
+        )
 
     def test_build_upload_operational_cards_state_uses_failed_retry_set_and_recent_profile(self) -> None:
         workspace = Path(tempfile.mkdtemp(prefix="dashboard-state-smoke-"))
@@ -387,7 +442,8 @@ class DashboardSmokeTests(TestCase):
         self.assertEqual(int(app.btn_retry_failed.grid_info()["row"]), 3)
         self.assertEqual(int(app.btn_start_supabase.grid_info()["row"]), 0)
         self.assertEqual(int(app.btn_open_studio.grid_info()["row"]), 1)
-        self.assertEqual(int(app.btn_stop_supabase.grid_info()["row"]), 2)
+        self.assertEqual(int(app.btn_open_grafana.grid_info()["row"]), 2)
+        self.assertEqual(int(app.btn_stop_supabase.grid_info()["row"]), 3)
 
     def test_dashboard_action_button_lists_match_render_priority(self) -> None:
         appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-button-contract-"))
@@ -400,7 +456,87 @@ class DashboardSmokeTests(TestCase):
         )
         self.assertEqual(
             app.supabase_action_buttons,
-            [app.btn_start_supabase, app.btn_open_studio, app.btn_stop_supabase],
+            [app.btn_start_supabase, app.btn_open_studio, app.btn_open_grafana, app.btn_stop_supabase],
+        )
+
+    def test_on_open_local_grafana_opens_browser_when_port_is_ready(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-open-grafana-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+
+        runtime = uploader_gui_tk.LocalSupabaseRuntime(
+            project_root=Path("C:/tmp"),
+            startup_script_path=Path("C:/tmp/startup.sh"),
+            api_host="127.0.0.1",
+            api_port=54321,
+            db_host="127.0.0.1",
+            db_port=54322,
+            studio_host="127.0.0.1",
+            studio_port=54323,
+        )
+
+        with patch.object(uploader_gui_tk, "resolve_local_supabase_runtime", return_value=runtime):
+            with patch.object(uploader_gui_tk, "is_local_grafana_ready", return_value=True):
+                with patch.object(uploader_gui_tk.os, "startfile", create=True) as startfile_mock:
+                    app.on_open_local_grafana()
+
+        startfile_mock.assert_called_once_with("http://localhost:3001/")
+
+    def test_on_open_local_grafana_starts_local_supabase_when_container_is_missing(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-open-grafana-missing-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+
+        runtime = uploader_gui_tk.LocalSupabaseRuntime(
+            project_root=Path("C:/tmp"),
+            startup_script_path=Path("C:/tmp/startup.sh"),
+            api_host="127.0.0.1",
+            api_port=54321,
+            db_host="127.0.0.1",
+            db_port=54322,
+            studio_host="127.0.0.1",
+            studio_port=54323,
+        )
+
+        with patch.object(uploader_gui_tk, "resolve_local_supabase_runtime", return_value=runtime):
+            with patch.object(uploader_gui_tk, "is_local_grafana_ready", return_value=False):
+                with patch.object(uploader_gui_tk, "is_local_supabase_stack_ready", return_value=False):
+                    with patch.object(app, "ask_yes_no", return_value=True) as ask_yes_no_mock:
+                        with patch.object(app, "start_local_supabase") as start_mock:
+                            app.on_open_local_grafana()
+
+        ask_yes_no_mock.assert_called_once()
+        start_mock.assert_called_once_with(runtime, False, True)
+
+    def test_on_open_local_grafana_marks_pending_when_startup_is_in_progress(self) -> None:
+        appdata_root = Path(tempfile.mkdtemp(prefix="dashboard-open-grafana-pending-"))
+        self.addCleanup(shutil.rmtree, appdata_root, True)
+        app = self.create_app(appdata_root)
+        app.cfg["SUPABASE_URL"] = "http://127.0.0.1:54321"
+        app.is_supabase_starting = True
+
+        runtime = uploader_gui_tk.LocalSupabaseRuntime(
+            project_root=Path("C:/tmp"),
+            startup_script_path=Path("C:/tmp/startup.sh"),
+            api_host="127.0.0.1",
+            api_port=54321,
+            db_host="127.0.0.1",
+            db_port=54322,
+            studio_host="127.0.0.1",
+            studio_port=54323,
+        )
+
+        with patch.object(uploader_gui_tk, "resolve_local_supabase_runtime", return_value=runtime):
+            with patch.object(uploader_gui_tk, "is_local_grafana_ready", return_value=False):
+                with patch.object(app, "show_info") as show_info_mock:
+                    with patch.object(app, "start_local_supabase") as start_mock:
+                        app.on_open_local_grafana()
+
+        self.assertTrue(app.pending_open_grafana)
+        start_mock.assert_not_called()
+        show_info_mock.assert_called_once_with(
+            "dashboard.local_supabase.dialog.starting.title",
+            "dashboard.local_supabase.dialog.grafana_pending.body",
         )
 
     def test_update_dashboard_loop_uses_hero_state_when_idle(self) -> None:

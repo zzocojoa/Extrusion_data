@@ -1,0 +1,1058 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "supabase DB(all_metrics)",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "현재속도"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 12,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH params AS (\n  SELECT CASE\n    WHEN $__to - $__from <= 345600000 THEN NULL\n    ELSE GREATEST(\n      $__interval_ms::bigint,\n      CEIL((($__to - $__from)::numeric) / 700000.0)::bigint\n    )\n  END AS bucket_ms\n)\nSELECT\n  CASE\n    WHEN params.bucket_ms IS NULL THEN src.timestamp\n    ELSE to_timestamp(floor(extract(epoch from src.timestamp) * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  END AS \"time\",\n  AVG(src.temperature) AS \"?????\",\n  AVG(src.main_pressure) AS \"????\",\n  AVG(src.billet_length) AS \"????\",\n  AVG(src.container_temp_front) AS \"??????-?\",\n  AVG(src.container_temp_rear) AS \"??????-?\",\n  MAX(src.production_counter) AS \"????\",\n  AVG(src.current_speed) AS \"????\",\n  AVG(src.extrusion_end_position) AS \"?? ? ??\",\n  AVG(src.billet_temp) AS \"??????\",\n  AVG(src.at_pre) AS \"????\",\n  AVG(src.at_temp) AS \"????\"\nFROM public.all_metrics AS src\nCROSS JOIN params\nWHERE $__timeFilter(src.timestamp)\nGROUP BY 1\nORDER BY 1",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "rawData",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "작업일지의 DW 번호 동기화",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "displayName": "${__field.name} - ${__field.labels.die_id}",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "current_speed"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH params AS (\n  SELECT CASE\n    WHEN $__to - $__from <= 518400000 THEN NULL\n    ELSE GREATEST(\n      $__interval_ms::bigint,\n      CEIL((($__to - $__from)::numeric) / 500000.0)::bigint\n    )\n  END AS bucket_ms\n)\nSELECT\n  CASE\n    WHEN params.bucket_ms IS NULL THEN src.\"timestamp\"\n    ELSE to_timestamp(floor(extract(epoch from src.\"timestamp\") * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  END AS \"time\",\n  src.die_id,\n  AVG(src.temperature) AS \"temperature\",\n  AVG(src.main_pressure) AS \"main_pressure\",\n  AVG(src.billet_length) AS \"billet_length\",\n  AVG(src.container_temp_front) AS \"container_temp_front\",\n  AVG(src.container_temp_rear) AS \"container_temp_rear\",\n  MAX(src.production_counter) AS \"production_counter\",\n  AVG(src.current_speed) AS \"current_speed\",\n  AVG(src.extrusion_end_position) AS \"extrusion_end_position\",\n  AVG(src.billet_temp) AS \"billet_temp\",\n  AVG(src.at_pre) AS \"at_pre\",\n  AVG(src.at_temp) AS \"at_temp\"\nFROM public.mv_optimized_metrics_work_log AS src\nCROSS JOIN params\nWHERE $__timeFilter(src.\"timestamp\")\nGROUP BY 1, 2\nORDER BY 1 ASC",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "dieID & Timeseries",
+      "transformations": [
+        {
+          "id": "prepareTimeSeries",
+          "options": {
+            "format": "multi"
+          }
+        }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "view_optimized_aligned_metrics",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "현재속도"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH params AS (\n  SELECT CASE\n    WHEN $__to - $__from <= 518400000 THEN NULL\n    ELSE GREATEST(\n      $__interval_ms::bigint,\n      CEIL((($__to - $__from)::numeric) / 700000.0)::bigint\n    )\n  END AS bucket_ms\n)\nSELECT\n  CASE\n    WHEN params.bucket_ms IS NULL THEN src.timestamp\n    ELSE to_timestamp(floor(extract(epoch from src.timestamp) * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  END AS \"time\",\n  AVG(src.temperature) AS \"?????\",\n  AVG(src.main_pressure) AS \"????\",\n  AVG(src.billet_length) AS \"????\",\n  AVG(src.container_temp_front) AS \"??????-?\",\n  AVG(src.container_temp_rear) AS \"??????-?\",\n  MAX(src.production_counter) AS \"????\",\n  AVG(src.current_speed) AS \"????\",\n  AVG(src.extrusion_end_position) AS \"?? ? ??\",\n  AVG(src.billet_temp) AS \"??????\",\n  AVG(src.at_pre) AS \"????\",\n  AVG(src.at_temp) AS \"????\"\nFROM public.view_optimized_aligned_metrics AS src\nCROSS JOIN params\nWHERE $__timeFilter(src.timestamp)\nGROUP BY 1\nORDER BY 1 ASC",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Temp. Shift_V1",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "일자별 die_id별로 사용한 die_number 개수",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 14,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.97,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "orientation": "auto",
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        },
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH base AS (\n    SELECT\n      date_trunc('day', start_time AT TIME ZONE 'Asia/Seoul') AT TIME ZONE 'Asia/Seoul' AS day,\n      die_id,\n      die_number,\n      start_time,\n      end_time,\n      id\n    FROM public.tb_work_log\n    WHERE start_time <= $__timeTo()\n      AND COALESCE(end_time, start_time) >= $__timeFrom()\n  ),\n  ordered AS (\n    SELECT\n      *,\n      ROW_NUMBER() OVER (PARTITION BY day, die_id ORDER BY start_time, end_time, id) AS seq\n    FROM base\n  )\n  SELECT\n    day AS \"일자\",\n    die_id AS \"die_id\",\n    COUNT(*) AS \"금형 기록수\",\n    COUNT(DISTINCT die_number) FILTER (WHERE die_number IS NOT NULL) AS \"금형 종류수\",\n    STRING_AGG(die_number::text, ',' ORDER BY seq)\n      FILTER (WHERE die_number IS NOT NULL) AS \"die_number_전체목록\",\n    STRING_AGG(\n      to_char(start_time AT TIME ZONE 'Asia/Seoul', 'HH24:MI') || '~' ||\n      to_char(end_time   AT TIME ZONE 'Asia/Seoul', 'HH24:MI'),\n      ', ' ORDER BY seq\n    ) AS \"시간_목록\"\n  FROM ordered\n  GROUP BY 1, 2\n  ORDER BY 1, MIN(start_time AT TIME ZONE 'Asia/Seoul'), die_id;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "DW에 따른 번호",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "기간 내 상위 금형/LOT",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineWidth": 1,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 12,
+      "options": {
+        "barRadius": 0,
+        "barWidth": 0.97,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "orientation": "auto",
+        "showValue": "auto",
+        "stacking": "none",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        },
+        "xTickLabelRotation": -45,
+        "xTickLabelSpacing": 0
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n    die_id AS \"DW번호\",\n    die_number AS \"금형번호\",\n    lot,\n    temper_type,\n    alloy_type,\n    COUNT(*) AS row_count,\n    COALESCE(SUM(production_qty), 0) AS \"적합수량합계\",\n    COALESCE(SUM(production_weight), 0) AS \"적합중량합계\",\n    AVG(yield_rate) AS \"수율평균\",\n    COALESCE(SUM(defect_bubble), 0)\n    + COALESCE(SUM(defect_tearing), 0)\n    + COALESCE(SUM(defect_white_black_line), 0)\n    + COALESCE(SUM(defect_oxide), 0)\n    + COALESCE(SUM(defect_scratch), 0)\n    + COALESCE(SUM(defect_bend), 0)\n    + COALESCE(SUM(defect_dimension), 0)\n    + COALESCE(SUM(defect_line), 0)\n    + COALESCE(SUM(defect_etc), 0) AS total_defects\n  FROM public.tb_work_log\n  WHERE $__timeFilter(start_time)\n  GROUP BY die_id, die_number, lot, temper_type, alloy_type\n  ORDER BY 적합중량합계 DESC\n  LIMIT 50;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "제품/금형별 분석",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "일자별 생산량/중량/생산성",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "생산성평균"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n    date_trunc('day', start_time) AS time,\n    COALESCE(SUM(production_qty), 0) AS \"적합수량합계\",\n    COALESCE(SUM(production_weight), 0) AS \"적합중량합계\",\n    AVG(productivity) AS \"생산성평균\"\n  FROM public.tb_work_log\n  WHERE $__timeFilter(start_time)\n  GROUP BY 1\n  ORDER BY 1;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "운영 요약",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "일자별 수율 + 불량 유형 합계",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "total_defects"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "id": 13,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n    date_trunc('day', start_time) AS time,\n    AVG(yield_rate) AS yield_rate_avg,\n    COALESCE(SUM(defect_bubble), 0) AS \"기포\",\n    COALESCE(SUM(defect_tearing), 0) AS \"뜯김\",\n    COALESCE(SUM(defect_white_black_line), 0) AS \"백선/흑선\",\n    COALESCE(SUM(defect_oxide), 0) AS \"산화물\",\n    COALESCE(SUM(defect_scratch), 0) AS \"스크래치\",\n    COALESCE(SUM(defect_bend), 0) AS \"휨\",\n    COALESCE(SUM(defect_dimension), 0) AS \"치수\",\n    COALESCE(SUM(defect_line), 0) AS \"라인\",\n    COALESCE(SUM(defect_etc), 0) AS \"기타\",\n    COALESCE(SUM(defect_bubble), 0)\n    + COALESCE(SUM(defect_tearing), 0)\n    + COALESCE(SUM(defect_white_black_line), 0)\n    + COALESCE(SUM(defect_oxide), 0)\n    + COALESCE(SUM(defect_scratch), 0)\n    + COALESCE(SUM(defect_bend), 0)\n    + COALESCE(SUM(defect_dimension), 0)\n    + COALESCE(SUM(defect_line), 0)\n    + COALESCE(SUM(defect_etc), 0) AS total_defects\n  FROM public.tb_work_log\n  WHERE $__timeFilter(start_time)\n  GROUP BY 1\n  ORDER BY 1;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "수율/품질",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "die_id 선택 가능",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "current_speed"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.2.1",
+      "targets": [
+        {
+          "dataset": "postgres",
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH params AS (\n  SELECT CASE\n    WHEN $__to - $__from <= 345600000 THEN NULL\n    ELSE GREATEST(\n      $__interval_ms::bigint,\n      CEIL((($__to - $__from)::numeric) / 700000.0)::bigint\n    )\n  END AS bucket_ms\n)\nSELECT\n  CASE\n    WHEN params.bucket_ms IS NULL THEN src.timestamp\n    ELSE to_timestamp(floor(extract(epoch from src.timestamp) * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  END AS \"time\",\n  AVG(src.temperature) AS \"temperature\",\n  AVG(src.main_pressure) AS \"main_pressure\",\n  AVG(src.billet_length) AS \"billet_length\",\n  AVG(src.container_temp_front) AS \"container_temp_front\",\n  AVG(src.container_temp_rear) AS \"container_temp_rear\",\n  MAX(src.production_counter) AS \"production_counter\",\n  AVG(src.current_speed) AS \"current_speed\",\n  AVG(src.extrusion_end_position) AS \"extrusion_end_position\",\n  AVG(src.billet_temp) AS \"billet_temp\",\n  AVG(src.at_pre) AS \"at_pre\",\n  AVG(src.at_temp) AS \"at_temp\"\nFROM public.all_metrics AS src\nCROSS JOIN params\nWHERE $__timeFilter(src.timestamp)\n  AND src.die_id IN (${die_id:sqlstring})\n  AND src.billet_cycle_id::text IN (${billet_cycle_id:sqlstring})\nGROUP BY 1\nORDER BY 1 ASC",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "rawData",
+      "type": "timeseries"
+    }
+  ],
+  "preload": false,
+  "schemaVersion": 42,
+  "tags": [],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ]
+        },
+        "definition": "SELECT DISTINCT die_id\nFROM public.all_metrics\nWHERE $__timeFilter(\"timestamp\")\nORDER BY die_id ASC;",
+        "includeAll": true,
+        "multi": true,
+        "name": "die_id",
+        "options": [],
+        "query": "SELECT DISTINCT die_id\nFROM public.all_metrics\nWHERE $__timeFilter(\"timestamp\")\nORDER BY die_id ASC;",
+        "refresh": 1,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "All",
+          "value": [
+            "$__all"
+          ]
+        },
+        "definition": "SELECT DISTINCT billet_cycle_id\nFROM public.all_metrics\nWHERE $__timeFilter(\"timestamp\")\n  AND die_id IN (${die_id:sqlstring})\n  AND billet_cycle_id IS NOT NULL  -- [중요] NULL 값 제외\nORDER BY billet_cycle_id ASC;",
+        "includeAll": true,
+        "multi": true,
+        "name": "billet_cycle_id",
+        "options": [],
+        "query": "SELECT DISTINCT billet_cycle_id\nFROM public.all_metrics\nWHERE $__timeFilter(\"timestamp\")\n  AND die_id IN (${die_id:sqlstring})\n  AND billet_cycle_id IS NOT NULL  -- [중요] NULL 값 제외\nORDER BY billet_cycle_id ASC;",
+        "refresh": 1,
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Extrusion_data",
+  "uid": "adzprvm",
+  "version": 327
+}
