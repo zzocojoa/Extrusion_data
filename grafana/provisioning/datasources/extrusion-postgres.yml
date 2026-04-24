@@ -1,0 +1,18 @@
+apiVersion: 1
+
+datasources:
+  - name: Extrusion Postgres
+    uid: extrusion-postgres
+    type: postgres
+    access: proxy
+    url: supabase_db_Extrusion_data:5432
+    user: supabase_admin
+    editable: false
+    isDefault: true
+    jsonData:
+      database: postgres
+      postgresVersion: 1700
+      sslmode: disable
+      timescaledb: false
+    secureJsonData:
+      password: postgres

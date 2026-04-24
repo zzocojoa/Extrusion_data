@@ -50,6 +50,12 @@ NAS를 사용할 경우:
 - GUI `Data Mgmt` 화면에서 아카이브 `dry-run` / export / 검증 후 삭제를 실행할 수 있습니다.
 - 배포본: `ExtrusionUploader.exe`
 - `ExtrusionUploader.exe`는 Dashboard의 `로컬 Supabase 시작` 버튼으로 WSL `startup.sh`를 실행할 수 있고, `Studio 열기` 버튼으로 `http://127.0.0.1:54323/`를 열 수 있습니다.
+- Dashboard의 `Grafana 열기` 버튼은 `http://localhost:3001/`를 사용합니다. `startup.sh`는 `grafana_local`이 없으면 공식 Docker 이미지 `grafana/grafana`로 컨테이너를 생성하고, 있으면 재시작한 뒤 같은 URL로 열 수 있게 맞춥니다.
+- Grafana 데이터는 `grafana.db`가 실제로 있는 경로를 우선 재사용하고, 두 경로에 모두 DB가 있으면 더 최근 파일이 있는 쪽을 사용합니다. 후보 경로는 `data/grafana_data/`와 저장소 루트 `grafana_data/`입니다.
+- Grafana 데이터소스와 대시보드 프로비저닝 파일은 `grafana/provisioning/`와 `grafana/dashboards/`를 source of truth로 사용합니다.
+- `grafana/dashboards/`에는 새 overview 대시보드와 기존 `Extrusion_data` legacy 대시보드가 함께 들어 있으며, `startup.sh`는 이 디렉터리의 파일 전체를 동기화합니다.
+- `startup.sh`는 source-controlled `Extrusion_data` 대시보드가 unified storage 에 반영된 것이 확인되면, 기존 SQLite `dashboard`/`dashboard_version`의 stale legacy row 를 백업 후 정리합니다.
+- 기본 대시보드는 `public.view_grafana_all_metrics_long`와 `public.mv_optimized_metrics_work_log`를 조회하도록 맞춰져 있습니다.
 - Dashboard에는 로컬 Supabase 상태 라벨과 시작/종료 중 진행 표시가 보이며, `로컬 Supabase 종료` 버튼으로 로컬 스택만 내릴 수 있습니다.
 - Dashboard에는 WSL 저장공간 카드가 함께 표시되며, 기본값은 guest 파일시스템 기준 `사용 중`/`여유 공간`/`사용률`입니다.
 - `WSL_VHDX_PATH`가 설정되면 카드의 큰 수치와 진행률은 host-side `ext4.vhdx` 크기, host 드라이브 여유 공간, 전체 host 용량 사용률 기준으로 전환되고, detail 영역에는 guest 사용량도 함께 남습니다.

@@ -1135,6 +1135,8 @@ class LocalSupabaseUiState:
     start_button_enabled: bool
     studio_button_text: str
     studio_button_enabled: bool
+    grafana_button_text: str
+    grafana_button_enabled: bool
     stop_button_text: str
     stop_button_enabled: bool
 
@@ -1151,6 +1153,8 @@ class LocalSupabaseStatusSnapshot:
     runtime: LocalSupabaseRuntime | None
     is_ready: bool
     is_studio_ready: bool
+    is_grafana_ready: bool
+    has_grafana_container: bool
 
 
 @dataclass(frozen=True)
@@ -1679,6 +1683,58 @@ def build_local_supabase_studio_url(runtime: LocalSupabaseRuntime) -> str:
     return f"http://{runtime.studio_host}:{runtime.studio_port}/"
 
 
+def is_local_grafana_ready() -> bool:
+    return can_connect_tcp("127.0.0.1", 3001)
+
+
+def build_local_grafana_url() -> str:
+    return "http://localhost:3001/"
+
+
+def does_local_grafana_container_exist(
+    runtime: LocalSupabaseRuntime,
+    translate_fn: Callable[[str, Mapping[str, object]], str],
+) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                "wsl.exe",
+                "bash",
+                "-lc",
+                "docker ps -a --format '{{.Names}}' | grep -q '^grafana_local$'",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            translate_fn("dashboard.local_supabase.runtime.wsl_missing", {})
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            translate_fn("dashboard.local_supabase.runtime.docker_check_timeout", {})
+        ) from error
+
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+
+    stderr_text = completed.stderr.strip()
+    stdout_text = completed.stdout.strip()
+    detail_text = stderr_text if stderr_text != "" else stdout_text
+    raise RuntimeError(
+        translate_fn(
+            "dashboard.local_supabase.runtime.docker_check_failed",
+            {"error": detail_text if detail_text != "" else "grafana_container_check_failed"},
+        )
+    )
+
+
 def build_wsl_start_command(
     runtime: LocalSupabaseRuntime,
     translate_fn: Callable[[str, Mapping[str, object]], str],
@@ -1781,9 +1837,12 @@ def build_local_supabase_ui_state(
     is_starting: bool,
     is_stopping: bool,
     pending_open_studio: bool,
+    pending_open_grafana: bool,
     runtime: LocalSupabaseRuntime | None,
     is_ready: bool,
     is_studio_ready: bool,
+    is_grafana_ready: bool,
+    has_grafana_container: bool,
     translate_fn: Callable[[str, Mapping[str, object]], str],
 ) -> LocalSupabaseUiState:
     if not is_local_supabase_target(supabase_url):
@@ -1795,6 +1854,8 @@ def build_local_supabase_ui_state(
             start_button_enabled=False,
             studio_button_text=translate_fn("dashboard.local_supabase.button.studio.disabled_remote", {}),
             studio_button_enabled=False,
+            grafana_button_text=translate_fn("dashboard.local_supabase.button.grafana.disabled_remote", {}),
+            grafana_button_enabled=False,
             stop_button_text=translate_fn("dashboard.local_supabase.button.stop.disabled_remote", {}),
             stop_button_enabled=False,
         )
@@ -1808,6 +1869,13 @@ def build_local_supabase_ui_state(
             start_button_enabled=False,
             studio_button_text=translate_fn("dashboard.local_supabase.button.studio", {}),
             studio_button_enabled=False,
+            grafana_button_text=translate_fn(
+                "dashboard.local_supabase.button.grafana"
+                if has_grafana_container
+                else "dashboard.local_supabase.button.grafana.missing",
+                {},
+            ),
+            grafana_button_enabled=False,
             stop_button_text=translate_fn("dashboard.local_supabase.button.stop.stopping", {}),
             stop_button_enabled=False,
         )
@@ -1822,6 +1890,16 @@ def build_local_supabase_ui_state(
                 start_button_enabled=False,
                 studio_button_text=translate_fn("dashboard.local_supabase.button.studio.pending", {}),
                 studio_button_enabled=False,
+                grafana_button_text=translate_fn(
+                    "dashboard.local_supabase.button.grafana.missing"
+                    if not has_grafana_container
+                    else
+                    "dashboard.local_supabase.button.grafana.pending"
+                    if pending_open_grafana
+                    else "dashboard.local_supabase.button.grafana",
+                    {},
+                ),
+                grafana_button_enabled=False,
                 stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
                 stop_button_enabled=False,
             )
@@ -1833,6 +1911,16 @@ def build_local_supabase_ui_state(
             start_button_enabled=False,
             studio_button_text=translate_fn("dashboard.local_supabase.button.studio", {}),
             studio_button_enabled=False,
+            grafana_button_text=translate_fn(
+                "dashboard.local_supabase.button.grafana.missing"
+                if not has_grafana_container
+                else
+                "dashboard.local_supabase.button.grafana.pending"
+                if pending_open_grafana
+                else "dashboard.local_supabase.button.grafana",
+                {},
+            ),
+            grafana_button_enabled=False,
             stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
             stop_button_enabled=False,
         )
@@ -1846,6 +1934,15 @@ def build_local_supabase_ui_state(
             start_button_enabled=False,
             studio_button_text=translate_fn("dashboard.local_supabase.button.studio", {}),
             studio_button_enabled=True,
+            grafana_button_text=translate_fn(
+                "dashboard.local_supabase.button.grafana"
+                if is_grafana_ready
+                else "dashboard.local_supabase.button.grafana.start"
+                if has_grafana_container
+                else "dashboard.local_supabase.button.grafana.create",
+                {},
+            ),
+            grafana_button_enabled=True,
             stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
             stop_button_enabled=True,
         )
@@ -1859,6 +1956,15 @@ def build_local_supabase_ui_state(
             start_button_enabled=False,
             studio_button_text=translate_fn("dashboard.local_supabase.button.studio", {}),
             studio_button_enabled=True,
+            grafana_button_text=translate_fn(
+                "dashboard.local_supabase.button.grafana"
+                if is_grafana_ready
+                else "dashboard.local_supabase.button.grafana.start"
+                if has_grafana_container
+                else "dashboard.local_supabase.button.grafana.create",
+                {},
+            ),
+            grafana_button_enabled=True,
             stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
             stop_button_enabled=True,
         )
@@ -1871,6 +1977,15 @@ def build_local_supabase_ui_state(
         start_button_enabled=True,
         studio_button_text=translate_fn("dashboard.local_supabase.button.studio", {}),
         studio_button_enabled=True,
+        grafana_button_text=translate_fn(
+            "dashboard.local_supabase.button.grafana"
+            if is_grafana_ready
+            else "dashboard.local_supabase.button.grafana.start"
+            if has_grafana_container
+            else "dashboard.local_supabase.button.grafana.create",
+            {},
+        ),
+        grafana_button_enabled=True,
         stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
         stop_button_enabled=False,
     )
@@ -1878,11 +1993,18 @@ def build_local_supabase_ui_state(
 
 def build_local_supabase_checking_ui_state(
     pending_open_studio: bool,
+    pending_open_grafana: bool,
+    has_grafana_container: bool,
     translate_fn: Callable[[str, Mapping[str, object]], str],
 ) -> LocalSupabaseUiState:
     studio_button_key = "dashboard.local_supabase.button.studio"
     if pending_open_studio:
         studio_button_key = "dashboard.local_supabase.button.studio.pending"
+    grafana_button_key = "dashboard.local_supabase.button.grafana"
+    if not has_grafana_container:
+        grafana_button_key = "dashboard.local_supabase.button.grafana.create"
+    elif pending_open_grafana:
+        grafana_button_key = "dashboard.local_supabase.button.grafana.pending"
     return LocalSupabaseUiState(
         status_text=translate_fn("dashboard.local_supabase.status.checking", {}),
         status_color="#3B8ED0",
@@ -1891,6 +2013,8 @@ def build_local_supabase_checking_ui_state(
         start_button_enabled=False,
         studio_button_text=translate_fn(studio_button_key, {}),
         studio_button_enabled=False,
+        grafana_button_text=translate_fn(grafana_button_key, {}),
+        grafana_button_enabled=False,
         stop_button_text=translate_fn("dashboard.local_supabase.button.stop", {}),
         stop_button_enabled=False,
     )
@@ -2518,6 +2642,7 @@ class App(ctk.CTk):
         self.is_supabase_starting = False
         self.is_supabase_stopping = False
         self.pending_open_studio = False
+        self.pending_open_grafana = False
         self.pending_close_after_supabase_stop = False
         self.local_supabase_status_override: LocalSupabaseStatusOverride | None = None
         self.local_supabase_status_snapshot: LocalSupabaseStatusSnapshot | None = None
@@ -3990,6 +4115,14 @@ class App(ctk.CTk):
             fg_color="#3B8ED0",
             hover_color="#2D6FA6",
         )
+        self.btn_open_grafana = ctk.CTkButton(
+            self.supabase_action_row,
+            text=self.tr("dashboard.local_supabase.button.grafana"),
+            command=self.on_open_local_grafana,
+            width=150,
+            fg_color="#3B8ED0",
+            hover_color="#2D6FA6",
+        )
         self.btn_stop_supabase = ctk.CTkButton(
             self.supabase_action_row,
             text=self.tr("dashboard.local_supabase.button.stop"),
@@ -4001,6 +4134,7 @@ class App(ctk.CTk):
         self.supabase_action_buttons: list[ctk.CTkButton] = [
             self.btn_start_supabase,
             self.btn_open_studio,
+            self.btn_open_grafana,
             self.btn_stop_supabase,
         ]
         self.upload_action_buttons: list[ctk.CTkButton] = [
@@ -8098,6 +8232,10 @@ class App(ctk.CTk):
             return self.tr("dashboard.local_supabase.failure.startup_script")
         if self.tr("dashboard.local_supabase.runtime.studio_port_not_open") in detail:
             return self.tr("dashboard.local_supabase.failure.studio_port_not_open")
+        if self.tr("dashboard.local_supabase.runtime.grafana_port_not_open") in detail:
+            return self.tr("dashboard.local_supabase.failure.grafana_open")
+        if "grafana_local" in detail or "Grafana" in detail:
+            return self.tr("dashboard.local_supabase.failure.grafana_open")
         if self.tr("dashboard.local_supabase.runtime.api_port_not_open") in detail:
             return self.tr("dashboard.local_supabase.failure.api_port_not_open")
         if self.tr("dashboard.local_supabase.runtime.startup_script_failed", exit_code=0).split("0")[0] in detail:
@@ -8153,10 +8291,36 @@ class App(ctk.CTk):
             ),
         )
 
+    def show_grafana_open_error(
+        self,
+        detail: str,
+        title_key: str,
+    ) -> None:
+        grafana_url = build_local_grafana_url()
+        title_text = self.tr(title_key)
+        self.log_to_local_supabase_outputs(
+            self.tr(
+                "dashboard.local_supabase.log.grafana_open_failed",
+                title=title_text,
+                detail=detail,
+            )
+        )
+        self.set_local_supabase_status_override(self.tr("dashboard.local_supabase.failure.grafana_open"), "#E06C75")
+        messagebox.showerror(
+            title_text,
+            self.tr(
+                "dashboard.local_supabase.dialog.grafana_open_failed.body",
+                detail=detail,
+                grafana_url=grafana_url,
+            ),
+        )
+
     def refresh_local_supabase_button(self):
         if not hasattr(self, 'btn_start_supabase') or not self.btn_start_supabase.winfo_exists():
             return
         if not hasattr(self, 'btn_open_studio') or not self.btn_open_studio.winfo_exists():
+            return
+        if not hasattr(self, 'btn_open_grafana') or not self.btn_open_grafana.winfo_exists():
             return
         if not hasattr(self, 'btn_stop_supabase') or not self.btn_stop_supabase.winfo_exists():
             return
@@ -8179,7 +8343,10 @@ class App(ctk.CTk):
                 self.is_supabase_starting,
                 self.is_supabase_stopping,
                 self.pending_open_studio,
+                self.pending_open_grafana,
                 None,
+                False,
+                False,
                 False,
                 False,
                 self.tr_map,
@@ -8197,9 +8364,12 @@ class App(ctk.CTk):
                 self.is_supabase_starting,
                 self.is_supabase_stopping,
                 self.pending_open_studio,
+                self.pending_open_grafana,
                 runtime,
                 is_ready,
                 is_studio_ready,
+                snapshot.is_grafana_ready,
+                snapshot.has_grafana_container,
                 self.tr_map,
             )
             if is_ready:
@@ -8213,6 +8383,8 @@ class App(ctk.CTk):
                     start_button_enabled=ui_state.start_button_enabled,
                     studio_button_text=ui_state.studio_button_text,
                     studio_button_enabled=ui_state.studio_button_enabled,
+                    grafana_button_text=ui_state.grafana_button_text,
+                    grafana_button_enabled=ui_state.grafana_button_enabled,
                     stop_button_text=ui_state.stop_button_text,
                     stop_button_enabled=ui_state.stop_button_enabled,
                 )
@@ -8220,6 +8392,8 @@ class App(ctk.CTk):
 
         return build_local_supabase_checking_ui_state(
             self.pending_open_studio,
+            self.pending_open_grafana,
+            False,
             self.tr_map,
         )
 
@@ -8234,6 +8408,10 @@ class App(ctk.CTk):
         self.btn_open_studio.configure(
             state="normal" if ui_state.studio_button_enabled else "disabled",
             text=ui_state.studio_button_text,
+        )
+        self.btn_open_grafana.configure(
+            state="normal" if ui_state.grafana_button_enabled else "disabled",
+            text=ui_state.grafana_button_text,
         )
         self.btn_stop_supabase.configure(
             state="normal" if ui_state.stop_button_enabled else "disabled",
@@ -8263,6 +8441,8 @@ class App(ctk.CTk):
                     runtime=runtime,
                     is_ready=is_local_supabase_stack_ready(runtime),
                     is_studio_ready=is_local_supabase_studio_ready(runtime),
+                    is_grafana_ready=is_local_grafana_ready(),
+                    has_grafana_container=does_local_grafana_container_exist(runtime, self.tr_map),
                 )
             except Exception:
                 snapshot = LocalSupabaseStatusSnapshot(
@@ -8270,6 +8450,8 @@ class App(ctk.CTk):
                     runtime=None,
                     is_ready=False,
                     is_studio_ready=False,
+                    is_grafana_ready=False,
+                    has_grafana_container=False,
                 )
 
             def _apply() -> None:
@@ -8641,7 +8823,7 @@ class App(ctk.CTk):
         if not should_start:
             return False
 
-        self.start_local_supabase(runtime, False)
+        self.start_local_supabase(runtime, False, False)
         return False
 
     def on_start_local_supabase(self):
@@ -8674,7 +8856,7 @@ class App(ctk.CTk):
         if not self.ensure_local_docker_ready(runtime):
             return
 
-        self.start_local_supabase(runtime, False)
+        self.start_local_supabase(runtime, False, False)
 
     def on_stop_local_supabase(self):
         self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
@@ -8739,6 +8921,21 @@ class App(ctk.CTk):
         except Exception as error:
             raise RuntimeError(
                 self.tr("dashboard.local_supabase.runtime.studio_open_failed", error=error)
+            ) from error
+
+    def open_local_grafana(self) -> None:
+        grafana_url = build_local_grafana_url()
+        try:
+            self.log_to_local_supabase_outputs(
+                self.tr("dashboard.local_supabase.log.grafana_open_attempt", grafana_url=grafana_url)
+            )
+            if os.name == 'nt':
+                os.startfile(grafana_url)
+            else:
+                webbrowser.open(grafana_url)
+        except Exception as error:
+            raise RuntimeError(
+                self.tr("dashboard.local_supabase.runtime.grafana_open_failed", error=error)
             ) from error
 
     def on_open_local_supabase_studio(self):
@@ -8816,9 +9013,69 @@ class App(ctk.CTk):
         if not should_start:
             return
 
-        self.start_local_supabase(runtime, True)
+        self.start_local_supabase(runtime, True, False)
 
-    def start_local_supabase(self, runtime: LocalSupabaseRuntime, open_studio_after_start: bool):
+    def on_open_local_grafana(self):
+        self.cfg, self.config_source, self.config_metadata = load_config_with_sources(None)
+        self.refresh_runtime_context_labels(self.cfg.get('SUPABASE_URL', ''), self.cfg.get('EDGE_FUNCTION_URL', ''))
+        supabase_url = self.cfg.get('SUPABASE_URL', '')
+        if not is_local_supabase_target(supabase_url):
+            self.show_info(
+                "dashboard.local_supabase.dialog.remote_target.title",
+                "dashboard.local_supabase.dialog.remote_target.body",
+            )
+            self.refresh_local_supabase_button()
+            return
+
+        try:
+            runtime = resolve_local_supabase_runtime(supabase_url, self.tr_map)
+        except Exception as error:
+            messagebox.showerror(self.tr("dashboard.local_supabase.dialog.grafana_error.title"), str(error))
+            self.refresh_local_supabase_button()
+            return
+
+        if is_local_grafana_ready():
+            try:
+                self.open_local_grafana()
+            except Exception as error:
+                self.show_grafana_open_error(str(error), "dashboard.local_supabase.dialog.grafana_open_failed.title")
+            return
+
+        if self.is_supabase_stopping:
+            self.show_info(
+                "dashboard.local_supabase.dialog.stopping.title",
+                "dashboard.local_supabase.dialog.wait_for_stop.body",
+            )
+            return
+
+        if self.is_supabase_starting:
+            self.pending_open_grafana = True
+            self.refresh_local_supabase_button()
+            self.show_info(
+                "dashboard.local_supabase.dialog.starting.title",
+                "dashboard.local_supabase.dialog.grafana_pending.body",
+            )
+            return
+
+        if is_local_supabase_stack_ready(runtime):
+            self.start_local_supabase(runtime, False, True)
+            return
+
+        should_start = self.ask_yes_no(
+            "dashboard.local_supabase.dialog.grafana_start.title",
+            "dashboard.local_supabase.dialog.grafana_start.body",
+        )
+        if not should_start:
+            return
+
+        self.start_local_supabase(runtime, False, True)
+
+    def start_local_supabase(
+        self,
+        runtime: LocalSupabaseRuntime,
+        open_studio_after_start: bool,
+        open_grafana_after_start: bool,
+    ):
         if self.is_supabase_starting or self.is_supabase_stopping:
             return
 
@@ -8828,6 +9085,7 @@ class App(ctk.CTk):
         self.clear_local_supabase_status_override()
         self.is_supabase_starting = True
         self.pending_open_studio = open_studio_after_start
+        self.pending_open_grafana = open_grafana_after_start
         self.pending_close_after_supabase_stop = False
         self.refresh_local_supabase_button()
         self.log_to_local_supabase_outputs(self.tr("dashboard.local_supabase.log.start_requested"))
@@ -8838,8 +9096,13 @@ class App(ctk.CTk):
             self.log_to_local_supabase_outputs(
                 self.tr("dashboard.local_supabase.log.studio_auto_open_requested")
             )
+        if open_grafana_after_start:
+            self.log_to_local_supabase_outputs(
+                self.tr("dashboard.local_supabase.log.grafana_auto_open_requested")
+            )
 
         def _run():
+            startup_error_detail = ""
             try:
                 command = build_wsl_start_command(runtime, self.tr_map)
                 process = subprocess.Popen(
@@ -8856,9 +9119,13 @@ class App(ctk.CTk):
                         line = raw_line.rstrip()
                         if line != "":
                             self.log_to_local_supabase_outputs(f"[startup] {line}")
+                            if line.startswith("ERROR:"):
+                                startup_error_detail = line.removeprefix("ERROR:").strip()
 
                 return_code = process.wait()
                 if return_code != 0:
+                    if startup_error_detail != "":
+                        raise RuntimeError(startup_error_detail)
                     raise RuntimeError(
                         self.tr(
                             "dashboard.local_supabase.runtime.startup_script_failed",
@@ -8875,6 +9142,15 @@ class App(ctk.CTk):
                     raise RuntimeError(
                         self.tr("dashboard.local_supabase.runtime.studio_port_not_open")
                     )
+                if self.pending_open_grafana:
+                    if not does_local_grafana_container_exist(runtime, self.tr_map):
+                        raise RuntimeError(
+                            self.tr("dashboard.local_supabase.runtime.grafana_container_missing")
+                        )
+                    if not wait_for_tcp_ready("127.0.0.1", 3001, 30, 1.0):
+                        raise RuntimeError(
+                            self.tr("dashboard.local_supabase.runtime.grafana_port_not_open")
+                        )
 
                 self.schedule_gui_callback(
                     0,
@@ -8896,6 +9172,17 @@ class App(ctk.CTk):
                                 "dashboard.local_supabase.dialog.studio_auto_open_failed.title",
                             ),
                         )
+                if self.pending_open_grafana:
+                    try:
+                        self.open_local_grafana()
+                    except Exception as error:
+                        self.schedule_gui_callback(
+                            0,
+                            lambda: self.show_grafana_open_error(
+                                str(error),
+                                "dashboard.local_supabase.dialog.grafana_auto_open_failed.title",
+                            ),
+                        )
             except Exception as error:
                 self.log_to_local_supabase_outputs(
                     self.tr("dashboard.local_supabase.log.start_failed", error=error)
@@ -8908,6 +9195,7 @@ class App(ctk.CTk):
             finally:
                 self.is_supabase_starting = False
                 self.pending_open_studio = False
+                self.pending_open_grafana = False
                 self.local_supabase_status_snapshot = None
                 self.schedule_gui_callback(0, self.refresh_local_supabase_button)
                 self.schedule_gui_callback(0, self.request_wsl_storage_refresh)

@@ -1,0 +1,783 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "현재 시간 범위와 선택된 die_id 에서 search window 상한 299에 걸린 cycle 수입니다.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "with cycle_stats as (\n  select\n    die_id,\n    calc_cycle_id,\n    max(coalesce(_applied_offset, 0)) as offset_rows\n  from public.mv_optimized_metrics_work_log src\n  where $__timeFilter(\"timestamp\")\n    and src.die_id in (${die_id:sqlstring})\n  group by die_id, calc_cycle_id\n)\nselect count(*)::bigint as offset_299_cycle_count\nfrom cycle_stats\nwhere offset_rows = 299;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "offset 299 경고",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "with params as (\n  select greatest(\n    1::bigint,\n    $__interval_ms::bigint,\n    ceil((($__to - $__from)::numeric) / 800000.0)::bigint\n  ) as bucket_ms\n)\nselect\n  case\n    when params.bucket_ms <= 1 then src.\"timestamp\"\n    else to_timestamp(floor(extract(epoch from src.\"timestamp\") * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  end as \"time\",\n  avg(src.metric_value) as value,\n  src.metric_name as metric\nfrom public.view_grafana_all_metrics_long as src\ncross join params\nwhere $__timeFilter(src.\"timestamp\")\n  and src.device_id = ${device_id:sqlstring}\n  and src.metric_name = ${metric_name:sqlstring}\ngroup by 1, 3\norder by 1;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "선택 메트릭 추이",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "with params as (\n  select greatest(\n    1::bigint,\n    $__interval_ms::bigint,\n    ceil((($__to - $__from)::numeric) / 400000.0)::bigint\n  ) as bucket_ms\n)\nselect\n  case\n    when params.bucket_ms <= 1 then src.\"timestamp\"\n    else to_timestamp(floor(extract(epoch from src.\"timestamp\") * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  end as \"time\",\n  avg(src.metric_value) as value,\n  src.metric_name as metric\nfrom public.view_grafana_all_metrics_long as src\ncross join params\nwhere $__timeFilter(src.\"timestamp\")\n  and src.device_id = ${device_id:sqlstring}\n  and src.metric_name in ('main_pressure', 'current_speed')\ngroup by 1, 3\norder by 1;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "압력 및 속도",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "with params as (\n  select greatest(\n    1::bigint,\n    $__interval_ms::bigint,\n    ceil((($__to - $__from)::numeric) / 130000.0)::bigint\n  ) as bucket_ms\n)\nselect\n  case\n    when params.bucket_ms <= 1 then src.\"timestamp\"\n    else to_timestamp(floor(extract(epoch from src.\"timestamp\") * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  end as \"time\",\n  avg(src.metric_value) as value,\n  src.metric_name as metric\nfrom public.view_grafana_all_metrics_long as src\ncross join params\nwhere $__timeFilter(src.\"timestamp\")\n  and src.device_id = ${device_id:sqlstring}\n  and src.metric_name in ('mold_1', 'mold_2', 'mold_3', 'mold_4', 'mold_5', 'mold_6')\ngroup by 1, 3\norder by 1;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "금형 온도",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 2,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "with params as (\n  select greatest(\n    1::bigint,\n    $__interval_ms::bigint,\n    ceil((($__to - $__from)::numeric) / 800000.0)::bigint\n  ) as bucket_ms\n)\nselect\n  case\n    when params.bucket_ms <= 1 then src.\"timestamp\"\n    else to_timestamp(floor(extract(epoch from src.\"timestamp\") * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  end as \"time\",\n  avg(src.temperature) as value,\n  'aligned_temperature' as metric\nfrom public.mv_optimized_metrics_work_log as src\ncross join params\nwhere $__timeFilter(src.\"timestamp\")\n  and src.die_id in (${die_id:sqlstring})\ngroup by 1\norder by 1;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        },
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "with params as (\n  select greatest(\n    1::bigint,\n    $__interval_ms::bigint,\n    ceil((($__to - $__from)::numeric) / 800000.0)::bigint\n  ) as bucket_ms\n)\nselect\n  case\n    when params.bucket_ms <= 1 then src.\"timestamp\"\n    else to_timestamp(floor(extract(epoch from src.\"timestamp\") * 1000.0 / params.bucket_ms) * params.bucket_ms / 1000.0)\n  end as \"time\",\n  avg(src.original_temperature) as value,\n  'original_temperature' as metric\nfrom public.mv_optimized_metrics_work_log as src\ncross join params\nwhere $__timeFilter(src.\"timestamp\")\n  and src.die_id in (${die_id:sqlstring})\ngroup by 1\norder by 1;",
+          "refId": "B",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "정렬 온도 비교",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "offset 상한 도달 또는 평균 절대차가 큰 cycle 목록입니다.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 31
+      },
+      "id": 5,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "cycle_abs_diff_avg"
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "with filtered as (\n  select *\n  from public.mv_optimized_metrics_work_log src\n  where $__timeFilter(\"timestamp\")\n    and src.die_id in (${die_id:sqlstring})\n), cycle_stats as (\n  select\n    die_id,\n    calc_cycle_id,\n    count(*) as cycle_rows,\n    max(coalesce(_applied_offset, 0)) as offset_rows,\n    avg(abs(temperature - original_temperature)) as cycle_abs_diff_avg,\n    percentile_cont(0.9) within group (\n      order by abs(temperature - original_temperature)\n    ) as cycle_abs_diff_p90,\n    min(\"timestamp\") as cycle_start,\n    max(\"timestamp\") as cycle_end\n  from filtered src\n  group by die_id, calc_cycle_id\n)\nselect\n  cycle_start,\n  cycle_end,\n  die_id,\n  calc_cycle_id,\n  cycle_rows,\n  offset_rows,\n  round(cycle_abs_diff_avg::numeric, 4) as cycle_abs_diff_avg,\n  round(cycle_abs_diff_p90::numeric, 4) as cycle_abs_diff_p90,\n  case\n    when offset_rows = 299 and cycle_abs_diff_avg >= 10 then 'offset_299_and_diff_10'\n    when offset_rows = 299 then 'offset_299'\n    when cycle_abs_diff_avg >= 10 then 'diff_10'\n    else 'normal'\n  end as suspect_reason\nfrom cycle_stats\nwhere offset_rows = 299\n   or cycle_abs_diff_avg >= 10\norder by cycle_abs_diff_avg desc nulls last, offset_rows desc, cycle_rows desc;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "정렬 의심 cycle",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "extrusion-postgres"
+      },
+      "description": "die별 의심 cycle 비율과 평균 offset 요약입니다.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "id": 6,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "suspect_cycle_pct"
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "extrusion-postgres"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "with filtered as (\n  select *\n  from public.mv_optimized_metrics_work_log src\n  where $__timeFilter(\"timestamp\")\n    and src.die_id in (${die_id:sqlstring})\n), cycle_stats as (\n  select\n    die_id,\n    calc_cycle_id,\n    count(*) as cycle_rows,\n    max(coalesce(_applied_offset, 0)) as offset_rows,\n    avg(abs(temperature - original_temperature)) as cycle_abs_diff_avg\n  from filtered\n  group by die_id, calc_cycle_id\n), per_die as (\n  select\n    die_id,\n    count(*) as cycle_count,\n    count(*) filter (\n      where offset_rows = 299 or cycle_abs_diff_avg >= 10\n    ) as suspect_cycle_count,\n    round(\n      100.0 * count(*) filter (\n        where offset_rows = 299 or cycle_abs_diff_avg >= 10\n      ) / count(*),\n      2\n    ) as suspect_cycle_pct,\n    round(avg(offset_rows)::numeric, 2) as avg_offset_rows,\n    round(avg(cycle_abs_diff_avg)::numeric, 4) as avg_cycle_abs_diff,\n    round(avg(cycle_rows)::numeric, 2) as avg_cycle_rows\n  from cycle_stats\n  group by die_id\n)\nselect *\nfrom per_die\nwhere suspect_cycle_count > 0\norder by suspect_cycle_pct desc, suspect_cycle_count desc, avg_cycle_abs_diff desc;",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "die별 정렬 의심 요약",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": [
+    "extrusion",
+    "all_metrics"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "extruder_integrated",
+          "value": "extruder_integrated"
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "extrusion-postgres"
+        },
+        "definition": "select distinct device_id from public.view_grafana_all_metrics_long order by 1;",
+        "hide": 0,
+        "includeAll": false,
+        "label": "device_id",
+        "multi": false,
+        "name": "device_id",
+        "options": [],
+        "query": "select distinct device_id from public.view_grafana_all_metrics_long order by 1;",
+        "refresh": 1,
+        "skipUrlSync": false,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "temperature",
+          "value": "temperature"
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "extrusion-postgres"
+        },
+        "definition": "select distinct metric_name from public.view_grafana_all_metrics_long where device_id = ${device_id:sqlstring} order by 1;",
+        "hide": 0,
+        "includeAll": false,
+        "label": "metric_name",
+        "multi": false,
+        "name": "metric_name",
+        "options": [],
+        "query": "select distinct metric_name from public.view_grafana_all_metrics_long where device_id = ${device_id:sqlstring} order by 1;",
+        "refresh": 2,
+        "skipUrlSync": false,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "extrusion-postgres"
+        },
+        "definition": "select distinct die_id from public.mv_optimized_metrics_work_log where die_id is not null order by 1;",
+        "hide": 0,
+        "includeAll": true,
+        "label": "die_id",
+        "multi": false,
+        "name": "die_id",
+        "options": [],
+        "query": "select distinct die_id from public.mv_optimized_metrics_work_log where die_id is not null order by 1;",
+        "refresh": 1,
+        "skipUrlSync": false,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Extrusion All Metrics Overview",
+  "uid": "extrusion-all-metrics",
+  "version": 2,
+  "weekStart": ""
+}
