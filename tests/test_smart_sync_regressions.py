@@ -2,7 +2,7 @@ import shutil
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -371,6 +371,18 @@ class BuilderDeviceIdRegressionTests(TestCase):
 
         with self.assertRaisesRegex(ValueError, "PLC CSV 변환 실패"):
             core_transform.build_records_plc(str(file_path), file_path.name, None)
+
+    def test_build_records_plc_wraps_chunk_iteration_errors(self) -> None:
+        class BrokenReader:
+            def __iter__(self) -> Iterator[pd.DataFrame]:
+                raise RuntimeError("reader exploded")
+
+        chunks = None
+        with patch.object(core_transform.pd, "read_csv", return_value=BrokenReader()):
+            chunks = core_transform.build_records_plc("C:/broken.csv", "broken.csv", 10)
+
+        with self.assertRaisesRegex(ValueError, "PLC CSV 변환 실패"):
+            list(chunks)
 
     def test_build_records_temp_sets_temperature_device_id(self) -> None:
         workspace = self.create_workspace()

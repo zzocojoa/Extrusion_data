@@ -162,11 +162,14 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
         # 2. Handle Chunking vs Full
         if chunksize:
             def generator():
-                colmap = None
-                for chunk in reader:
-                    processed, colmap = process_df(chunk, colmap)
-                    if not processed.empty:
-                        yield processed
+                try:
+                    colmap = None
+                    for chunk in reader:
+                        processed, colmap = process_df(chunk, colmap)
+                        if not processed.empty:
+                            yield processed
+                except Exception as error:
+                    raise ValueError(f"PLC CSV 변환 실패: path={file_path}, filename={filename}") from error
             return generator()
         else:
             # Full read (reader is DataFrame)
@@ -239,10 +242,13 @@ def build_records_temp(file_path: str, filename: str, chunksize: int | None = No
 
         if chunksize:
             def generator():
-                for chunk in reader:
-                    processed = process_df(chunk)
-                    if not processed.empty:
-                        yield processed
+                try:
+                    for chunk in reader:
+                        processed = process_df(chunk)
+                        if not processed.empty:
+                            yield processed
+                except Exception as error:
+                    raise ValueError(f"온도 CSV 변환 실패: path={file_path}, filename={filename}") from error
             return generator()
         else:
             return process_df(reader)
