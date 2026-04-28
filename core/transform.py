@@ -173,10 +173,8 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
             processed, _ = process_df(reader)
             return processed
 
-    except Exception:
-        if chunksize:
-            return (x for x in []) # Empty generator
-        return pd.DataFrame()
+    except Exception as error:
+        raise ValueError(f"PLC CSV 변환 실패: path={file_path}, filename={filename}") from error
 
 
 def build_records_temp(file_path: str, filename: str, chunksize: int | None = None) -> pd.DataFrame | Any:
@@ -249,7 +247,5 @@ def build_records_temp(file_path: str, filename: str, chunksize: int | None = No
         else:
             return process_df(reader)
 
-    except Exception:
-        if chunksize:
-            return (x for x in [])
-        return pd.DataFrame()
+    except Exception as error:
+        raise ValueError(f"온도 CSV 변환 실패: path={file_path}, filename={filename}") from error

@@ -365,6 +365,13 @@ class BuilderDeviceIdRegressionTests(TestCase):
         )
         self.assertEqual(dataframe["mold_1"].tolist(), [11, 12])
 
+    def test_build_records_plc_raises_for_missing_file(self) -> None:
+        workspace = self.create_workspace()
+        file_path = workspace / "260421_missing.csv"
+
+        with self.assertRaisesRegex(ValueError, "PLC CSV 변환 실패"):
+            core_transform.build_records_plc(str(file_path), file_path.name, None)
+
     def test_build_records_temp_sets_temperature_device_id(self) -> None:
         workspace = self.create_workspace()
         file_path = workspace / "temperature.csv"

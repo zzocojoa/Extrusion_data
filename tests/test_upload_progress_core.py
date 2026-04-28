@@ -191,3 +191,60 @@ class UploadProgressCoreTests(TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(progress_events, [(1, 0), (3, 0), (3, 3)])
+
+    def test_upload_item_records_failure_when_builder_raises(self) -> None:
+        workspace = self.create_workspace()
+        file_path = self.create_csv_file(workspace, "broken.csv")
+        recorded_failures: list[tuple[str, str, str, int, str, int | None]] = []
+        completed_items: list[tuple[str, str, str, int | None]] = []
+
+        def build_plc(path: str, filename: str, chunksize: int) -> Iterator[pd.DataFrame]:
+            _ = path
+            _ = filename
+            _ = chunksize
+            raise ValueError("CSV 변환 실패")
+
+        def record_failure(
+            folder: str,
+            filename: str,
+            path: str,
+            resume_offset: int,
+            error_message: str,
+            run_id: int | None,
+        ) -> None:
+            recorded_failures.append((folder, filename, path, resume_offset, error_message, run_id))
+
+        def record_completed(folder: str, filename: str, path: str, run_id: int | None) -> None:
+            completed_items.append((folder, filename, path, run_id))
+
+        ok = core_upload.upload_item(
+            "http://localhost/upload",
+            "anon-key",
+            "folder",
+            file_path.name,
+            str(file_path),
+            "plc",
+            build_plc=build_plc,
+            build_temp=build_plc,
+            get_resume_offset=lambda key: 0,
+            set_resume_offset_fn=lambda key, offset: None,
+            mark_file_completed_fn=record_completed,
+            record_file_failure_fn=record_failure,
+            log=lambda message: None,
+            batch_size=100,
+            chunk_size=100,
+            progress_cb=None,
+            progress_update_interval_seconds=0.0,
+            enable_smart_sync=False,
+            resolve_latest_timestamp_fn=None,
+            pause_event=None,
+            run_id=3,
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(completed_items, [])
+        self.assertEqual(len(recorded_failures), 1)
+        self.assertEqual(recorded_failures[0][0:3], ("folder", file_path.name, str(file_path)))
+        self.assertEqual(recorded_failures[0][3], 1)
+        self.assertIn("CSV 변환 실패", recorded_failures[0][4])
+        self.assertEqual(recorded_failures[0][5], 3)
