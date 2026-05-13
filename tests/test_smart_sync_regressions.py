@@ -384,6 +384,25 @@ class BuilderDeviceIdRegressionTests(TestCase):
         with self.assertRaisesRegex(ValueError, "PLC CSV 변환 실패"):
             list(chunks)
 
+    def test_build_records_temp_raises_for_missing_file(self) -> None:
+        workspace = self.create_workspace()
+        file_path = workspace / "temperature_missing.csv"
+
+        with self.assertRaisesRegex(ValueError, "CSV"):
+            core_transform.build_records_temp(str(file_path), file_path.name, None)
+
+    def test_build_records_temp_wraps_chunk_iteration_errors(self) -> None:
+        class BrokenReader:
+            def __iter__(self) -> Iterator[pd.DataFrame]:
+                raise RuntimeError("reader exploded")
+
+        chunks = None
+        with patch.object(core_transform.pd, "read_csv", return_value=BrokenReader()):
+            chunks = core_transform.build_records_temp("C:/broken_temperature.csv", "broken_temperature.csv", 10)
+
+        with self.assertRaisesRegex(ValueError, "CSV"):
+            list(chunks)
+
     def test_build_records_temp_sets_temperature_device_id(self) -> None:
         workspace = self.create_workspace()
         file_path = workspace / "temperature.csv"

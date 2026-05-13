@@ -108,8 +108,8 @@ def build_records_plc(file_path: str, filename: str, chunksize: int | None = Non
                         timestamp_text,
                         errors="coerce",
                     ).dt.strftime("%Y-%m-%dT%H:%M:%S.%f+09:00")
-                except Exception:
-                    return pd.DataFrame(), colmap
+                except Exception as error:
+                    raise ValueError("통합 PLC timestamp 변환 실패") from error
             elif "time" in colmap:
                 # 레거시 PLC는 파일 날짜 접두사를 시간 열에 벡터 방식으로 붙인다.
                 date_prefix = f"20{filename[0:2]}-{filename[2:4]}-{filename[4:6]}T"

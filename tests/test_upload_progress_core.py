@@ -248,3 +248,97 @@ class UploadProgressCoreTests(TestCase):
         self.assertEqual(recorded_failures[0][3], 1)
         self.assertIn("CSV 변환 실패", recorded_failures[0][4])
         self.assertEqual(recorded_failures[0][5], 3)
+
+    def test_upload_item_records_failure_when_generator_raises_after_resume_update(self) -> None:
+        workspace = self.create_workspace()
+        file_path = self.create_csv_file(workspace, "partial_failure.csv")
+        recorded_failures: list[tuple[str, str, str, int, str, int | None]] = []
+        completed_items: list[tuple[str, str, str, int | None]] = []
+        resume_offsets: dict[str, int] = {}
+
+        def build_plc(path: str, filename: str, chunksize: int) -> Iterator[pd.DataFrame]:
+            _ = path
+            _ = filename
+            _ = chunksize
+            yield self.make_dataframe([1, 2])
+            raise RuntimeError("transform failed")
+
+        def get_resume_offset(key: str) -> int:
+            return resume_offsets.get(key, 0)
+
+        def set_resume_offset(key: str, offset: int) -> None:
+            resume_offsets[key] = offset
+
+        def record_failure(
+            folder: str,
+            filename: str,
+            path: str,
+            resume_offset: int,
+            error_message: str,
+            run_id: int | None,
+        ) -> None:
+            recorded_failures.append((folder, filename, path, resume_offset, error_message, run_id))
+
+        def record_completed(folder: str, filename: str, path: str, run_id: int | None) -> None:
+            completed_items.append((folder, filename, path, run_id))
+
+        def fake_upload_via_edge(
+            edge_url: str,
+            anon_key: str,
+            df: pd.DataFrame,
+            client: Any,
+            *,
+            log: Callable[[str], None],
+            resume_key: str | None,
+            start_index: int,
+            batch_size: int,
+            progress_cb: Callable[[int, int], None] | None,
+            pause_event: Any,
+            silent: bool,
+        ) -> bool:
+            _ = edge_url
+            _ = anon_key
+            _ = df
+            _ = client
+            _ = log
+            _ = resume_key
+            _ = start_index
+            _ = batch_size
+            _ = progress_cb
+            _ = pause_event
+            _ = silent
+            return True
+
+        with patch.object(core_upload, "create_upload_http_client", new=lambda: NullClient()):
+            with patch.object(core_upload, "upload_via_edge", new=fake_upload_via_edge):
+                ok = core_upload.upload_item(
+                    "http://localhost/upload",
+                    "anon-key",
+                    "folder",
+                    file_path.name,
+                    str(file_path),
+                    "plc",
+                    build_plc=build_plc,
+                    build_temp=build_plc,
+                    get_resume_offset=get_resume_offset,
+                    set_resume_offset_fn=set_resume_offset,
+                    mark_file_completed_fn=record_completed,
+                    record_file_failure_fn=record_failure,
+                    log=lambda message: None,
+                    batch_size=100,
+                    chunk_size=100,
+                    progress_cb=None,
+                    progress_update_interval_seconds=0.0,
+                    enable_smart_sync=False,
+                    resolve_latest_timestamp_fn=None,
+                    pause_event=None,
+                    run_id=4,
+                )
+
+        self.assertFalse(ok)
+        self.assertEqual(completed_items, [])
+        self.assertEqual(len(recorded_failures), 1)
+        self.assertEqual(recorded_failures[0][0:3], ("folder", file_path.name, str(file_path)))
+        self.assertEqual(recorded_failures[0][3], 2)
+        self.assertIn("transform failed", recorded_failures[0][4])
+        self.assertEqual(recorded_failures[0][5], 4)
